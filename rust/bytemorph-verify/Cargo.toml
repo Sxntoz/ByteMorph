@@ -1,0 +1,10 @@
+[package]
+name = "bytemorph-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Safe bounds-checked binary pre-validation and entropy diagnostics for ByteMorph"
+
+[lib]
+name = "bytemorph_verify"
+path = "src/lib.rs"

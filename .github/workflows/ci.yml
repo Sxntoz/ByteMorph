@@ -1,0 +1,75 @@
+name: ByteMorph CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  cpp-build-and-test:
+    name: C++20 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Run Benchmark Smoke
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./build/benchmarks/Release/bytemorph_bench.exe 20
+          else
+            ./build/benchmarks/bytemorph_bench 20
+          fi
+        shell: bash
+
+  linux-sanitizers-and-fuzzers:
+    name: Sanitizers & Fuzz Targets (ubuntu-latest, Clang)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Configure with Sanitizers and Fuzzers
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBYTEMORPH_ENABLE_SANITIZERS=ON -DBYTEMORPH_BUILD_FUZZERS=ON
+
+      - name: Build Fuzz Targets & Tests
+        run: cmake --build build-fuzz --target bytemorph_tests fuzz_loader fuzz_pe_parser fuzz_elf_parser fuzz_macho_parser --parallel
+
+      - name: Run Tests under ASan/UBSan
+        run: ctest --test-dir build-fuzz --output-on-failure
+
+  rust-verify:
+    name: Rust Aux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Cargo Test
+        run: cargo test --workspace
