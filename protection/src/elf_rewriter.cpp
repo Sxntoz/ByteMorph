@@ -185,6 +185,16 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     std::vector<std::uint8_t> runtime_bytes = rt_res.value();
     runtime_bytes.resize(static_cast<std::size_t>(align_up(runtime_bytes.size(), 0x1000)), 0);
 
+    LIEF::ELF::Section* text_sec_pre = elf->get_section(".text");
+    if (!text_sec_pre) {
+        return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "ELF missing .text section", "ElfRewriter::protect_file");
+    }
+    if (target_va < text_sec_pre->virtual_address() ||
+        target_va + 5 > text_sec_pre->virtual_address() + text_sec_pre->content().size()) {
+        return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Target VA outside .text", "ElfRewriter::protect_file");
+    }
+    const std::size_t patch_off = static_cast<std::size_t>(target_va - text_sec_pre->virtual_address());
+
     LIEF::ELF::Section bmrt_sec(".bmrt", LIEF::ELF::Section::TYPE::PROGBITS);
     bmrt_sec.add(LIEF::ELF::Section::FLAGS::ALLOC);
     bmrt_sec.add(LIEF::ELF::Section::FLAGS::EXECINSTR);
@@ -213,17 +223,13 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     }
 
     LIEF::ELF::Section* text_sec = elf->get_section(".text");
-    if (!text_sec) {
-        return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "ELF missing .text section", "ElfRewriter::protect_file");
-    }
-    if (target_va < text_sec->virtual_address() ||
-        target_va + 5 > text_sec->virtual_address() + text_sec->content().size()) {
-        return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Target VA outside .text", "ElfRewriter::protect_file");
+    if (!text_sec || patch_off + 5 > text_sec->content().size()) {
+        return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Target VA outside .text after segment add", "ElfRewriter::protect_file");
     }
 
     auto text_content = std::vector<std::uint8_t>(text_sec->content().begin(), text_sec->content().end());
-    const std::size_t patch_off = static_cast<std::size_t>(target_va - text_sec->virtual_address());
-    const std::int64_t rel32 = static_cast<std::int64_t>(added_bmrt->virtual_address()) - static_cast<std::int64_t>(target_va + 5);
+    const std::uint64_t patched_va = text_sec->virtual_address() + patch_off;
+    const std::int64_t rel32 = static_cast<std::int64_t>(added_bmrt->virtual_address()) - static_cast<std::int64_t>(patched_va + 5);
     text_content[patch_off] = 0xE9;
     const std::uint32_t rel32_u = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel32));
     std::memcpy(text_content.data() + patch_off + 1, &rel32_u, 4);

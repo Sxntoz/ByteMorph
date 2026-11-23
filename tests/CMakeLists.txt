@@ -2,6 +2,9 @@ add_executable(lab_pe_target
     lab/lab_pe_target.cpp
 )
 target_compile_features(lab_pe_target PRIVATE cxx_std_20)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lab_pe_target PRIVATE -fno-sanitize=all)
+endif()
 
 add_executable(bytemorph_tests
     unit/test_diagnostics.cpp
