@@ -116,9 +116,12 @@ BvmCodec::encode(const BvmProgram& program) {
             return core::diagnostics::Result<std::vector<std::uint8_t>>::err(
                 ErrorCode::ParseError, "Invalid VmOpcode in encode", "BvmCodec::encode");
         }
-        if (insn.dst >= BvmProgram::kNumRegisters ||
+        const bool dst_is_trap = (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF);
+        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
+        const bool valid_width = (insn.src2 == 0 || insn.src2 == 8 || insn.src2 == 16 || insn.src2 == 32 || insn.src2 == 64);
+        if ((!dst_is_trap && insn.dst >= BvmProgram::kNumRegisters) ||
             insn.src1 >= BvmProgram::kNumRegisters ||
-            insn.src2 >= BvmProgram::kNumRegisters) {
+            (src2_is_width ? !valid_width : insn.src2 >= BvmProgram::kNumRegisters)) {
             return core::diagnostics::Result<std::vector<std::uint8_t>>::err(
                 ErrorCode::OutOfBounds, "Register index out of bounds (>= 32)", "BvmCodec::encode");
         }
@@ -211,12 +214,16 @@ BvmCodec::decode(std::span<const std::uint8_t> data) {
             return core::diagnostics::Result<BvmProgram>::err(
                 ErrorCode::ParseError, "Invalid opcode in .bvm stream", "BvmCodec::decode");
         }
+        const VmOpcode op = static_cast<VmOpcode>(logical_op);
         const std::uint8_t dst = payload[off + 1];
         const std::uint8_t src1 = payload[off + 2];
         const std::uint8_t src2 = payload[off + 3];
-        if (dst >= BvmProgram::kNumRegisters ||
+        const bool dst_is_trap = (op == VmOpcode::Halt && dst == 0xFF);
+        const bool src2_is_width = (op == VmOpcode::Load || op == VmOpcode::Store);
+        const bool valid_width = (src2 == 0 || src2 == 8 || src2 == 16 || src2 == 32 || src2 == 64);
+        if ((!dst_is_trap && dst >= BvmProgram::kNumRegisters) ||
             src1 >= BvmProgram::kNumRegisters ||
-            src2 >= BvmProgram::kNumRegisters) {
+            (src2_is_width ? !valid_width : src2 >= BvmProgram::kNumRegisters)) {
             return core::diagnostics::Result<BvmProgram>::err(
                 ErrorCode::OutOfBounds, "Register index out of bounds in .bvm stream", "BvmCodec::decode");
         }

@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #if defined(_MSC_VER)
@@ -15,6 +16,21 @@ extern "C" BM_EXPORT std::int64_t bm_target_compute(std::int64_t a, std::int64_t
     return mix + (a * 3);
 }
 
+extern "C" BM_EXPORT std::int64_t bm_target_multi_args(std::int64_t a, std::int64_t b, std::int64_t c, std::int64_t d) {
+    return (a * 2) + (b * 3) - c + (d ^ a);
+}
+
+extern "C" BM_EXPORT std::int64_t bm_target_branch_loop(std::int64_t a, std::int64_t b) {
+    if (a <= 0) {
+        return b;
+    }
+    std::int64_t acc = b;
+    for (std::int64_t i = 1; i <= 4; ++i) {
+        acc += (a ^ i);
+    }
+    return acc;
+}
+
 int main(int argc, char* argv[]) {
     std::int64_t a = 42;
     std::int64_t b = 19;
@@ -23,6 +39,12 @@ int main(int argc, char* argv[]) {
         b = std::strtoll(argv[2], nullptr, 10);
     }
     const std::int64_t res = bm_target_compute(a, b);
+    if (argc >= 4 && std::strcmp(argv[3], "--v06") == 0) {
+        const std::int64_t multi = bm_target_multi_args(a, b, a + 5, b + 3);
+        const std::int64_t loop = bm_target_branch_loop(a, b);
+        std::cout << "RESULT=" << res << " MULTI=" << multi << " LOOP=" << loop << '\n';
+        return 0;
+    }
     std::cout << "RESULT=" << res << '\n';
     return 0;
 }

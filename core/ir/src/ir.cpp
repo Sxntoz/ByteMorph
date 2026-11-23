@@ -46,6 +46,10 @@ IrOperand IrOperand::memory(std::string expr, std::uint8_t width) {
     return IrOperand{Kind::Memory, std::move(expr), 0, width};
 }
 
+IrOperand IrOperand::memory_disp(std::string base_reg, std::int64_t disp, std::uint8_t width) {
+    return IrOperand{Kind::Memory, std::move(base_reg), disp, width};
+}
+
 IrOperand IrOperand::label(std::uint64_t va) {
     std::ostringstream oss;
     oss << "loc_0x" << std::hex << va;
@@ -67,7 +71,13 @@ std::string IrOperand::to_string() const {
             oss << "0x" << std::hex << imm << ":i" << std::dec << static_cast<unsigned>(bit_width);
             return oss.str();
         case Kind::Memory:
-            oss << "[" << name << "]:i" << static_cast<unsigned>(bit_width);
+            oss << "[" << name;
+            if (imm > 0) {
+                oss << "+0x" << std::hex << imm << std::dec;
+            } else if (imm < 0) {
+                oss << "-0x" << std::hex << (-imm) << std::dec;
+            }
+            oss << "]:i" << static_cast<unsigned>(bit_width);
             return oss.str();
         case Kind::Label:
             return name;

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_set>
+#include <vector>
 
 namespace bytemorph::virt {
 
@@ -15,6 +16,8 @@ struct TranslateOptions {
     bool allow_external_calls{false};
     std::uint64_t stub_base_va{0};
     std::unordered_set<std::uint64_t> authorized_call_targets;
+    std::unordered_set<std::uint64_t> authorized_jump_targets;
+    std::vector<std::uint64_t> jump_table_targets;
 };
 
 /// Translates an architecture-independent IrFunction into a ByteMorph VM program (.bvm).

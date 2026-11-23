@@ -190,6 +190,8 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     Label l_op_nop = a.new_label();
     Label l_op_movreg = a.new_label();
     Label l_op_movimm = a.new_label();
+    Label l_op_load = a.new_label();
+    Label l_op_store = a.new_label();
     Label l_op_add = a.new_label();
     Label l_op_sub = a.new_label();
     Label l_op_mul = a.new_label();
@@ -220,12 +222,12 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.push(x86::r14);
     a.push(x86::r15);
 
-    // 8 pushes (64B) + retaddr (8B) + 264B = 336B (16-byte aligned)
-    a.sub(x86::rsp, 264);
+    // 8 pushes (64B) + retaddr (8B) + 1288B (256B VM regs + 1032B virtual stack frame) = 1360B (16-byte aligned)
+    a.sub(x86::rsp, 1288);
 
     a.xor_(x86::eax, x86::eax);
     a.mov(x86::rdi, x86::rsp);
-    a.mov(x86::r10d, 32);
+    a.mov(x86::r10d, 161);
     Label l_zero_loop = a.new_label();
     a.bind(l_zero_loop);
     a.mov(x86::qword_ptr(x86::rdi), x86::rax);
@@ -233,7 +235,18 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.dec(x86::r10d);
     a.jnz(l_zero_loop);
 
-    // Restore rdi from saved stack slot for SysV arg0 (push order: rbx, rbp, rdi -> [rsp + 264 + 5*8])
+    // Initialize virtual stack pointer R4 (rsp) and frame pointer R5 (rbp) to [rsp + 896]
+    a.lea(x86::rax, x86::ptr(x86::rsp, 896));
+    a.mov(x86::qword_ptr(x86::rsp, 4 * 8), x86::rax);
+    a.mov(x86::qword_ptr(x86::rsp, 5 * 8), x86::rax);
+
+    // Copy 64B of caller stack arguments / shadow space from [caller_rsp + 8] ([rsp + 1352 + 8]) to [R4 + 8]
+    for (int i = 1; i <= 8; ++i) {
+        a.mov(x86::r10, x86::qword_ptr(x86::rsp, 1352 + i * 8));
+        a.mov(x86::qword_ptr(x86::rsp, 896 + i * 8), x86::r10);
+    }
+
+    // Restore rdi from saved stack slot for SysV arg0 (push order: rbx, rbp, rdi -> [rsp + 1288 + 5*8])
     if (abi == AbiKind::Win64) {
         a.mov(x86::qword_ptr(x86::rsp, 1 * 8), x86::rcx);
         a.mov(x86::qword_ptr(x86::rsp, 2 * 8), x86::rdx);
@@ -241,7 +254,7 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
         a.mov(x86::qword_ptr(x86::rsp, 9 * 8), x86::r9);
     } else {
         // System V AMD64: rdi->R7, rsi->R6, rdx->R2, rcx->R1, r8->R8, r9->R9
-        a.mov(x86::rax, x86::qword_ptr(x86::rsp, 264 + 5 * 8));
+        a.mov(x86::rax, x86::qword_ptr(x86::rsp, 1288 + 5 * 8));
         a.mov(x86::qword_ptr(x86::rsp, 7 * 8), x86::rax);
         a.mov(x86::qword_ptr(x86::rsp, 6 * 8), x86::rsi);
         a.mov(x86::qword_ptr(x86::rsp, 2 * 8), x86::rdx);
@@ -272,6 +285,8 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Nop));     a.je(l_op_nop);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::MovReg));  a.je(l_op_movreg);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::MovImm));  a.je(l_op_movimm);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Load));    a.je(l_op_load);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Store));   a.je(l_op_store);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Add));     a.je(l_op_add);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Sub));     a.je(l_op_sub);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Mul));     a.je(l_op_mul);
@@ -311,6 +326,60 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
 
     a.bind(l_op_movimm);
     a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::r11);
+    a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+    // Load: dst=rcx, src1=r8 (base), src2=r9 (width: 8/16/32/64/0), imm=r11 (disp)
+    Label l_load_16 = a.new_label();
+    Label l_load_32 = a.new_label();
+    Label l_load_64 = a.new_label();
+    Label l_load_done = a.new_label();
+    a.bind(l_op_load);
+    a.mov(x86::r10, x86::qword_ptr(x86::rsp, x86::r8, 3));
+    a.add(x86::r10, x86::r11);
+    a.cmp(x86::r10, 0x1000);
+    a.jb(l_vm_done);
+    a.cmp(x86::r9d, 8);  a.jne(l_load_16);
+    a.movzx(x86::eax, x86::byte_ptr(x86::r10));
+    a.jmp(l_load_done);
+    a.bind(l_load_16);
+    a.cmp(x86::r9d, 16); a.jne(l_load_32);
+    a.movzx(x86::eax, x86::word_ptr(x86::r10));
+    a.jmp(l_load_done);
+    a.bind(l_load_32);
+    a.cmp(x86::r9d, 32); a.jne(l_load_64);
+    a.mov(x86::eax, x86::dword_ptr(x86::r10));
+    a.jmp(l_load_done);
+    a.bind(l_load_64);
+    a.mov(x86::rax, x86::qword_ptr(x86::r10));
+    a.bind(l_load_done);
+    a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+    a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+    // Store: dst=rcx (base), src1=r8 (val), src2=r9 (width: 8/16/32/64/0), imm=r11 (disp)
+    Label l_store_16 = a.new_label();
+    Label l_store_32 = a.new_label();
+    Label l_store_64 = a.new_label();
+    Label l_store_done = a.new_label();
+    a.bind(l_op_store);
+    a.mov(x86::r10, x86::qword_ptr(x86::rsp, x86::rcx, 3));
+    a.add(x86::r10, x86::r11);
+    a.cmp(x86::r10, 0x1000);
+    a.jb(l_vm_done);
+    a.mov(x86::rax, x86::qword_ptr(x86::rsp, x86::r8, 3));
+    a.cmp(x86::r9d, 8);  a.jne(l_store_16);
+    a.mov(x86::byte_ptr(x86::r10), x86::al);
+    a.jmp(l_store_done);
+    a.bind(l_store_16);
+    a.cmp(x86::r9d, 16); a.jne(l_store_32);
+    a.mov(x86::word_ptr(x86::r10), x86::ax);
+    a.jmp(l_store_done);
+    a.bind(l_store_32);
+    a.cmp(x86::r9d, 32); a.jne(l_store_64);
+    a.mov(x86::dword_ptr(x86::r10), x86::eax);
+    a.jmp(l_store_done);
+    a.bind(l_store_64);
+    a.mov(x86::qword_ptr(x86::r10), x86::rax);
+    a.bind(l_store_done);
     a.inc(x86::r14d); a.jmp(l_vm_loop);
 
     a.bind(l_op_add);
@@ -423,7 +492,7 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.bind(l_op_ret);
     a.bind(l_vm_done);
     a.mov(x86::rax, x86::qword_ptr(x86::rsp));
-    a.add(x86::rsp, 264);
+    a.add(x86::rsp, 1288);
     a.pop(x86::r15);
     a.pop(x86::r14);
     a.pop(x86::r13);
@@ -477,9 +546,12 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     Label l_op_nop = a.new_label();
     Label l_op_movreg = a.new_label();
     Label l_op_movimm = a.new_label();
+    Label l_op_load = a.new_label();
+    Label l_op_store = a.new_label();
     Label l_op_add = a.new_label();
     Label l_op_sub = a.new_label();
     Label l_op_mul = a.new_label();
+    Label l_op_div = a.new_label();
     Label l_op_and = a.new_label();
     Label l_op_or = a.new_label();
     Label l_op_xor = a.new_label();
@@ -494,9 +566,10 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     Label l_op_jgt = a.new_label();
     Label l_op_jge = a.new_label();
     Label l_op_ret = a.new_label();
+    Label l_op_callext = a.new_label();
 
     // AAPCS64 / Apple ARM64 ABI:
-    // Save x19-x28, x29, x30 (12 regs = 96B) + 256B VM regs = 352B (16B aligned)
+    // Save x19-x28, x29, x30 (12 regs = 96B) + 1280B (256B VM regs + 1024B virtual stack frame) = 1376B (16B aligned)
     a.bind(l_entry);
     a.stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -96));
     a.stp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
@@ -504,24 +577,31 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.stp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
     a.stp(a64::x25, a64::x26, a64::ptr(a64::sp, 64));
     a.stp(a64::x27, a64::x28, a64::ptr(a64::sp, 80));
-    a.sub(a64::sp, a64::sp, 256);
+    a.sub(a64::sp, a64::sp, 1280);
 
-    // Zero R0..R31
+    // Zero R0..R31 and virtual stack frame (160 qwords = 1280B)
     a.mov(a64::x10, a64::sp);
-    a.mov(a64::w11, 32);
+    a.mov(a64::w11, 160);
     Label l_zero = a.new_label();
     a.bind(l_zero);
     a.str(a64::xzr, a64::ptr_post(a64::x10, 8));
     a.subs(a64::w11, a64::w11, 1);
     a.b_ne(l_zero);
 
-    // Store AAPCS64 args x0..x5 into R0..R3, R6, R7 (matching RegAllocator: x0->R0, x1->R1, x2->R2, x3->R3, x4->R6, x5->R7)
+    // Initialize virtual stack pointer R4 (sp) and frame pointer R5 (x29) to sp + 896
+    a.add(a64::x10, a64::sp, 896);
+    a.str(a64::x10, a64::ptr(a64::sp, 4 * 8));
+    a.str(a64::x10, a64::ptr(a64::sp, 5 * 8));
+
+    // Store AAPCS64 args x0..x7 into R0..R3, R6..R9
     a.str(a64::x0, a64::ptr(a64::sp, 0 * 8));
     a.str(a64::x1, a64::ptr(a64::sp, 1 * 8));
     a.str(a64::x2, a64::ptr(a64::sp, 2 * 8));
     a.str(a64::x3, a64::ptr(a64::sp, 3 * 8));
     a.str(a64::x4, a64::ptr(a64::sp, 6 * 8));
     a.str(a64::x5, a64::ptr(a64::sp, 7 * 8));
+    a.str(a64::x6, a64::ptr(a64::sp, 8 * 8));
+    a.str(a64::x7, a64::ptr(a64::sp, 9 * 8));
 
     a.adr(a64::x19, l_bytecode);
     a.ldr(a64::w20, a64::ptr(a64::x19));       // insn_count
@@ -544,27 +624,31 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.ldrb(a64::w13, a64::ptr(a64::x9, 3));    // src2
     a.ldur(a64::x14, a64::ptr(a64::x9, 4));    // imm (unaligned 64-bit load)
 
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Nop));    a.b_eq(l_op_nop);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::MovReg)); a.b_eq(l_op_movreg);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::MovImm)); a.b_eq(l_op_movimm);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Add));    a.b_eq(l_op_add);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Sub));    a.b_eq(l_op_sub);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Mul));    a.b_eq(l_op_mul);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::And));    a.b_eq(l_op_and);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Or));     a.b_eq(l_op_or);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Xor));    a.b_eq(l_op_xor);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Shl));    a.b_eq(l_op_shl);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Shr));    a.b_eq(l_op_shr);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Cmp));    a.b_eq(l_op_cmp);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jmp));    a.b_eq(l_op_jmp);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jeq));    a.b_eq(l_op_jeq);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jne));    a.b_eq(l_op_jne);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jlt));    a.b_eq(l_op_jlt);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jle));    a.b_eq(l_op_jle);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jgt));    a.b_eq(l_op_jgt);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jge));    a.b_eq(l_op_jge);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Ret));    a.b_eq(l_op_ret);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Halt));   a.b_eq(l_op_ret);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Nop));     a.b_eq(l_op_nop);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::MovReg));  a.b_eq(l_op_movreg);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::MovImm));  a.b_eq(l_op_movimm);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Load));    a.b_eq(l_op_load);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Store));   a.b_eq(l_op_store);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Add));     a.b_eq(l_op_add);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Sub));     a.b_eq(l_op_sub);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Mul));     a.b_eq(l_op_mul);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Div));     a.b_eq(l_op_div);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::And));     a.b_eq(l_op_and);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Or));      a.b_eq(l_op_or);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Xor));     a.b_eq(l_op_xor);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Shl));     a.b_eq(l_op_shl);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Shr));     a.b_eq(l_op_shr);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Cmp));     a.b_eq(l_op_cmp);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jmp));     a.b_eq(l_op_jmp);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jeq));     a.b_eq(l_op_jeq);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jne));     a.b_eq(l_op_jne);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jlt));     a.b_eq(l_op_jlt);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jle));     a.b_eq(l_op_jle);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jgt));     a.b_eq(l_op_jgt);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jge));     a.b_eq(l_op_jge);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Ret));     a.b_eq(l_op_ret);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Halt));    a.b_eq(l_op_ret);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::CallExt)); a.b_eq(l_op_callext);
     a.b(l_vm_done);
 
     auto load_srcs = [&]() {
@@ -594,9 +678,68 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.mov(a64::x0, a64::x14);
     store_dst(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
 
+    // Load: dst=w11, src1=w12 (base), src2=w13 (width: 8/16/32/64/0), imm=x14 (disp)
+    Label l_a64_load_16 = a.new_label();
+    Label l_a64_load_32 = a.new_label();
+    Label l_a64_load_64 = a.new_label();
+    Label l_a64_load_done = a.new_label();
+    a.bind(l_op_load);
+    a.mov(a64::x15, a64::sp);
+    a.ldr(a64::x9, a64::ptr(a64::x15, a64::x12, a64::lsl(3)));
+    a.add(a64::x9, a64::x9, a64::x14);
+    a.cmp(a64::x9, 0x1000);
+    a.b_lo(l_vm_done);
+    a.cmp(a64::w13, 8);  a.b_ne(l_a64_load_16);
+    a.ldrb(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_load_done);
+    a.bind(l_a64_load_16);
+    a.cmp(a64::w13, 16); a.b_ne(l_a64_load_32);
+    a.ldrh(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_load_done);
+    a.bind(l_a64_load_32);
+    a.cmp(a64::w13, 32); a.b_ne(l_a64_load_64);
+    a.ldr(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_load_done);
+    a.bind(l_a64_load_64);
+    a.ldr(a64::x0, a64::ptr(a64::x9));
+    a.bind(l_a64_load_done);
+    store_dst();
+    a.add(a64::w22, a64::w22, 1);
+    a.b(l_vm_loop);
+
+    // Store: dst=w11 (base), src1=w12 (val), src2=w13 (width: 8/16/32/64/0), imm=x14 (disp)
+    Label l_a64_store_16 = a.new_label();
+    Label l_a64_store_32 = a.new_label();
+    Label l_a64_store_64 = a.new_label();
+    Label l_a64_store_done = a.new_label();
+    a.bind(l_op_store);
+    a.mov(a64::x15, a64::sp);
+    a.ldr(a64::x9, a64::ptr(a64::x15, a64::x11, a64::lsl(3)));
+    a.add(a64::x9, a64::x9, a64::x14);
+    a.cmp(a64::x9, 0x1000);
+    a.b_lo(l_vm_done);
+    a.ldr(a64::x0, a64::ptr(a64::x15, a64::x12, a64::lsl(3)));
+    a.cmp(a64::w13, 8);  a.b_ne(l_a64_store_16);
+    a.strb(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_store_done);
+    a.bind(l_a64_store_16);
+    a.cmp(a64::w13, 16); a.b_ne(l_a64_store_32);
+    a.strh(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_store_done);
+    a.bind(l_a64_store_32);
+    a.cmp(a64::w13, 32); a.b_ne(l_a64_store_64);
+    a.str(a64::w0, a64::ptr(a64::x9));
+    a.b(l_a64_store_done);
+    a.bind(l_a64_store_64);
+    a.str(a64::x0, a64::ptr(a64::x9));
+    a.bind(l_a64_store_done);
+    a.add(a64::w22, a64::w22, 1);
+    a.b(l_vm_loop);
+
     a.bind(l_op_add); load_srcs(); a.add(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_sub); load_srcs(); a.sub(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_mul); load_srcs(); a.mul(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    a.bind(l_op_div); load_srcs(); a.cbz(a64::x1, l_vm_done); a.udiv(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_and); load_srcs(); a.and_(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_or);  load_srcs(); a.orr(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_xor); load_srcs(); a.eor(a64::x0, a64::x0, a64::x1); store_dst(); update_flags_x0(); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
@@ -623,10 +766,27 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.bind(l_op_jgt); a.tst(a64::w23, 3); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_jge); a.tst(a64::w23, 2); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
 
+    // CallExt bridge on ARM64: target_va = l_entry + x14 (PIC!)
+    a.bind(l_op_callext);
+    a.adr(a64::x9, l_entry);
+    a.add(a64::x9, a64::x9, a64::x14);
+    a.ldr(a64::x0, a64::ptr(a64::sp, 0 * 8));
+    a.ldr(a64::x1, a64::ptr(a64::sp, 1 * 8));
+    a.ldr(a64::x2, a64::ptr(a64::sp, 2 * 8));
+    a.ldr(a64::x3, a64::ptr(a64::sp, 3 * 8));
+    a.ldr(a64::x4, a64::ptr(a64::sp, 6 * 8));
+    a.ldr(a64::x5, a64::ptr(a64::sp, 7 * 8));
+    a.ldr(a64::x6, a64::ptr(a64::sp, 8 * 8));
+    a.ldr(a64::x7, a64::ptr(a64::sp, 9 * 8));
+    a.blr(a64::x9);
+    a.str(a64::x0, a64::ptr(a64::sp, 0 * 8));
+    a.add(a64::w22, a64::w22, 1);
+    a.b(l_vm_loop);
+
     a.bind(l_op_ret);
     a.bind(l_vm_done);
     a.ldr(a64::x0, a64::ptr(a64::sp, 0));
-    a.add(a64::sp, a64::sp, 256);
+    a.add(a64::sp, a64::sp, 1280);
     a.ldp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
     a.ldp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
     a.ldp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));

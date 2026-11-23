@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0] - 2026-11-23
+
+### Adicionado
+- **Stack frames e memória 8/16/32/64 bits:** `vm.load` e `vm.store` (`base + disp`) nos interpretadores IR/VM e nos emissores nativos PIC x86-64 (`1360B` frame) e ARM64 (`1376B` frame), com validação de limites e alinhamento de pilha ABI.
+- **ELF64 ARM64:** proteção funcional de binários Linux AArch64 em `ElfRewriter`, preservando PIE/ASLR e segmentos `PT_LOAD` W^X, com execução nativa no CI (`ubuntu-24.04-arm`).
+- **Controle de fluxo avançado:** chamadas indiretas autorizadas (`authorized_call_targets`), jump tables validadas (`jump_table_targets`), trap `vm.halt (dst=0xFF)`, `vm.div` nativo ARM64/x86-64 e suporte expandido aos lifters x86-64/AArch64 (`push`/`pop`/`leave`/`stp`/`ldp`/`madd`/`cbz`/`cbnz`/RMW).
+- **CLI v0.6:** `bytemorph compatibility <in> --format json`, `bytemorph protect --functions auto` e `bytemorph analyze --functions`.
+- **Testes:** 6 novos testes `ProtectionV06Test` (44 testes C++ + 3 testes Rust).
+
 ## [0.5.0] - 2026-11-23
 
 ### Adicionado

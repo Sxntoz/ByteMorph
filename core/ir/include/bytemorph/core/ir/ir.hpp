@@ -53,6 +53,7 @@ struct IrOperand {
     [[nodiscard]] static IrOperand reg(std::string name, std::uint8_t width = 64);
     [[nodiscard]] static IrOperand immediate(std::int64_t value, std::uint8_t width = 64);
     [[nodiscard]] static IrOperand memory(std::string expr, std::uint8_t width = 64);
+    [[nodiscard]] static IrOperand memory_disp(std::string base_reg, std::int64_t disp, std::uint8_t width = 64);
     [[nodiscard]] static IrOperand label(std::uint64_t va);
 
     [[nodiscard]] std::string to_string() const;

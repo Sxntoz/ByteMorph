@@ -1,5 +1,7 @@
 #include "bytemorph/virt/vm_interpreter.hpp"
 
+#include <cstring>
+
 namespace bytemorph::virt {
 
 core::diagnostics::Result<VmExecState>
@@ -14,6 +16,11 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     VmExecState state;
     state.regs = options.initial_regs;
     state.memory.assign(options.memory_slots, 0ULL);
+    if (options.memory_slots > 0 && state.regs[4] == 0 && state.regs[5] == 0) {
+        const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
+        state.regs[4] = mid_stack;
+        state.regs[5] = mid_stack;
+    }
 
     const std::size_t code_len = program.instructions.size();
 
@@ -25,9 +32,14 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
         ++state.steps_executed;
 
         const auto& insn = program.instructions[state.pc];
+        if (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF) {
+            return core::diagnostics::Result<VmExecState>::err(
+                ErrorCode::OutOfBounds, "Unauthorized indirect control-flow target at runtime", "VmInterpreter::execute");
+        }
+        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
         if (insn.dst >= BvmProgram::kNumRegisters ||
             insn.src1 >= BvmProgram::kNumRegisters ||
-            insn.src2 >= BvmProgram::kNumRegisters) {
+            (!src2_is_width && insn.src2 >= BvmProgram::kNumRegisters)) {
             return core::diagnostics::Result<VmExecState>::err(
                 ErrorCode::OutOfBounds, "Register index out of bounds", "VmInterpreter::execute");
         }
@@ -57,12 +69,25 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute");
                 }
-                const std::uint64_t addr = state.regs[insn.src1] + static_cast<std::uint64_t>(insn.imm);
-                if (addr >= state.memory.size()) {
-                    return core::diagnostics::Result<VmExecState>::err(
-                        ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute");
+                if (insn.src2 == 0) {
+                    const std::uint64_t addr = state.regs[insn.src1] + static_cast<std::uint64_t>(insn.imm);
+                    if (addr >= state.memory.size()) {
+                        return core::diagnostics::Result<VmExecState>::err(
+                            ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute");
+                    }
+                    state.regs[insn.dst] = state.memory[addr];
+                } else {
+                    const std::size_t width_bytes = (insn.src2 == 8) ? 1 : (insn.src2 == 16) ? 2 : (insn.src2 == 32) ? 4 : 8;
+                    const std::int64_t byte_addr = static_cast<std::int64_t>(state.regs[insn.src1]) + insn.imm;
+                    const std::size_t total_bytes = state.memory.size() * sizeof(std::uint64_t);
+                    if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_bytes) {
+                        return core::diagnostics::Result<VmExecState>::err(
+                            ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute");
+                    }
+                    std::uint64_t val = 0;
+                    std::memcpy(&val, reinterpret_cast<const std::uint8_t*>(state.memory.data()) + byte_addr, width_bytes);
+                    state.regs[insn.dst] = val;
                 }
-                state.regs[insn.dst] = state.memory[addr];
                 ++state.pc;
                 break;
             }
@@ -71,12 +96,24 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute");
                 }
-                const std::uint64_t addr = state.regs[insn.dst] + static_cast<std::uint64_t>(insn.imm);
-                if (addr >= state.memory.size()) {
-                    return core::diagnostics::Result<VmExecState>::err(
-                        ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute");
+                if (insn.src2 == 0) {
+                    const std::uint64_t addr = state.regs[insn.dst] + static_cast<std::uint64_t>(insn.imm);
+                    if (addr >= state.memory.size()) {
+                        return core::diagnostics::Result<VmExecState>::err(
+                            ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute");
+                    }
+                    state.memory[addr] = state.regs[insn.src1];
+                } else {
+                    const std::size_t width_bytes = (insn.src2 == 8) ? 1 : (insn.src2 == 16) ? 2 : (insn.src2 == 32) ? 4 : 8;
+                    const std::int64_t byte_addr = static_cast<std::int64_t>(state.regs[insn.dst]) + insn.imm;
+                    const std::size_t total_bytes = state.memory.size() * sizeof(std::uint64_t);
+                    if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_bytes) {
+                        return core::diagnostics::Result<VmExecState>::err(
+                            ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute");
+                    }
+                    const std::uint64_t val = state.regs[insn.src1];
+                    std::memcpy(reinterpret_cast<std::uint8_t*>(state.memory.data()) + byte_addr, &val, width_bytes);
                 }
-                state.memory[addr] = state.regs[insn.src1];
                 ++state.pc;
                 break;
             }

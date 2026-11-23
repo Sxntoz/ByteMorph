@@ -1,5 +1,7 @@
 #include "bytemorph/prot/pe_rewriter.hpp"
 
+#include "bytemorph/arch/aarch64/aarch64_disasm.hpp"
+#include "bytemorph/arch/aarch64/aarch64_lifter.hpp"
 #include "bytemorph/arch/x86_64/x86_64_disasm.hpp"
 #include "bytemorph/arch/x86_64/x86_64_lifter.hpp"
 #include "bytemorph/core/analysis/analyzer.hpp"
@@ -48,16 +50,12 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         return diagnostics::Result<ProtectionReport>::err(
             ErrorCode::UnsupportedFormat, "ElfRewriter supports ELF64 only", "ElfRewriter::protect_file");
     }
-    if (bin.info().architecture == Architecture::ARM64) {
-        return diagnostics::Result<ProtectionReport>::err(
-            ErrorCode::NotImplemented,
-            "ELF64 ARM64 binary rewriting is prepared for v0.6 (v0.5 supports ELF64 x86-64)",
-            "ElfRewriter::protect_file");
-    }
-    if (bin.info().architecture != Architecture::X86_64) {
+    if (bin.info().architecture != Architecture::X86_64 && bin.info().architecture != Architecture::ARM64) {
         return diagnostics::Result<ProtectionReport>::err(
             ErrorCode::UnsupportedArchitecture, "Unsupported ELF64 architecture", "ElfRewriter::protect_file");
     }
+    const bool is_arm64 = (bin.info().architecture == Architecture::ARM64);
+    const std::size_t min_patch = is_arm64 ? 4 : 5;
 
     std::unique_ptr<LIEF::ELF::Binary> elf;
     try {
@@ -105,7 +103,10 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         }
     }
 
-    arch::x86_64::X86_64Disassembler disasm;
+    arch::x86_64::X86_64Disassembler x64_disasm;
+    arch::aarch64::AArch64Disassembler a64_disasm;
+    IDisassemblerEngine& disasm = is_arm64 ? static_cast<IDisassemblerEngine&>(a64_disasm)
+                                           : static_cast<IDisassemblerEngine&>(x64_disasm);
     BinaryAnalyzer analyzer;
     auto an_res = analyzer.analyze(bin, disasm);
     if (!an_res) {
@@ -144,13 +145,14 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         target_fn = &adhoc_fn;
     }
 
-    if (target_fn->size_bytes < 5) {
+    if (target_fn->size_bytes < min_patch) {
         return diagnostics::Result<ProtectionReport>::err(
-            ErrorCode::OutOfBounds, "Target ELF function smaller than 5 bytes", "ElfRewriter::protect_file");
+            ErrorCode::OutOfBounds, "Target ELF function smaller than patch size", "ElfRewriter::protect_file");
     }
 
-    arch::x86_64::X86_64Lifter lifter;
-    IrFunction ir_fn = lifter.lift_function(*target_fn);
+    arch::x86_64::X86_64Lifter x64_lifter;
+    arch::aarch64::AArch64Lifter a64_lifter;
+    IrFunction ir_fn = is_arm64 ? a64_lifter.lift_function(*target_fn) : x64_lifter.lift_function(*target_fn);
     std::uint32_t orig_ops = 0;
     for (const auto& bb : ir_fn.blocks) orig_ops += static_cast<std::uint32_t>(bb.instructions.size());
 
@@ -173,11 +175,12 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     if (!bvm_res) {
         return diagnostics::Result<ProtectionReport>::err(
             bvm_res.error().code,
-            "ELF function is not eligible for v0.5 virtualization: " + bvm_res.error().message,
+            "ELF function is not eligible for v0.6 virtualization: " + bvm_res.error().message,
             "ElfRewriter::protect_file");
     }
 
-    auto rt_res = emit_pic_x64_vm_runtime(bvm_res.value(), AbiKind::SysV_AMD64);
+    auto rt_res = is_arm64 ? emit_pic_arm64_vm_runtime(bvm_res.value())
+                           : emit_pic_x64_vm_runtime(bvm_res.value(), AbiKind::SysV_AMD64);
     if (!rt_res) {
         return diagnostics::Result<ProtectionReport>::err(rt_res.error().code, rt_res.error().message, "ElfRewriter::protect_file");
     }
@@ -190,7 +193,7 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "ELF missing .text section", "ElfRewriter::protect_file");
     }
     if (target_va < text_sec_pre->virtual_address() ||
-        target_va + 5 > text_sec_pre->virtual_address() + text_sec_pre->content().size()) {
+        target_va + min_patch > text_sec_pre->virtual_address() + text_sec_pre->content().size()) {
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Target VA outside .text", "ElfRewriter::protect_file");
     }
     const std::size_t patch_off = static_cast<std::size_t>(target_va - text_sec_pre->virtual_address());
@@ -205,6 +208,10 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     if (!added_bmrt) {
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::InternalError, "Failed to add .bmrt ELF section", "ElfRewriter::protect_file");
     }
+    if (added_bmrt->size() > runtime_bytes.size()) {
+        runtime_bytes.resize(static_cast<std::size_t>(added_bmrt->size()), 0);
+        added_bmrt->content(runtime_bytes);
+    }
 
     // Re-translate with exact stub_base_va if external calls are present
     if (options.allow_external_calls) {
@@ -213,26 +220,41 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         if (!bvm2) {
             return diagnostics::Result<ProtectionReport>::err(bvm2.error().code, bvm2.error().message, "ElfRewriter::protect_file");
         }
-        auto rt2 = emit_pic_x64_vm_runtime(bvm2.value(), AbiKind::SysV_AMD64);
+        auto rt2 = is_arm64 ? emit_pic_arm64_vm_runtime(bvm2.value())
+                            : emit_pic_x64_vm_runtime(bvm2.value(), AbiKind::SysV_AMD64);
         if (!rt2) {
             return diagnostics::Result<ProtectionReport>::err(rt2.error().code, rt2.error().message, "ElfRewriter::protect_file");
         }
+        const std::size_t target_rt_size = std::max<std::size_t>(
+            static_cast<std::size_t>(align_up(rt2.value().size(), 0x1000)),
+            static_cast<std::size_t>(added_bmrt->size()));
         runtime_bytes = std::move(rt2.value());
-        runtime_bytes.resize(static_cast<std::size_t>(align_up(runtime_bytes.size(), 0x1000)), 0);
+        runtime_bytes.resize(target_rt_size, 0);
         added_bmrt->content(runtime_bytes);
     }
+    runtime_bytes.assign(added_bmrt->content().begin(), added_bmrt->content().end());
 
     LIEF::ELF::Section* text_sec = elf->get_section(".text");
-    if (!text_sec || patch_off + 5 > text_sec->content().size()) {
+    if (!text_sec || patch_off + min_patch > text_sec->content().size()) {
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Target VA outside .text after segment add", "ElfRewriter::protect_file");
     }
 
     auto text_content = std::vector<std::uint8_t>(text_sec->content().begin(), text_sec->content().end());
     const std::uint64_t patched_va = text_sec->virtual_address() + patch_off;
-    const std::int64_t rel32 = static_cast<std::int64_t>(added_bmrt->virtual_address()) - static_cast<std::int64_t>(patched_va + 5);
-    text_content[patch_off] = 0xE9;
-    const std::uint32_t rel32_u = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel32));
-    std::memcpy(text_content.data() + patch_off + 1, &rel32_u, 4);
+    if (is_arm64) {
+        const std::int64_t delta = static_cast<std::int64_t>(added_bmrt->virtual_address()) - static_cast<std::int64_t>(patched_va);
+        const std::int64_t imm26 = delta >> 2;
+        if (imm26 < -(1LL << 25) || imm26 >= (1LL << 25)) {
+            return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "ARM64 branch target out of 128MB range", "ElfRewriter::protect_file");
+        }
+        const std::uint32_t insn = 0x14000000u | (static_cast<std::uint32_t>(imm26) & 0x03FFFFFFu);
+        std::memcpy(text_content.data() + patch_off, &insn, 4);
+    } else {
+        const std::int64_t rel32 = static_cast<std::int64_t>(added_bmrt->virtual_address()) - static_cast<std::int64_t>(patched_va + 5);
+        text_content[patch_off] = 0xE9;
+        const std::uint32_t rel32_u = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel32));
+        std::memcpy(text_content.data() + patch_off + 1, &rel32_u, 4);
+    }
     text_sec->content(text_content);
 
     auto bvm_encoded = BvmCodec::encode(bvm_res.value());
@@ -258,7 +280,7 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         target_name,
         target_va - bin.info().image_base,
         added_bmrt->virtual_address() - bin.info().image_base,
-        5,
+        static_cast<std::uint32_t>(min_patch),
         orig_ops,
         static_cast<std::uint32_t>(obf_res.value().obfuscated_instructions),
         static_cast<std::uint32_t>(bvm_res.value().instructions.size())

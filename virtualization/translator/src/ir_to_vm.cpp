@@ -1,6 +1,9 @@
 #include "bytemorph/virt/ir_to_vm.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <unordered_map>
+#include <vector>
 
 namespace bytemorph::virt {
 
@@ -12,21 +15,30 @@ namespace {
 class RegAllocator {
 public:
     RegAllocator() {
-        map_["rax"] = 0; map_["eax"] = 0; map_["x0"] = 0; map_["w0"] = 0; map_["r0"] = 0;
-        map_["rcx"] = 1; map_["ecx"] = 1; map_["x1"] = 1; map_["w1"] = 1; map_["r1"] = 1;
-        map_["rdx"] = 2; map_["edx"] = 2; map_["x2"] = 2; map_["w2"] = 2; map_["r2"] = 2;
-        map_["rbx"] = 3; map_["ebx"] = 3; map_["x3"] = 3; map_["w3"] = 3; map_["r3"] = 3;
-        map_["rsp"] = 4; map_["sp"]  = 4;
-        map_["rbp"] = 5; map_["x29"] = 5;
-        map_["rsi"] = 6; map_["esi"] = 6; map_["x4"] = 6;
-        map_["rdi"] = 7; map_["edi"] = 7; map_["x5"] = 7;
-        map_["r8"]  = 8; map_["r8d"] = 8;
-        map_["r9"]  = 9; map_["r9d"] = 9;
-        map_["r10"] = 10; map_["r10d"] = 10;
-        map_["r11"] = 11; map_["r11d"] = 11;
+        map_["rax"] = 0; map_["eax"] = 0; map_["ax"] = 0; map_["al"] = 0; map_["x0"] = 0; map_["w0"] = 0; map_["r0"] = 0;
+        map_["rcx"] = 1; map_["ecx"] = 1; map_["cx"] = 1; map_["cl"] = 1; map_["x1"] = 1; map_["w1"] = 1; map_["r1"] = 1;
+        map_["rdx"] = 2; map_["edx"] = 2; map_["dx"] = 2; map_["dl"] = 2; map_["x2"] = 2; map_["w2"] = 2; map_["r2"] = 2;
+        map_["rbx"] = 3; map_["ebx"] = 3; map_["bx"] = 3; map_["bl"] = 3; map_["x3"] = 3; map_["w3"] = 3; map_["r3"] = 3;
+        map_["rsp"] = 4; map_["esp"] = 4; map_["sp"] = 4;
+        map_["rbp"] = 5; map_["ebp"] = 5; map_["x29"] = 5; map_["w29"] = 5;
+        map_["rsi"] = 6; map_["esi"] = 6; map_["si"] = 6; map_["sil"] = 6; map_["x4"] = 6; map_["w4"] = 6;
+        map_["rdi"] = 7; map_["edi"] = 7; map_["di"] = 7; map_["dil"] = 7; map_["x5"] = 7; map_["w5"] = 7;
+        map_["r8"]  = 8; map_["r8d"] = 8; map_["r8w"] = 8; map_["r8b"] = 8; map_["x6"] = 8; map_["w6"] = 8;
+        map_["r9"]  = 9; map_["r9d"] = 9; map_["r9w"] = 9; map_["r9b"] = 9; map_["x7"] = 9; map_["w7"] = 9;
+        map_["r10"] = 10; map_["r10d"] = 10; map_["r10w"] = 10; map_["r10b"] = 10; map_["x8"] = 10; map_["w8"] = 10;
+        map_["r11"] = 11; map_["r11d"] = 11; map_["r11w"] = 11; map_["r11b"] = 11; map_["x9"] = 11; map_["w9"] = 11;
     }
 
-    diagnostics::Result<std::uint8_t> get_or_alloc(const std::string& name) {
+    diagnostics::Result<std::uint8_t> get_or_alloc(const std::string& raw_name) {
+        std::string name = raw_name;
+        if (name == "xzr" || name == "wzr") {
+            return static_cast<std::uint8_t>(31);
+        }
+        if (name.size() >= 2 && name[0] == 'w' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+            name = "x" + name.substr(1);
+        } else if (name.size() >= 3 && name[0] == 'r' && name.back() == 'd' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+            name = name.substr(0, name.size() - 1);
+        }
         auto it = map_.find(name);
         if (it != map_.end()) {
             return it->second;
@@ -50,11 +62,20 @@ private:
 VmOpcode map_cond_opcode(const std::string& cond) noexcept {
     if (cond == "je" || cond == "jz" || cond == "b.eq") return VmOpcode::Jeq;
     if (cond == "jne" || cond == "jnz" || cond == "b.ne") return VmOpcode::Jne;
-    if (cond == "jl" || cond == "b.lt") return VmOpcode::Jlt;
-    if (cond == "jle" || cond == "b.le") return VmOpcode::Jle;
-    if (cond == "jg" || cond == "b.gt") return VmOpcode::Jgt;
-    if (cond == "jge" || cond == "b.ge") return VmOpcode::Jge;
+    if (cond == "jl" || cond == "jnge" || cond == "jb" || cond == "jnae" || cond == "jc" || cond == "js" ||
+        cond == "b.lt" || cond == "b.lo" || cond == "b.cc" || cond == "b.mi") return VmOpcode::Jlt;
+    if (cond == "jle" || cond == "jng" || cond == "jbe" || cond == "jna" ||
+        cond == "b.le" || cond == "b.ls") return VmOpcode::Jle;
+    if (cond == "jg" || cond == "jnle" || cond == "ja" || cond == "jnbe" ||
+        cond == "b.gt" || cond == "b.hi") return VmOpcode::Jgt;
+    if (cond == "jge" || cond == "jnl" || cond == "jae" || cond == "jnb" || cond == "jnc" || cond == "jns" ||
+        cond == "b.ge" || cond == "b.hs" || cond == "b.cs" || cond == "b.pl") return VmOpcode::Jge;
     return VmOpcode::Jne;
+}
+
+std::uint8_t normalize_mem_width(std::uint8_t w) noexcept {
+    if (w == 8 || w == 16 || w == 32 || w == 64) return w;
+    return 64;
 }
 
 } // namespace
@@ -91,12 +112,17 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
             return scratch_reg;
         }
         if (op.kind == IrOperand::Kind::VirtualReg || op.kind == IrOperand::Kind::ArchReg) {
+            if (op.name == "xzr" || op.name == "wzr") {
+                prog.instructions.push_back(VmInstruction{VmOpcode::MovImm, scratch_reg, 0, 0, 0});
+                return scratch_reg;
+            }
             return reg_alloc.get_or_alloc(op.name);
         }
         if (op.kind == IrOperand::Kind::Memory) {
             auto base_r = reg_alloc.get_or_alloc(op.name);
             if (!base_r) return base_r;
-            prog.instructions.push_back(VmInstruction{VmOpcode::Load, scratch_reg, base_r.value(), 0, 0});
+            prog.instructions.push_back(
+                VmInstruction{VmOpcode::Load, scratch_reg, base_r.value(), normalize_mem_width(op.bit_width), op.imm});
             return scratch_reg;
         }
         return diagnostics::Result<std::uint8_t>::err(
@@ -115,10 +141,23 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     if (insn.dsts.size() != 1 || insn.srcs.size() != 1) {
                         return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid Mov arity", "IrToVmTranslator::translate");
                     }
+                    if (insn.dsts[0].kind == IrOperand::Kind::Memory) {
+                        auto base_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                        auto src_r = materialize_src(insn.srcs[0], 29);
+                        if (!base_r || !src_r) return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
+                        prog.instructions.push_back(
+                            VmInstruction{VmOpcode::Store, base_r.value(), src_r.value(), normalize_mem_width(insn.dsts[0].bit_width), insn.dsts[0].imm});
+                        break;
+                    }
                     auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
                     if (!dst_r) return diagnostics::Result<BvmProgram>::err(dst_r.error().code, dst_r.error().message, dst_r.error().context);
                     if (insn.srcs[0].kind == IrOperand::Kind::Immediate) {
                         prog.instructions.push_back(VmInstruction{VmOpcode::MovImm, dst_r.value(), 0, 0, insn.srcs[0].imm});
+                    } else if (insn.srcs[0].kind == IrOperand::Kind::Memory) {
+                        auto base_r = reg_alloc.get_or_alloc(insn.srcs[0].name);
+                        if (!base_r) return diagnostics::Result<BvmProgram>::err(base_r.error().code, base_r.error().message, base_r.error().context);
+                        prog.instructions.push_back(
+                            VmInstruction{VmOpcode::Load, dst_r.value(), base_r.value(), normalize_mem_width(insn.srcs[0].bit_width), insn.srcs[0].imm});
                     } else {
                         auto src_r = materialize_src(insn.srcs[0], 29);
                         if (!src_r) return diagnostics::Result<BvmProgram>::err(src_r.error().code, src_r.error().message, src_r.error().context);
@@ -133,7 +172,8 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
                     auto base_r = reg_alloc.get_or_alloc(insn.srcs[0].name);
                     if (!dst_r || !base_r) return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
-                    prog.instructions.push_back(VmInstruction{VmOpcode::Load, dst_r.value(), base_r.value(), 0, 0});
+                    const std::uint8_t width = normalize_mem_width(insn.srcs[0].bit_width);
+                    prog.instructions.push_back(VmInstruction{VmOpcode::Load, dst_r.value(), base_r.value(), width, insn.srcs[0].imm});
                     break;
                 }
                 case IrOpcode::Store: {
@@ -143,7 +183,8 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     auto base_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
                     auto src_r = materialize_src(insn.srcs[0], 29);
                     if (!base_r || !src_r) return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
-                    prog.instructions.push_back(VmInstruction{VmOpcode::Store, base_r.value(), src_r.value(), 0, 0});
+                    const std::uint8_t width = normalize_mem_width(insn.dsts[0].bit_width);
+                    prog.instructions.push_back(VmInstruction{VmOpcode::Store, base_r.value(), src_r.value(), width, insn.dsts[0].imm});
                     break;
                 }
                 case IrOpcode::Add:
@@ -193,13 +234,40 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     break;
                 }
                 case IrOpcode::Jump: {
-                    if (insn.srcs.empty() || insn.srcs[0].kind != IrOperand::Kind::Label) {
-                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "Indirect/non-label Jump not supported in VM translator", "IrToVmTranslator::translate");
+                    if (insn.srcs.empty()) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Empty Jump operand", "IrToVmTranslator::translate");
                     }
-                    const std::size_t pc = prog.instructions.size();
-                    prog.instructions.push_back(VmInstruction{VmOpcode::Jmp, 0, 0, 0, 0});
-                    patches.push_back(PendingPatch{pc, static_cast<std::uint64_t>(insn.srcs[0].imm)});
-                    break;
+                    if (insn.srcs[0].kind == IrOperand::Kind::Label) {
+                        const std::size_t pc = prog.instructions.size();
+                        prog.instructions.push_back(VmInstruction{VmOpcode::Jmp, 0, 0, 0, 0});
+                        patches.push_back(PendingPatch{pc, static_cast<std::uint64_t>(insn.srcs[0].imm)});
+                        break;
+                    }
+                    if ((insn.srcs[0].kind == IrOperand::Kind::ArchReg || insn.srcs[0].kind == IrOperand::Kind::VirtualReg) &&
+                        (!options.jump_table_targets.empty() || !options.authorized_jump_targets.empty())) {
+                        auto idx_r = reg_alloc.get_or_alloc(insn.srcs[0].name);
+                        if (!idx_r) return diagnostics::Result<BvmProgram>::err(idx_r.error().code, idx_r.error().message, idx_r.error().context);
+                        for (std::size_t idx = 0; idx < options.jump_table_targets.size(); ++idx) {
+                            prog.instructions.push_back(VmInstruction{VmOpcode::MovImm, 30, 0, 0, static_cast<std::int64_t>(idx)});
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Cmp, 0, idx_r.value(), 30, 0});
+                            const std::size_t br_pc = prog.instructions.size();
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Jeq, 0, 0, 0, 0});
+                            patches.push_back(PendingPatch{br_pc, options.jump_table_targets[idx]});
+                        }
+                        std::vector<std::uint64_t> sorted_jtargets(options.authorized_jump_targets.begin(), options.authorized_jump_targets.end());
+                        std::sort(sorted_jtargets.begin(), sorted_jtargets.end());
+                        for (const auto tva : sorted_jtargets) {
+                            prog.instructions.push_back(VmInstruction{VmOpcode::MovImm, 30, 0, 0, static_cast<std::int64_t>(tva)});
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Cmp, 0, idx_r.value(), 30, 0});
+                            const std::size_t br_pc = prog.instructions.size();
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Jeq, 0, 0, 0, 0});
+                            patches.push_back(PendingPatch{br_pc, tva});
+                        }
+                        prog.instructions.push_back(VmInstruction{VmOpcode::Halt, 0xFF, 0, 0, 0});
+                        break;
+                    }
+                    return diagnostics::Result<BvmProgram>::err(
+                        ErrorCode::UnsupportedFormat, "Indirect/non-label Jump not supported in VM translator without validated jump table", "IrToVmTranslator::translate");
                 }
                 case IrOpcode::JumpCond: {
                     if (insn.srcs.empty() || insn.srcs[0].kind != IrOperand::Kind::Label) {
@@ -215,26 +283,54 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     prog.instructions.push_back(VmInstruction{VmOpcode::Ret, 0, 0, 0, 0});
                     break;
                 case IrOpcode::Call: {
-                    if (!options.allow_external_calls ||
-                        insn.srcs.empty() ||
-                        insn.srcs[0].kind != IrOperand::Kind::Label) {
+                    if (!options.allow_external_calls || insn.srcs.empty()) {
                         return diagnostics::Result<BvmProgram>::err(
                             ErrorCode::UnsupportedFormat,
                             "Unsupported Call in VM translator (indirect or external calls disabled)",
                             "IrToVmTranslator::translate");
                     }
-                    const std::uint64_t target_va = static_cast<std::uint64_t>(insn.srcs[0].imm);
-                    if (!options.authorized_call_targets.empty() &&
-                        !options.authorized_call_targets.contains(target_va)) {
-                        return diagnostics::Result<BvmProgram>::err(
-                            ErrorCode::UnsupportedFormat,
-                            "Unauthorized external call target in VM translator",
-                            "IrToVmTranslator::translate");
+                    if (insn.srcs[0].kind == IrOperand::Kind::Label) {
+                        const std::uint64_t target_va = static_cast<std::uint64_t>(insn.srcs[0].imm);
+                        if (!options.authorized_call_targets.empty() &&
+                            !options.authorized_call_targets.contains(target_va)) {
+                            return diagnostics::Result<BvmProgram>::err(
+                                ErrorCode::UnsupportedFormat,
+                                "Unauthorized external call target in VM translator",
+                                "IrToVmTranslator::translate");
+                        }
+                        const std::int64_t rel_off = static_cast<std::int64_t>(target_va) -
+                                                     static_cast<std::int64_t>(options.stub_base_va);
+                        prog.instructions.push_back(VmInstruction{VmOpcode::CallExt, 0, 0, 0, rel_off});
+                        break;
                     }
-                    const std::int64_t rel_off = static_cast<std::int64_t>(target_va) -
-                                                 static_cast<std::int64_t>(options.stub_base_va);
-                    prog.instructions.push_back(VmInstruction{VmOpcode::CallExt, 0, 0, 0, rel_off});
-                    break;
+                    if ((insn.srcs[0].kind == IrOperand::Kind::ArchReg || insn.srcs[0].kind == IrOperand::Kind::VirtualReg) &&
+                        !options.authorized_call_targets.empty()) {
+                        auto reg_r = reg_alloc.get_or_alloc(insn.srcs[0].name);
+                        if (!reg_r) return diagnostics::Result<BvmProgram>::err(reg_r.error().code, reg_r.error().message, reg_r.error().context);
+                        std::vector<std::uint64_t> sorted_ctargets(options.authorized_call_targets.begin(), options.authorized_call_targets.end());
+                        std::sort(sorted_ctargets.begin(), sorted_ctargets.end());
+                        const std::size_t k = sorted_ctargets.size();
+                        const std::size_t base_pc = prog.instructions.size();
+                        const std::size_t dispatch_start = base_pc + k * 3 + 1;
+                        const std::size_t after_pc = dispatch_start + k * 2;
+                        for (std::size_t i = 0; i < k; ++i) {
+                            prog.instructions.push_back(VmInstruction{VmOpcode::MovImm, 30, 0, 0, static_cast<std::int64_t>(sorted_ctargets[i])});
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Cmp, 0, reg_r.value(), 30, 0});
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Jeq, 0, 0, 0, static_cast<std::int64_t>(dispatch_start + i * 2)});
+                        }
+                        prog.instructions.push_back(VmInstruction{VmOpcode::Halt, 0xFF, 0, 0, 0});
+                        for (std::size_t i = 0; i < k; ++i) {
+                            const std::int64_t rel_off = static_cast<std::int64_t>(sorted_ctargets[i]) -
+                                                         static_cast<std::int64_t>(options.stub_base_va);
+                            prog.instructions.push_back(VmInstruction{VmOpcode::CallExt, 0, 0, 0, rel_off});
+                            prog.instructions.push_back(VmInstruction{VmOpcode::Jmp, 0, 0, 0, static_cast<std::int64_t>(after_pc)});
+                        }
+                        break;
+                    }
+                    return diagnostics::Result<BvmProgram>::err(
+                        ErrorCode::UnsupportedFormat,
+                        "Unsupported Call in VM translator (indirect call requires authorized_call_targets)",
+                        "IrToVmTranslator::translate");
                 }
                 case IrOpcode::Syscall:
                 case IrOpcode::Unknown:

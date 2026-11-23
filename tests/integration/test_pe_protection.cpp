@@ -78,7 +78,7 @@ TEST(ProtectionV04Test, RejectsUnsupportedElfArm64AndMalformedInputsCleanly) {
     ProtectOptions opts;
     auto res = ProtectionEngine::protect(elf_path, out_path, opts);
     ASSERT_FALSE(res.has_value());
-    EXPECT_EQ(res.error().code, bytemorph::core::diagnostics::ErrorCode::NotImplemented);
+    EXPECT_EQ(res.error().code, bytemorph::core::diagnostics::ErrorCode::UnsupportedFormat);
 
     std::error_code ec;
     std::filesystem::remove(elf_path, ec);

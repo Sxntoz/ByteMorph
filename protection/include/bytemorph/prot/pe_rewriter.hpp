@@ -37,6 +37,28 @@ struct ProtectOptions {
     bool protect_strings{true};
     bool allow_strip_signature{false};
     bool allow_external_calls{false};
+    bool auto_select_functions{false};
+};
+
+struct FunctionCompatibilityEntry {
+    std::string name;
+    std::uint64_t entry_va{0};
+    std::uint64_t size_bytes{0};
+    bool eligible{false};
+    std::uint32_t ir_ops{0};
+    std::uint32_t vm_ops{0};
+    std::vector<std::string> unsupported_instructions;
+    std::string rejection_reason;
+};
+
+struct CompatibilityReport {
+    core::binary::BinaryFormat format{core::binary::BinaryFormat::Unknown};
+    core::binary::Architecture architecture{core::binary::Architecture::Unknown};
+    bool binary_supported{false};
+    std::vector<FunctionCompatibilityEntry> eligible_functions;
+    std::vector<FunctionCompatibilityEntry> rejected_functions;
+    std::vector<std::string> os_requirements;
+    std::vector<std::string> known_limitations;
 };
 
 struct ProtectedFunctionRecord {
@@ -151,6 +173,10 @@ public:
 
     [[nodiscard]] static core::diagnostics::Result<VerifyReport>
     verify(const std::filesystem::path& path);
+
+    [[nodiscard]] static core::diagnostics::Result<CompatibilityReport>
+    check_compatibility(const std::filesystem::path& path,
+                        bool allow_external_calls = false);
 };
 
 } // namespace bytemorph::prot

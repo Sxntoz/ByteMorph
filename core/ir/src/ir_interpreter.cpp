@@ -1,5 +1,6 @@
 #include "bytemorph/core/ir/ir_interpreter.hpp"
 
+#include <cstring>
 #include <optional>
 #include <unordered_map>
 
@@ -7,42 +8,100 @@ namespace bytemorph::core::ir {
 
 namespace {
 
-std::uint64_t eval_operand(const IrOperand& op, const IrExecState& state) {
+std::string canonical_reg_name(const std::string& name) {
+    if (name == "eax" || name == "ax" || name == "al") return "rax";
+    if (name == "ecx" || name == "cx" || name == "cl") return "rcx";
+    if (name == "edx" || name == "dx" || name == "dl") return "rdx";
+    if (name == "ebx" || name == "bx" || name == "bl") return "rbx";
+    if (name == "esi" || name == "si" || name == "sil") return "rsi";
+    if (name == "edi" || name == "di" || name == "dil") return "rdi";
+    if (name == "esp") return "rsp";
+    if (name == "ebp") return "rbp";
+    if (name.size() >= 2 && name[0] == 'r' && name.back() == 'd' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+        return name.substr(0, name.size() - 1);
+    }
+    if (name.size() >= 2 && name[0] == 'w' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+        return "x" + name.substr(1);
+    }
+    if (name == "wzr" || name == "xzr") return "xzr";
+    return name;
+}
+
+diagnostics::Result<std::uint64_t> eval_operand_checked(const IrOperand& op, const IrExecState& state) {
+    using diagnostics::ErrorCode;
     switch (op.kind) {
         case IrOperand::Kind::Immediate:
             return static_cast<std::uint64_t>(op.imm);
         case IrOperand::Kind::VirtualReg:
         case IrOperand::Kind::ArchReg: {
-            auto it = state.regs.find(op.name);
+            const auto cname = canonical_reg_name(op.name);
+            if (cname == "xzr") return 0ULL;
+            auto it = state.regs.find(cname);
             return (it != state.regs.end()) ? it->second : 0ULL;
         }
         case IrOperand::Kind::Memory: {
-            auto it = state.regs.find(op.name);
-            const std::uint64_t idx = (it != state.regs.end()) ? (it->second % state.memory.size()) : 0ULL;
-            return state.memory.empty() ? 0ULL : state.memory[idx];
+            if (state.memory.empty()) {
+                return diagnostics::Result<std::uint64_t>::err(
+                    ErrorCode::OutOfBounds, "IR virtual memory is empty", "IrInterpreter::execute");
+            }
+            const auto cname = canonical_reg_name(op.name);
+            auto it = state.regs.find(cname);
+            const std::uint64_t base_val = (it != state.regs.end()) ? it->second : 0ULL;
+            const std::int64_t byte_addr = static_cast<std::int64_t>(base_val) + op.imm;
+            const std::size_t width_bytes = (op.bit_width == 8) ? 1 : (op.bit_width == 16) ? 2 : (op.bit_width == 32) ? 4 : 8;
+            const std::size_t total_bytes = state.memory.size() * sizeof(std::uint64_t);
+            if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_bytes) {
+                return diagnostics::Result<std::uint64_t>::err(
+                    ErrorCode::OutOfBounds, "IR memory load out of bounds", "IrInterpreter::execute");
+            }
+            const auto* raw = reinterpret_cast<const std::uint8_t*>(state.memory.data()) + byte_addr;
+            std::uint64_t out = 0;
+            std::memcpy(&out, raw, width_bytes);
+            return out;
         }
         default:
             return 0ULL;
     }
 }
 
-void write_operand(const IrOperand& op, std::uint64_t val, IrExecState& state) {
+diagnostics::Result<void> write_operand_checked(const IrOperand& op, std::uint64_t val, IrExecState& state) {
+    using diagnostics::ErrorCode;
     if (op.kind == IrOperand::Kind::VirtualReg || op.kind == IrOperand::Kind::ArchReg) {
-        state.regs[op.name] = val;
-    } else if (op.kind == IrOperand::Kind::Memory && !state.memory.empty()) {
-        auto it = state.regs.find(op.name);
-        const std::uint64_t idx = (it != state.regs.end()) ? (it->second % state.memory.size()) : 0ULL;
-        state.memory[idx] = val;
+        const auto cname = canonical_reg_name(op.name);
+        if (cname != "xzr") {
+            state.regs[cname] = val;
+        }
+        return diagnostics::Result<void>::ok();
     }
+    if (op.kind == IrOperand::Kind::Memory) {
+        if (state.memory.empty()) {
+            return diagnostics::Result<void>::err(
+                ErrorCode::OutOfBounds, "IR virtual memory is empty", "IrInterpreter::execute");
+        }
+        const auto cname = canonical_reg_name(op.name);
+        auto it = state.regs.find(cname);
+        const std::uint64_t base_val = (it != state.regs.end()) ? it->second : 0ULL;
+        const std::int64_t byte_addr = static_cast<std::int64_t>(base_val) + op.imm;
+        const std::size_t width_bytes = (op.bit_width == 8) ? 1 : (op.bit_width == 16) ? 2 : (op.bit_width == 32) ? 4 : 8;
+        const std::size_t total_bytes = state.memory.size() * sizeof(std::uint64_t);
+        if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_bytes) {
+            return diagnostics::Result<void>::err(
+                ErrorCode::OutOfBounds, "IR memory store out of bounds", "IrInterpreter::execute");
+        }
+        auto* raw = reinterpret_cast<std::uint8_t*>(state.memory.data()) + byte_addr;
+        std::memcpy(raw, &val, width_bytes);
+        return diagnostics::Result<void>::ok();
+    }
+    return diagnostics::Result<void>::ok();
 }
 
 bool eval_condition(const std::string& cond, const IrExecState& state) {
     if (cond == "je" || cond == "jz" || cond == "b.eq") return state.zf;
     if (cond == "jne" || cond == "jnz" || cond == "b.ne") return !state.zf;
-    if (cond == "jl" || cond == "b.lt") return state.sf;
-    if (cond == "jle" || cond == "b.le") return state.sf || state.zf;
-    if (cond == "jg" || cond == "b.gt") return !state.sf && !state.zf;
-    if (cond == "jge" || cond == "b.ge") return !state.sf;
+    if (cond == "jl" || cond == "jnge" || cond == "jb" || cond == "jnae" || cond == "jc" || cond == "js" || cond == "b.lt" || cond == "b.lo" || cond == "b.cc" || cond == "b.mi") return state.sf;
+    if (cond == "jle" || cond == "jng" || cond == "jbe" || cond == "jna" || cond == "b.le" || cond == "b.ls") return state.sf || state.zf;
+    if (cond == "jg" || cond == "jnle" || cond == "ja" || cond == "jnbe" || cond == "b.gt" || cond == "b.hi") return !state.sf && !state.zf;
+    if (cond == "jge" || cond == "jnl" || cond == "jae" || cond == "jnb" || cond == "jnc" || cond == "jns" || cond == "b.ge" || cond == "b.hs" || cond == "b.cs" || cond == "b.pl") return !state.sf;
     return !state.zf;
 }
 
@@ -62,8 +121,17 @@ IrInterpreter::execute(const IrFunction& fn, const IrExecOptions& options) {
     }
 
     IrExecState state;
-    state.regs = options.initial_regs;
     state.memory.assign(options.memory_slots, 0ULL);
+    if (options.memory_slots > 0) {
+        const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
+        state.regs["rsp"] = mid_stack;
+        state.regs["rbp"] = mid_stack;
+        state.regs["sp"]  = mid_stack;
+        state.regs["x29"] = mid_stack;
+    }
+    for (const auto& [k, v] : options.initial_regs) {
+        state.regs[canonical_reg_name(k)] = v;
+    }
 
     std::size_t block_idx = 0;
     if (va_to_block.contains(fn.entry_va)) {
@@ -86,103 +154,62 @@ IrInterpreter::execute(const IrFunction& fn, const IrExecOptions& options) {
                 case IrOpcode::Nop:
                     break;
                 case IrOpcode::Mov:
-                    if (!insn.dsts.empty() && !insn.srcs.empty()) {
-                        write_operand(insn.dsts[0], eval_operand(insn.srcs[0], state), state);
-                    }
-                    break;
                 case IrOpcode::Load:
-                    if (!insn.dsts.empty() && !insn.srcs.empty()) {
-                        write_operand(insn.dsts[0], eval_operand(insn.srcs[0], state), state);
-                    }
-                    break;
                 case IrOpcode::Store:
                     if (!insn.dsts.empty() && !insn.srcs.empty()) {
-                        write_operand(insn.dsts[0], eval_operand(insn.srcs[0], state), state);
+                        auto v = eval_operand_checked(insn.srcs[0], state);
+                        if (!v) return diagnostics::Result<IrExecState>::err(v.error().code, v.error().message, v.error().context);
+                        auto w = write_operand_checked(insn.dsts[0], v.value(), state);
+                        if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
                     }
                     break;
                 case IrOpcode::Add:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) + eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Sub:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) - eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Mul:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) * eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Div:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto denom = eval_operand(insn.srcs[1], state);
-                        if (denom == 0) {
-                            return diagnostics::Result<IrExecState>::err(
-                                ErrorCode::InternalError, "Division by zero in IR interpreter", "IrInterpreter::execute");
-                        }
-                        const auto res = eval_operand(insn.srcs[0], state) / denom;
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::And:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) & eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Or:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) | eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Xor:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto res = eval_operand(insn.srcs[0], state) ^ eval_operand(insn.srcs[1], state);
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Shl:
-                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto sh = eval_operand(insn.srcs[1], state) & 63ULL;
-                        const auto res = eval_operand(insn.srcs[0], state) << sh;
-                        write_operand(insn.dsts[0], res, state);
-                        state.zf = (res == 0);
-                        state.sf = (static_cast<std::int64_t>(res) < 0);
-                    }
-                    break;
                 case IrOpcode::Shr:
                     if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
-                        const auto sh = eval_operand(insn.srcs[1], state) & 63ULL;
-                        const auto res = eval_operand(insn.srcs[0], state) >> sh;
-                        write_operand(insn.dsts[0], res, state);
+                        auto v1 = eval_operand_checked(insn.srcs[0], state);
+                        auto v2 = eval_operand_checked(insn.srcs[1], state);
+                        if (!v1) return diagnostics::Result<IrExecState>::err(v1.error().code, v1.error().message, v1.error().context);
+                        if (!v2) return diagnostics::Result<IrExecState>::err(v2.error().code, v2.error().message, v2.error().context);
+                        std::uint64_t res = 0;
+                        switch (insn.opcode) {
+                            case IrOpcode::Add: res = v1.value() + v2.value(); break;
+                            case IrOpcode::Sub: res = v1.value() - v2.value(); break;
+                            case IrOpcode::Mul: res = v1.value() * v2.value(); break;
+                            case IrOpcode::Div:
+                                if (v2.value() == 0) {
+                                    return diagnostics::Result<IrExecState>::err(
+                                        ErrorCode::InternalError, "Division by zero in IR interpreter", "IrInterpreter::execute");
+                                }
+                                res = v1.value() / v2.value();
+                                break;
+                            case IrOpcode::And: res = v1.value() & v2.value(); break;
+                            case IrOpcode::Or:  res = v1.value() | v2.value(); break;
+                            case IrOpcode::Xor: res = v1.value() ^ v2.value(); break;
+                            case IrOpcode::Shl: res = v1.value() << (v2.value() & 63ULL); break;
+                            case IrOpcode::Shr: res = v1.value() >> (v2.value() & 63ULL); break;
+                            default: break;
+                        }
+                        auto w = write_operand_checked(insn.dsts[0], res, state);
+                        if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
                         state.zf = (res == 0);
                         state.sf = (static_cast<std::int64_t>(res) < 0);
                     }
                     break;
                 case IrOpcode::Cmp:
                     if (insn.srcs.size() >= 2) {
-                        const auto lhs = static_cast<std::int64_t>(eval_operand(insn.srcs[0], state));
-                        const auto rhs = static_cast<std::int64_t>(eval_operand(insn.srcs[1], state));
+                        auto v1 = eval_operand_checked(insn.srcs[0], state);
+                        auto v2 = eval_operand_checked(insn.srcs[1], state);
+                        if (!v1) return diagnostics::Result<IrExecState>::err(v1.error().code, v1.error().message, v1.error().context);
+                        if (!v2) return diagnostics::Result<IrExecState>::err(v2.error().code, v2.error().message, v2.error().context);
+                        const auto lhs = static_cast<std::int64_t>(v1.value());
+                        const auto rhs = static_cast<std::int64_t>(v2.value());
                         state.zf = (lhs == rhs);
                         state.sf = (lhs < rhs);
                     }
