@@ -58,7 +58,7 @@ set(LIEF_MACHO ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     LIEF
     GIT_REPOSITORY https://github.com/lief-project/LIEF.git
-    GIT_TAG 0.15.1
+    GIT_TAG 0.16.4
     GIT_SHALLOW TRUE
 )
 
