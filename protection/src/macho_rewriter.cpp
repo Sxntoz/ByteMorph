@@ -211,7 +211,10 @@ MachORewriter::protect_file(const std::filesystem::path& input,
     if (!added_bmrt_cmd) {
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::InternalError, "Failed to add __BMRT Mach-O segment", "MachORewriter::protect_file");
     }
-    const auto* added_bmrt_seg = added_bmrt_cmd->as<LIEF::MachO::SegmentCommand>();
+    const auto* added_bmrt_seg = dynamic_cast<const LIEF::MachO::SegmentCommand*>(added_bmrt_cmd);
+    if (!added_bmrt_seg) {
+        return diagnostics::Result<ProtectionReport>::err(ErrorCode::InternalError, "Added __BMRT command is not a SegmentCommand", "MachORewriter::protect_file");
+    }
     const std::uint64_t stub_va = added_bmrt_seg->virtual_address();
 
     // Patch __TEXT,__text
