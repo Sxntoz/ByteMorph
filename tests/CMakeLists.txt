@@ -3,7 +3,7 @@ add_executable(lab_pe_target
 )
 target_compile_features(lab_pe_target PRIVATE cxx_std_20)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(lab_pe_target PRIVATE -O2 -fno-sanitize=all)
+    target_compile_options(lab_pe_target PRIVATE -O2 -fomit-frame-pointer -fno-sanitize=all)
 endif()
 
 add_executable(bytemorph_tests
