@@ -2,21 +2,18 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.4.0):**  
+> **Status atual (v0.5.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
-> - **Proteção e reescrita de binários (`protect` / `verify`):** funcional para **Windows PE32+ x86-64** em executáveis de laboratório não assinados; **ELF64** e **Mach-O 64-bit** permanecem como contratos planejados para a v0.5.
+> - **Proteção e reescrita de binários (`protect` / `verify`):** funcional para **Windows PE32+ x86-64**, **Linux ELF64 x86-64** (`ET_EXEC` / PIE `ET_DYN`) e **macOS Mach-O 64-bit** (x86-64 e ARM64, com re-assinatura ad-hoc via `/usr/bin/codesign` no macOS).
 
-## Recursos da v0.4
+## Recursos da v0.5
 
-- **Reescrita modular de binários (`protection/`):**
-  - Inserção controlada de seções respeitando W^X: `.bmrt` (`R-X`, runtime VM nativo PIC x86-64 via AsmJit) e `.bmvm` (`R--`, metadados versionados `BMP4` v1 e payload criptografado).
-  - Preservação de ASLR (`DYNAMIC_BASE`), DEP/NX (`NX_COMPAT`), `.pdata`, `.reloc`, imports e exports.
-  - Recusa modificação silenciosa de binários assinados com Authenticode (exige `--allow-signed-strip`).
-- **Virtualização seletiva de funções:**
-  - Seleção por nome exportado (`--func`) ou RVA (`--func-rva`), validação de elegibilidade, lifting → ofuscação (`fast` / `balanced` / `maximum`) → tradução para VM → trampoline `jmp rel32` compatível com ASLR e Win64 ABI.
-- **Criptografia Autenticada e Integridade (Monocypher 4.0.2):**
-  - **XChaCha20-Poly1305 AEAD** para selagem de bytecode e strings/constantes protegidas.
-  - **BLAKE2b-256** para verificação de integridade de `.text` e `.bmrt`.
+- **Reescrita multiplataforma (`protection/`):**
+  - `PeRewriter` (PE32+ x86-64, Win64 ABI).
+  - `ElfRewriter` (ELF64 x86-64, System V AMD64 ABI, criação de segmentos `PT_LOAD` respeitando W^X).
+  - `MachORewriter` (Mach-O 64-bit x86-64 e ARM64/AAPCS64, segmentos `__BMRT`/`__BMVM`, respeito à política de assinatura do macOS).
+- **Chamadas externas na VM (`vm.callext`):** ponte PIC relativa para chamadas autorizadas compatível com Win64 e System V AMD64.
+- **Criptografia Autenticada e Integridade (Monocypher 4.0.2):** **XChaCha20-Poly1305 AEAD** + **BLAKE2b-256** (`BMP4` v1).
 
 ## Compilação (Windows, Linux e macOS)
 
@@ -27,27 +24,12 @@ ctest --test-dir build -C Release --output-on-failure
 cargo test --workspace
 ```
 
-## Uso da CLI (v0.4)
+## Uso da CLI (v0.5)
 
 ```bash
-# Análise e IR/VM (v0.1 - v0.3)
-bytemorph info <arquivo>
-bytemorph analyze <arquivo>
-bytemorph disasm <arquivo>
-bytemorph functions <arquivo>
-bytemorph cfg <arquivo>
-bytemorph inspect <arquivo> --format json
-bytemorph ir <arquivo> --output saida.ir
-bytemorph obfuscate-ir entrada.ir --output saida.ir --seed 0x1234
-bytemorph vm-compile entrada.ir --output programa.bvm --seed 0x5678
-bytemorph vm-run programa.bvm
-bytemorph vm-inspect programa.bvm
-bytemorph benchmark-vm
-
-# Proteção de Binários PE32+ x86-64 (v0.4)
-bytemorph protect input.exe --output protected.exe --profile balanced --func minha_funcao
-bytemorph verify protected.exe
-bytemorph protection-info protected.exe
+bytemorph protect input_bin --output protected_bin --profile balanced --func bm_target_compute
+bytemorph verify protected_bin
+bytemorph protection-info protected_bin
 bytemorph benchmark-protection
 ```
 

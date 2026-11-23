@@ -71,9 +71,19 @@ ProtectionEngine::verify(const std::filesystem::path& path) {
         return pe_rw.verify_file(path);
     }
 
+    ElfRewriter elf_rw;
+    if (elf_rw.supports(fmt, arch)) {
+        return elf_rw.verify_file(path);
+    }
+
+    MachORewriter macho_rw;
+    if (macho_rw.supports(fmt, arch)) {
+        return macho_rw.verify_file(path);
+    }
+
     return core::diagnostics::Result<VerifyReport>::err(
         core::diagnostics::ErrorCode::UnsupportedFormat,
-        "Protection verification in v0.4 supports PE32+ x86-64",
+        "Protection verification in v0.5 supports PE32+, ELF64, and Mach-O 64-bit",
         "ProtectionEngine::verify");
 }
 

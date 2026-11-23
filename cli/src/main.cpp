@@ -34,7 +34,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.4.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.5.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -51,8 +51,8 @@ void print_usage() {
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
-        << "Protection Commands (v0.4 - PE32+ x86-64):\n"
-        << "  protect <in.exe> --output <out.exe> [--profile fast|balanced|maximum] [--func name | --func-rva hex]\n"
+        << "Protection Commands (v0.4 - v0.5: PE32+ x64, ELF64 x64, Mach-O 64-bit):\n"
+        << "  protect <in> --output <out> [--profile fast|balanced|maximum] [--func name | --func-rva hex]\n"
         << "  verify <protected.exe>              Verify AEAD authentication & section integrity\n"
         << "  protection-info <protected.exe>     Display protection metadata and virtualized functions\n"
         << "  benchmark-protection                Run protection pipeline & integrity benchmark\n\n"
@@ -65,7 +65,8 @@ void print_usage() {
         << "  --fn <index>          Function index in .ir module for vm-compile (default: 0)\n"
         << "  --format <fmt>        Output format for inspect: text | json (default: text)\n"
         << "  --no-strings          Disable string protection in .bmvm\n"
-        << "  --allow-signed-strip  Allow stripping Authenticode signature if present\n"
+        << "  --allow-signed-strip  Allow stripping Authenticode/Mach-O signature if present\n"
+        << "  --allow-ext-calls     Allow authorized external calls (vm.callext) in virtualized functions\n"
         << "  --max <N>             Limit disassembled instructions per section\n"
         << "  --verbose             Enable informational logging\n"
         << "  --help, -h            Show this help message\n"
@@ -594,7 +595,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.4.0\n";
+        std::cout << "ByteMorph v0.5.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -644,6 +645,8 @@ int main(int argc, char* argv[]) {
             prot_opts.protect_strings = false;
         } else if (arg == "--allow-signed-strip") {
             prot_opts.allow_strip_signature = true;
+        } else if (arg == "--allow-ext-calls") {
+            prot_opts.allow_external_calls = true;
         } else if (arg == "--format" && i + 1 < argc) {
             output_format = argv[++i];
             if (output_format != "text" && output_format != "json") return 1;

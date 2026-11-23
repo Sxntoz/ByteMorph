@@ -36,6 +36,7 @@ struct ProtectOptions {
     std::string target_function_name;
     bool protect_strings{true};
     bool allow_strip_signature{false};
+    bool allow_external_calls{false};
 };
 
 struct ProtectedFunctionRecord {

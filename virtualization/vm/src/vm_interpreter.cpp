@@ -248,6 +248,24 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
             case VmOpcode::Halt:
                 state.return_value = state.regs[0];
                 return state;
+            case VmOpcode::CallExt: {
+                if (!options.external_call_handler) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::UnsupportedFormat,
+                        "External call (vm.callext) requires native runtime or external_call_handler",
+                        "VmInterpreter::execute");
+                }
+                auto res = options.external_call_handler(insn.imm, state.regs);
+                if (!res.has_value()) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::UnsupportedFormat,
+                        "Unauthorized or failed external call target",
+                        "VmInterpreter::execute");
+                }
+                state.regs[0] = *res;
+                ++state.pc;
+                break;
+            }
             case VmOpcode::MaxOpcode:
                 return core::diagnostics::Result<VmExecState>::err(
                     ErrorCode::ParseError, "Invalid VM opcode during execution", "VmInterpreter::execute");

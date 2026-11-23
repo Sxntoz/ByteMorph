@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <vector>
 
 namespace bytemorph::virt {
@@ -14,6 +16,7 @@ struct VmExecOptions {
     std::size_t memory_slots{4096};
     std::size_t max_call_depth{256};
     std::array<std::uint64_t, BvmProgram::kNumRegisters> initial_regs{};
+    std::function<std::optional<std::uint64_t>(std::int64_t, const std::array<std::uint64_t, BvmProgram::kNumRegisters>&)> external_call_handler;
 };
 
 struct VmExecState {

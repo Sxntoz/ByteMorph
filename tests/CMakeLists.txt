@@ -15,6 +15,7 @@ add_executable(bytemorph_tests
     integration/test_macho_and_cfg2.cpp
     integration/test_ir_to_vm_diff.cpp
     integration/test_pe_protection.cpp
+    integration/test_cross_platform_protection.cpp
     regression/test_malformed_inputs.cpp
 )
 

@@ -64,13 +64,13 @@ TEST(ProtectionV04Test, CryptoAeadSealsOpensAndDetectsTampering) {
     EXPECT_FALSE(CryptoAead::open(sealed.value(), aad, wrong_key).has_value());
 }
 
-TEST(ProtectionV04Test, RejectsUnsupportedElfAndMalformedInputsCleanly) {
+TEST(ProtectionV04Test, RejectsUnsupportedElfArm64AndMalformedInputsCleanly) {
     const auto tmp_dir = std::filesystem::temp_directory_path();
-    const auto elf_path = tmp_dir / "bm_test_elf64.bin";
-    const auto out_path = tmp_dir / "bm_test_elf64_out.bin";
+    const auto elf_path = tmp_dir / "bm_test_elf64_arm64.bin";
+    const auto out_path = tmp_dir / "bm_test_elf64_arm64_out.bin";
 
     {
-        auto elf = bytemorph::tests::build_minimal_elf64_x86_64(bytemorph::tests::sample_x86_64_code());
+        auto elf = bytemorph::tests::build_minimal_elf64_arm64(bytemorph::tests::sample_arm64_code());
         std::ofstream ofs(elf_path, std::ios::binary);
         ofs.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
     }

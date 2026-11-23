@@ -37,7 +37,8 @@ enum class VmOpcode : std::uint8_t {
     Call = 0x16,
     Ret = 0x17,
     Halt = 0x18,
-    MaxOpcode = 0x19
+    CallExt = 0x19,
+    MaxOpcode = 0x1A
 };
 
 [[nodiscard]] std::string_view to_string(VmOpcode op) noexcept;

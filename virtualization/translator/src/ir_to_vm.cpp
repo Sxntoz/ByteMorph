@@ -61,6 +61,13 @@ VmOpcode map_cond_opcode(const std::string& cond) noexcept {
 
 diagnostics::Result<BvmProgram>
 IrToVmTranslator::translate(const IrFunction& fn, std::uint64_t build_seed) {
+    TranslateOptions opts;
+    opts.build_seed = build_seed;
+    return translate(fn, opts);
+}
+
+diagnostics::Result<BvmProgram>
+IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& options) {
     using diagnostics::ErrorCode;
     if (fn.blocks.empty()) {
         return diagnostics::Result<BvmProgram>::err(
@@ -68,7 +75,7 @@ IrToVmTranslator::translate(const IrFunction& fn, std::uint64_t build_seed) {
     }
 
     BvmProgram prog;
-    prog.build_seed = build_seed;
+    prog.build_seed = options.build_seed;
 
     RegAllocator reg_alloc;
     std::unordered_map<std::uint64_t, std::size_t> block_pc;
@@ -207,7 +214,28 @@ IrToVmTranslator::translate(const IrFunction& fn, std::uint64_t build_seed) {
                 case IrOpcode::Ret:
                     prog.instructions.push_back(VmInstruction{VmOpcode::Ret, 0, 0, 0, 0});
                     break;
-                case IrOpcode::Call:
+                case IrOpcode::Call: {
+                    if (!options.allow_external_calls ||
+                        insn.srcs.empty() ||
+                        insn.srcs[0].kind != IrOperand::Kind::Label) {
+                        return diagnostics::Result<BvmProgram>::err(
+                            ErrorCode::UnsupportedFormat,
+                            "Unsupported Call in VM translator (indirect or external calls disabled)",
+                            "IrToVmTranslator::translate");
+                    }
+                    const std::uint64_t target_va = static_cast<std::uint64_t>(insn.srcs[0].imm);
+                    if (!options.authorized_call_targets.empty() &&
+                        !options.authorized_call_targets.contains(target_va)) {
+                        return diagnostics::Result<BvmProgram>::err(
+                            ErrorCode::UnsupportedFormat,
+                            "Unauthorized external call target in VM translator",
+                            "IrToVmTranslator::translate");
+                    }
+                    const std::int64_t rel_off = static_cast<std::int64_t>(target_va) -
+                                                 static_cast<std::int64_t>(options.stub_base_va);
+                    prog.instructions.push_back(VmInstruction{VmOpcode::CallExt, 0, 0, 0, rel_off});
+                    break;
+                }
                 case IrOpcode::Syscall:
                 case IrOpcode::Unknown:
                     return diagnostics::Result<BvmProgram>::err(
