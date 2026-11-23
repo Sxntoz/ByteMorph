@@ -83,6 +83,12 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
         ir.opcode = IrOpcode::Mov;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "add" && ops.size() == 4 && ops[1] == ops[2] && ops[3] == "lsl #1") {
+        ir.opcode = IrOpcode::Mul;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(IrOperand::immediate(3, 64));
+        ir.comment = "add_lsl1_mul3";
     } else if (insn.mnemonic == "add" && ops.size() >= 3) {
         ir.opcode = IrOpcode::Add;
         ir.dsts.push_back(parse_operand_text(ops[0]));
@@ -177,7 +183,34 @@ IrFunction AArch64Lifter::lift_function(const FunctionInfo& fn) const {
         ir_bb.successors = bb.successors;
         ir_bb.instructions.reserve(bb.instructions.size());
         for (const auto& insn : bb.instructions) {
-            ir_bb.instructions.push_back(lift_instruction(insn));
+            const auto ops = split_operands(insn.operands_text);
+            const bool is_shift_alu =
+                ops.size() == 4 &&
+                (insn.mnemonic == "add" || insn.mnemonic == "sub" || insn.mnemonic == "and" ||
+                 insn.mnemonic == "orr" || insn.mnemonic == "eor") &&
+                !(insn.mnemonic == "add" && ops[1] == ops[2] && ops[3] == "lsl #1") &&
+                (ops[3].rfind("lsl #", 0) == 0 || ops[3].rfind("lsr #", 0) == 0);
+            if (is_shift_alu) {
+                const bool is_lsl = ops[3].rfind("lsl #", 0) == 0;
+                const auto shift_amt = parse_operand_text(ops[3].substr(4));
+                const auto tmp = IrOperand::reg("__bm_shift_tmp", 64);
+
+                IrInstruction sh;
+                sh.source_va = insn.address;
+                sh.opcode = is_lsl ? IrOpcode::Shl : IrOpcode::Shr;
+                sh.dsts.push_back(tmp);
+                sh.srcs.push_back(parse_operand_text(ops[2]));
+                sh.srcs.push_back(shift_amt);
+                ir_bb.instructions.push_back(std::move(sh));
+
+                IrInstruction alu = lift_instruction(insn);
+                if (alu.srcs.size() >= 2) {
+                    alu.srcs[1] = tmp;
+                }
+                ir_bb.instructions.push_back(std::move(alu));
+            } else {
+                ir_bb.instructions.push_back(lift_instruction(insn));
+            }
         }
         ir_fn.blocks.push_back(std::move(ir_bb));
     }

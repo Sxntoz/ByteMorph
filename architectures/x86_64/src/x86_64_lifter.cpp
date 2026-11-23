@@ -69,7 +69,7 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
     ir.source_va = insn.address;
     const auto ops = split_operands(insn.operands_text);
 
-    if (insn.mnemonic == "nop") {
+    if (insn.mnemonic == "nop" || insn.mnemonic == "endbr64" || insn.mnemonic == "endbr32") {
         ir.opcode = IrOpcode::Nop;
     } else if (insn.mnemonic == "mov" && ops.size() == 2) {
         ir.opcode = IrOpcode::Mov;
