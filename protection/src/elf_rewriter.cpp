@@ -346,7 +346,7 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     std::error_code ec;
     ProtectionReport rep;
     rep.format = BinaryFormat::ELF64;
-    rep.architecture = Architecture::X86_64;
+    rep.architecture = bin.info().architecture;
     rep.profile = options.profile;
     rep.seed = options.seed;
     rep.input_size = bin.info().file_size;
