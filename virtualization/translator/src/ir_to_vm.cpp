@@ -20,6 +20,10 @@ public:
         map_["rbp"] = 5; map_["x29"] = 5;
         map_["rsi"] = 6; map_["esi"] = 6; map_["x4"] = 6;
         map_["rdi"] = 7; map_["edi"] = 7; map_["x5"] = 7;
+        map_["r8"]  = 8; map_["r8d"] = 8;
+        map_["r9"]  = 9; map_["r9d"] = 9;
+        map_["r10"] = 10; map_["r10d"] = 10;
+        map_["r11"] = 11; map_["r11d"] = 11;
     }
 
     diagnostics::Result<std::uint8_t> get_or_alloc(const std::string& name) {
@@ -40,7 +44,7 @@ public:
 
 private:
     std::unordered_map<std::string, std::uint8_t> map_;
-    std::uint8_t next_reg_{8}; // R28..R31 reserved as scratch
+    std::uint8_t next_reg_{12}; // R28..R31 reserved as scratch
 };
 
 VmOpcode map_cond_opcode(const std::string& cond) noexcept {

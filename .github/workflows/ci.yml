@@ -23,7 +23,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel 2
 
       - name: Run CTest
         run: ctest --test-dir build -C Release --output-on-failure
@@ -54,7 +54,7 @@ jobs:
         run: cmake -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBYTEMORPH_ENABLE_SANITIZERS=ON -DBYTEMORPH_BUILD_FUZZERS=ON
 
       - name: Build Fuzz Targets & Tests
-        run: cmake --build build-fuzz --target bytemorph_tests fuzz_loader fuzz_pe_parser fuzz_elf_parser fuzz_macho_parser --parallel
+        run: cmake --build build-fuzz --target bytemorph_tests fuzz_loader fuzz_pe_parser fuzz_elf_parser fuzz_macho_parser --parallel 2
 
       - name: Run Tests under ASan/UBSan
         run: ctest --test-dir build-fuzz --output-on-failure

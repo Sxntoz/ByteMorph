@@ -90,6 +90,14 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(LIEF Zydis capstone)
 
+FetchContent_Declare(
+    monocypher
+    GIT_REPOSITORY https://github.com/LoupVaillant/Monocypher.git
+    GIT_TAG 4.0.2
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(monocypher)
+
 if(BYTEMORPH_ENABLE_ASMJIT)
     set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
     FetchContent_Declare(
@@ -109,6 +117,7 @@ add_subdirectory(formats)
 add_subdirectory(architectures)
 add_subdirectory(obfuscation)
 add_subdirectory(virtualization)
+add_subdirectory(protection)
 add_subdirectory(cli)
 
 if(BYTEMORPH_BUILD_TESTS)

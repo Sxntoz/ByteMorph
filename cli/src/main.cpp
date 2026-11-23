@@ -10,6 +10,7 @@
 #include "bytemorph/formats/macho/macho_parser.hpp"
 #include "bytemorph/formats/pe/pe_parser.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
+#include "bytemorph/prot/pe_rewriter.hpp"
 #include "bytemorph/virt/asmjit_prototype.hpp"
 #include "bytemorph/virt/bvm_format.hpp"
 #include "bytemorph/virt/ir_to_vm.hpp"
@@ -33,7 +34,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.3.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine (Experimental)\n\n"
+        << "ByteMorph v0.4.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -43,22 +44,32 @@ void print_usage() {
         << "  functions <file>                    List discovered functions with metadata and confidence\n"
         << "  cfg <file>                          Display Control Flow Graph (basic blocks, edges, loops)\n"
         << "  inspect <file> --format json        Inspect full binary & analysis report\n\n"
-        << "IR & Virtualization Commands (v0.3):\n"
+        << "IR & VM Commands (v0.3):\n"
         << "  ir <file> [--output out.ir]         Lift binary functions to ByteMorph IR\n"
         << "  obfuscate-ir <in.ir> --output out.ir [--seed N]\n"
         << "  vm-compile <in.ir> --output out.bvm [--seed N] [--fn idx]\n"
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
+        << "Protection Commands (v0.4 - PE32+ x86-64):\n"
+        << "  protect <in.exe> --output <out.exe> [--profile fast|balanced|maximum] [--func name | --func-rva hex]\n"
+        << "  verify <protected.exe>              Verify AEAD authentication & section integrity\n"
+        << "  protection-info <protected.exe>     Display protection metadata and virtualized functions\n"
+        << "  benchmark-protection                Run protection pipeline & integrity benchmark\n\n"
         << "Options:\n"
-        << "  --output <path>   Output file path\n"
-        << "  --seed <N>        Deterministic PRNG seed (default: 0x42595445)\n"
-        << "  --fn <index>      Function index in .ir module for vm-compile (default: 0)\n"
-        << "  --format <fmt>    Output format for inspect: text | json (default: text)\n"
-        << "  --max <N>         Limit disassembled instructions per section\n"
-        << "  --verbose         Enable informational logging\n"
-        << "  --help, -h        Show this help message\n"
-        << "  --version, -v     Show version information\n";
+        << "  --output <path>       Output file path\n"
+        << "  --profile <p>         Protection profile: fast | balanced | maximum (default: balanced)\n"
+        << "  --func <name>         Target exported function name to virtualize\n"
+        << "  --func-rva <hex>      Target function RVA (hex) to virtualize\n"
+        << "  --seed <N>            Deterministic PRNG seed\n"
+        << "  --fn <index>          Function index in .ir module for vm-compile (default: 0)\n"
+        << "  --format <fmt>        Output format for inspect: text | json (default: text)\n"
+        << "  --no-strings          Disable string protection in .bmvm\n"
+        << "  --allow-signed-strip  Allow stripping Authenticode signature if present\n"
+        << "  --max <N>             Limit disassembled instructions per section\n"
+        << "  --verbose             Enable informational logging\n"
+        << "  --help, -h            Show this help message\n"
+        << "  --version, -v         Show version information\n";
 }
 
 BinaryLoader create_default_loader() {
@@ -477,6 +488,100 @@ int cmd_benchmark_vm() {
 
 } // namespace
 
+int cmd_protect(const std::string& in_path,
+                const std::string& out_path,
+                const bytemorph::prot::ProtectOptions& opts) {
+    if (out_path.empty()) {
+        std::cerr << "Error: --output <protected.exe> is required for protect.\n";
+        return 1;
+    }
+    auto res = bytemorph::prot::ProtectionEngine::protect(in_path, out_path, opts);
+    if (!res) {
+        std::cerr << "Protection failed: " << res.error().to_string() << '\n';
+        return 1;
+    }
+    const auto& r = res.value();
+    std::cout << "=== ByteMorph v0.4 Protection Complete ===\n"
+              << "  Format / Arch       : " << to_string(r.format) << " / " << to_string(r.architecture) << '\n'
+              << "  Profile             : " << bytemorph::prot::to_string(r.profile) << '\n'
+              << "  Seed                : 0x" << std::hex << r.seed << std::dec << '\n'
+              << "  Input -> Output     : " << r.input_size << " -> " << r.output_size << " bytes\n"
+              << "  ASLR / DEP          : " << (r.aslr_preserved ? "Preserved" : "No") << " / "
+              << (r.dep_preserved ? "Preserved" : "No") << '\n'
+              << "  Protected Strings   : " << r.protected_strings_count << '\n'
+              << "  Virtualized Funcs   : " << r.protected_functions.size() << '\n';
+    for (const auto& f : r.protected_functions) {
+        std::cout << "    - " << f.name << " RVA=0x" << std::hex << f.original_rva
+                  << " -> stub=0x" << f.stub_rva << std::dec
+                  << " (orig_ir=" << f.orig_ir_ops
+                  << ", obf_ir=" << f.obf_ir_ops
+                  << ", vm_ops=" << f.vm_ops << ")\n";
+    }
+    return 0;
+}
+
+int cmd_verify(const std::string& path) {
+    auto res = bytemorph::prot::ProtectionEngine::verify(path);
+    if (!res) {
+        std::cerr << "Verify failed: " << res.error().to_string() << '\n';
+        return 1;
+    }
+    const auto& v = res.value();
+    std::cout << "=== ByteMorph Protection Verification ===\n"
+              << "  Status              : " << (v.valid ? "VALID" : "INVALID") << '\n'
+              << "  AEAD Authenticated  : " << (v.aead_authenticated ? "Yes" : "No") << '\n'
+              << "  .text Integrity     : " << (v.text_integrity_ok ? "OK" : "TAMPERED") << '\n'
+              << "  .bmrt Integrity     : " << (v.runtime_integrity_ok ? "OK" : "TAMPERED") << '\n'
+              << "  Summary             : " << v.summary << '\n';
+    return v.valid ? 0 : 2;
+}
+
+int cmd_protection_info(const std::string& path) {
+    auto res = bytemorph::prot::ProtectionEngine::verify(path);
+    if (!res) {
+        std::cerr << "Protection info failed: " << res.error().to_string() << '\n';
+        return 1;
+    }
+    const auto& m = res.value().metadata;
+    std::cout << "=== ByteMorph Protection Metadata (BMP4 v1) ===\n"
+              << "  Profile             : " << bytemorph::prot::to_string(m.profile) << '\n'
+              << "  Seed                : 0x" << std::hex << m.seed << std::dec << '\n'
+              << "  Protected Strings   : " << m.protected_strings_count << '\n'
+              << "  Integrity Valid     : " << (res.value().valid ? "Yes" : "No") << '\n'
+              << "  Protected Functions : " << m.functions.size() << '\n';
+    for (const auto& f : m.functions) {
+        std::cout << "    - " << f.name << " RVA=0x" << std::hex << f.original_rva
+                  << " -> stub=0x" << f.stub_rva << std::dec
+                  << " (vm_ops=" << f.vm_ops << ")\n";
+    }
+    return 0;
+}
+
+int cmd_benchmark_protection() {
+    auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
+    if (!cmp_res) {
+        std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
+        return 1;
+    }
+    const std::string msg = "ByteMorph v0.4 AEAD Integrity Benchmark";
+    const auto key = bytemorph::prot::CryptoAead::derive_key_from_seed(0x42595445ULL, "bench");
+    const auto nonce = bytemorph::prot::CryptoAead::generate_nonce(0x42595445ULL, 1);
+    const std::span<const std::uint8_t> pt(reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) {
+        auto s = bytemorph::prot::CryptoAead::seal(pt, {}, key, nonce);
+        if (s) (void)bytemorph::prot::CryptoAead::open(s.value(), {}, key);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double aead_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::cout << "=== ByteMorph v0.4 Protection Benchmark ===\n"
+              << "  VM Interpreter (10k iters)  : " << std::fixed << std::setprecision(3) << cmp_res.value().vm_ms << " ms\n"
+              << "  XChaCha20-Poly1305 (1k ops) : " << aead_ms << " ms\n";
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage();
@@ -489,11 +594,14 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.3.0\n";
+        std::cout << "ByteMorph v0.4.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
         return cmd_benchmark_vm();
+    }
+    if (cmd == "benchmark-protection") {
+        return cmd_benchmark_protection();
     }
 
     if (argc < 3) {
@@ -508,6 +616,7 @@ int main(int argc, char* argv[]) {
     std::size_t fn_idx = 0;
     std::uint64_t seed = 0x42595445ULL;
     std::string output_format = "text";
+    bytemorph::prot::ProtectOptions prot_opts;
 
     for (int i = 3; i < argc; ++i) {
         std::string_view arg = argv[i];
@@ -518,9 +627,23 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--output" && i + 1 < argc) {
             output_path = argv[++i];
         } else if (arg == "--seed" && i + 1 < argc) {
-            try { seed = std::stoull(argv[++i], nullptr, 0); } catch (...) { return 1; }
+            try { seed = std::stoull(argv[++i], nullptr, 0); prot_opts.seed = seed; } catch (...) { return 1; }
         } else if (arg == "--fn" && i + 1 < argc) {
             try { fn_idx = std::stoull(argv[++i]); } catch (...) { return 1; }
+        } else if (arg == "--profile" && i + 1 < argc) {
+            std::string_view p = argv[++i];
+            if (p == "fast") prot_opts.profile = bytemorph::prot::ProtectionProfile::Fast;
+            else if (p == "balanced") prot_opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+            else if (p == "maximum") prot_opts.profile = bytemorph::prot::ProtectionProfile::Maximum;
+            else { std::cerr << "Invalid --profile (expected fast|balanced|maximum)\n"; return 1; }
+        } else if (arg == "--func" && i + 1 < argc) {
+            prot_opts.target_function_name = argv[++i];
+        } else if (arg == "--func-rva" && i + 1 < argc) {
+            try { prot_opts.target_function_rva = std::stoull(argv[++i], nullptr, 16); } catch (...) { return 1; }
+        } else if (arg == "--no-strings") {
+            prot_opts.protect_strings = false;
+        } else if (arg == "--allow-signed-strip") {
+            prot_opts.allow_strip_signature = true;
         } else if (arg == "--format" && i + 1 < argc) {
             output_format = argv[++i];
             if (output_format != "text" && output_format != "json") return 1;
@@ -534,6 +657,9 @@ int main(int argc, char* argv[]) {
     if (cmd == "vm-compile") return cmd_vm_compile(file_path, output_path, seed, fn_idx);
     if (cmd == "vm-run") return cmd_vm_run(file_path);
     if (cmd == "vm-inspect") return cmd_vm_inspect(file_path);
+    if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
+    if (cmd == "verify") return cmd_verify(file_path);
+    if (cmd == "protection-info") return cmd_protection_info(file_path);
 
     auto loader = create_default_loader();
     auto load_res = loader.load_file(file_path);

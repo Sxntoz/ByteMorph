@@ -1,3 +1,8 @@
+add_executable(lab_pe_target
+    lab/lab_pe_target.cpp
+)
+target_compile_features(lab_pe_target PRIVATE cxx_std_20)
+
 add_executable(bytemorph_tests
     unit/test_diagnostics.cpp
     unit/test_ir.cpp
@@ -9,6 +14,7 @@ add_executable(bytemorph_tests
     integration/test_pe_elf_analysis.cpp
     integration/test_macho_and_cfg2.cpp
     integration/test_ir_to_vm_diff.cpp
+    integration/test_pe_protection.cpp
     regression/test_malformed_inputs.cpp
 )
 
@@ -17,6 +23,13 @@ target_include_directories(bytemorph_tests
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_compile_definitions(bytemorph_tests
+    PRIVATE
+        BYTEMORPH_LAB_PE_TARGET_PATH="$<TARGET_FILE:lab_pe_target>"
+)
+
+add_dependencies(bytemorph_tests lab_pe_target)
+
 target_link_libraries(bytemorph_tests
     PRIVATE
         ByteMorph::Core
@@ -24,6 +37,7 @@ target_link_libraries(bytemorph_tests
         ByteMorph::Arch
         ByteMorph::Obf
         ByteMorph::Virt
+        ByteMorph::Prot
         GTest::gtest_main
 )
 

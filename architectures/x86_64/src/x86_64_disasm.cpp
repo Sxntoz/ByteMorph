@@ -2,6 +2,7 @@
 
 #include <Zydis/Zydis.h>
 
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 

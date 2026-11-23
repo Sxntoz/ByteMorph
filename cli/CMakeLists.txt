@@ -9,6 +9,7 @@ target_link_libraries(bytemorph
         ByteMorph::Arch
         ByteMorph::Obf
         ByteMorph::Virt
+        ByteMorph::Prot
 )
 
 target_compile_features(bytemorph PRIVATE cxx_std_20)

@@ -1,5 +1,6 @@
 #include "bytemorph/arch/x86_64/x86_64_lifter.hpp"
 
+#include <cctype>
 #include <sstream>
 #include <vector>
 
@@ -75,8 +76,55 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
     } else if (insn.mnemonic == "lea" && ops.size() == 2) {
+        const auto dst = parse_operand_text(ops[0]);
+        std::string expr = ops[1];
+        const auto lbr = expr.find('[');
+        const auto rbr = expr.find(']');
+        if (lbr != std::string::npos && rbr != std::string::npos && rbr > lbr + 1) {
+            expr = expr.substr(lbr + 1, rbr - lbr - 1);
+            // Strip spaces
+            std::string clean;
+            for (char c : expr) {
+                if (c != ' ') clean.push_back(c);
+            }
+            const auto plus = clean.find('+');
+            const auto minus = clean.find('-');
+            if (plus != std::string::npos) {
+                const std::string lhs = clean.substr(0, plus);
+                const std::string rhs = clean.substr(plus + 1);
+                const auto star = rhs.find('*');
+                if (star != std::string::npos) {
+                    const std::string idx = rhs.substr(0, star);
+                    const std::string scale_s = rhs.substr(star + 1);
+                    if (lhs == idx && scale_s == "2") {
+                        ir.opcode = IrOpcode::Mul;
+                        ir.dsts.push_back(dst);
+                        ir.srcs.push_back(IrOperand::reg(lhs, 64));
+                        ir.srcs.push_back(IrOperand::immediate(3, 64));
+                        ir.comment = "lea*3";
+                        return ir;
+                    }
+                }
+                ir.opcode = IrOpcode::Add;
+                ir.dsts.push_back(dst);
+                ir.srcs.push_back(parse_operand_text(lhs));
+                ir.srcs.push_back(parse_operand_text(rhs));
+                ir.comment = "lea+";
+                return ir;
+            }
+            if (minus != std::string::npos) {
+                const std::string lhs = clean.substr(0, minus);
+                const std::string rhs = clean.substr(minus + 1);
+                ir.opcode = IrOpcode::Sub;
+                ir.dsts.push_back(dst);
+                ir.srcs.push_back(parse_operand_text(lhs));
+                ir.srcs.push_back(parse_operand_text(rhs));
+                ir.comment = "lea-";
+                return ir;
+            }
+        }
         ir.opcode = IrOpcode::Mov;
-        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.dsts.push_back(dst);
         ir.srcs.push_back(parse_operand_text(ops[1]));
         ir.comment = "lea";
     } else if (insn.mnemonic == "add" && ops.size() == 2) {
@@ -101,6 +149,26 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.srcs.push_back(parse_operand_text(ops[1]));
     } else if (insn.mnemonic == "or" && ops.size() == 2) {
         ir.opcode = IrOpcode::Or;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "imul" && ops.size() == 2) {
+        ir.opcode = IrOpcode::Mul;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "imul" && ops.size() == 3) {
+        ir.opcode = IrOpcode::Mul;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(parse_operand_text(ops[2]));
+    } else if (insn.mnemonic == "shl" && ops.size() == 2) {
+        ir.opcode = IrOpcode::Shl;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "shr" && ops.size() == 2) {
+        ir.opcode = IrOpcode::Shr;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));

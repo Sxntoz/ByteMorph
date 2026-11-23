@@ -1,21 +1,20 @@
 # Changelog
 
-## [0.3.0] - 2026-11-23
+## [0.4.0] - 2026-11-23
 
 ### Adicionado
-- Serialização versionada `.ir` (`BMIR` v1) e interpretador determinístico de referência da IR (`IrInterpreter`).
-- Engine de ofuscação sobre IR (`SemanticSubstitutionPass`, `ArithmeticBooleanMbaPass`, `ControlFlowObfuscationPass`, `ObfuscationPipeline`, `EquivalenceValidator`).
-- Máquina virtual própria baseada em registradores, formato `.bvm` (`BMVM` v1) com diversificação de opcodes por `build_seed` e interpretador seguro com limites de execução.
-- Tradutor `IrToVmTranslator` e protótipo nativo x86-64 via **AsmJit** (`AsmJitPrototype`).
-- Comandos CLI v0.3: `ir`, `obfuscate-ir`, `vm-compile`, `vm-run`, `vm-inspect` e `benchmark-vm`.
-- Testes diferenciais IR vs IR ofuscada vs VM, testes baseados em propriedades e documentação em `docs/IR_AND_BYTECODE.md`.
+- Reescritor modular PE32+ x86-64 (`PeRewriter`) com escrita atômica e validação estrutural pós-proteção.
+- Virtualização seletiva de funções nativas com trampoline `jmp rel32` compatível com ASLR e runtime VM PIC x86-64 na seção `.bmrt` (`R-X`).
+- Criptografia autenticada **XChaCha20-Poly1305 AEAD** e hashing **BLAKE2b-256** via **Monocypher 4.0.2** na seção `.bmvm` (`BMP4` v1).
+- Perfis de proteção (`fast`, `balanced`, `maximum`) e comandos CLI `protect`, `verify`, `protection-info` e `benchmark-protection`.
+- Teste de integração ponta a ponta executando binário real de laboratório (`lab_pe_target.exe`) antes e depois da virtualização.
+- Correções de CI: upgrade do LIEF para `0.16.4`, runner `macos-latest` e `--parallel 2` para evitar OOM no Ubuntu.
+
+## [0.3.0] - 2026-11-23
+- Engine de ofuscação sobre IR, VM baseada em registradores, tradutor IR → `.bvm`, protótipo AsmJit e publicação pública no GitHub.
 
 ## [0.2.0] - 2026-11-23
-
-### Adicionado
-- Parser Mach-O 64-bit e Fat/Universal, disassembler/lifter ARM64 (Capstone), `.pdata`/`.eh_frame_hdr`/`LC_FUNCTION_STARTS`, CFG 2.0, fuzz targets e benchmark.
+- Parser Mach-O 64-bit e Fat/Universal, disassembler/lifter ARM64, descoberta avançada de funções, CFG 2.0 e fuzz targets.
 
 ## [0.1.0] - 2026-11-23
-
-### Adicionado
 - Fundação multiplataforma C++20/Rust, parsers PE32+/ELF64, disassembler x86-64 e CLI inicial.
