@@ -93,6 +93,7 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
                 const std::string lhs = clean.substr(0, plus);
                 const std::string rhs = clean.substr(plus + 1);
                 const auto star = rhs.find('*');
+                std::string rhs_clean = rhs;
                 if (star != std::string::npos) {
                     const std::string idx = rhs.substr(0, star);
                     const std::string scale_s = rhs.substr(star + 1);
@@ -104,11 +105,14 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
                         ir.comment = "lea*3";
                         return ir;
                     }
+                    if (scale_s == "1") {
+                        rhs_clean = idx;
+                    }
                 }
                 ir.opcode = IrOpcode::Add;
                 ir.dsts.push_back(dst);
                 ir.srcs.push_back(parse_operand_text(lhs));
-                ir.srcs.push_back(parse_operand_text(rhs));
+                ir.srcs.push_back(parse_operand_text(rhs_clean));
                 ir.comment = "lea+";
                 return ir;
             }
