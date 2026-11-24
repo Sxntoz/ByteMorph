@@ -2404,6 +2404,7 @@ TEST(ProtectionV012Test, SdkMarkersAndAutoSelectProtectionEquivalence) {
     opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
     opts.auto_select_functions = true;
     opts.encrypt_bytecode = true;
+    opts.allow_strip_signature = true;
 
     auto res = bytemorph::prot::ProtectionEngine::protect(sdk_exe, out_exe, opts);
     ASSERT_TRUE(res.has_value()) << res.error().to_string();
@@ -2450,6 +2451,7 @@ TEST(ProtectionV012Test, SharedLibraryDllSoDylibProtectionAndVerification) {
     opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
     opts.protect_all_eligible = true;
     opts.encrypt_bytecode = true;
+    opts.allow_strip_signature = true;
 
     auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
     ASSERT_TRUE(res.has_value()) << res.error().to_string();
@@ -2493,6 +2495,7 @@ TEST(ProtectionV012Test, Cryptography30MultiFunctionAeadAndCorruptionHandling) {
     opts.profile = bytemorph::prot::ProtectionProfile::Maximum;
     opts.protect_all_eligible = true;
     opts.encrypt_bytecode = true;
+    opts.allow_strip_signature = true;
 
     auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
     ASSERT_TRUE(res.has_value()) << res.error().to_string();
