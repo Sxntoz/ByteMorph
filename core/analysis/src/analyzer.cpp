@@ -221,6 +221,9 @@ BinaryAnalyzer::analyze(const binary::IBinaryFile& binary,
         fn.discovery_source = seed.source;
 
         auto in_fn_bounds = [&](std::uint64_t va) -> bool {
+            if (va > entry_va && seeds.contains(va)) {
+                return false;
+            }
             if (!fn.metadata_end_va) {
                 return true;
             }
