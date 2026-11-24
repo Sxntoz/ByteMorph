@@ -33,6 +33,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 using namespace bytemorph::core::analysis;
@@ -2105,7 +2107,7 @@ TEST(ProtectionV011Test, NativeX64Simd20AndMxcsrPreservationExecution) {
 #ifdef _WIN32
     const auto abi = bytemorph::prot::detail::AbiKind::Win64;
 #else
-    const auto abi = bytemorph::prot::detail::AbiKind::SysV64;
+    const auto abi = bytemorph::prot::detail::AbiKind::SysV_AMD64;
 #endif
     auto code = bytemorph::prot::detail::emit_shared_pic_x64_vm_runtime(
         std::vector<BvmProgram>{prog}, abi, layout);
