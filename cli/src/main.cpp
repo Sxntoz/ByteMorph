@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -41,7 +42,7 @@ void print_usage() {
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
         << "  info <file>                         Display binary headers, sections, segments, imports, exports\n"
-        << "  analyze <file> [--functions] [--memory-references] [--eligibility-report report.json]\n"
+        << "  analyze <file> [--functions] [--memory-references] [--simd] [--exceptions] [--eligibility-report report.json]\n"
         << "  disasm <file>                       Disassemble executable sections (x86-64 / ARM64)\n"
         << "  functions <file>                    List discovered functions with metadata and confidence\n"
         << "  cfg <file>                          Display Control Flow Graph (basic blocks, edges, loops)\n"
@@ -53,12 +54,12 @@ void print_usage() {
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
-        << "Protection Commands (v0.4 - v0.9: PE32+ x64/ARM64*, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
-        << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--functions all-eligible|auto|list]\n"
+        << "Protection Commands (v0.4 - v0.10: PE32+ x64/ARM64*, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
+        << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--encrypt-bytecode] [--functions all-eligible|auto|list]\n"
         << "  compatibility <in> [--detailed] [--format json]  Report eligible/rejected functions & cost estimates\n"
-        << "  verify <protected>                  Verify AEAD authentication & section integrity\n"
+        << "  verify <protected> [--deep]         Verify AEAD authentication & section integrity\n"
         << "  protection-info <protected> [--functions] [--format json]  Display protection metadata\n"
-        << "  benchmark-protection [--detailed] [--memory] [--compare-baseline]  Run VM & protection benchmark\n\n"
+        << "  benchmark-protection [--detailed] [--memory] [--crypto] [--compare-baseline]  Run VM & crypto benchmark\n\n"
         << "Options:\n"
         << "  --output, -o <path>        Output file path (optional for protect; defaults to <in>.protected)\n"
         << "  --profile <p>              Protection profile: fast | balanced | maximum (default: balanced)\n"
@@ -75,8 +76,13 @@ void print_usage() {
         << "  --allow-ext-calls          Allow authorized external calls (vm.callext) in virtualized functions\n"
         << "  --detailed                 Show per-function category/cost or multi-function scaling\n"
         << "  --memory-references        Show resolved RIP/PC-relative global references during analyze\n"
+        << "  --simd                     Show functions using SIMD/floating-point instructions during analyze\n"
+        << "  --exceptions               Show exception/unwind metadata (.pdata/.eh_frame/__unwind_info) during analyze\n"
+        << "  --encrypt-bytecode         Encrypt runtime VM bytecode with XChaCha20-Poly1305 AEAD\n"
+        << "  --deep                     Perform additional static structure/nonce/W^X verification in verify\n"
         << "  --memory                   Include VM memory pool vs heap allocation benchmark\n"
-        << "  --compare-baseline         Compare VM benchmark metrics against v0.7/v0.8 baselines\n"
+        << "  --crypto                   Include AEAD seal/open and SIMD benchmark\n"
+        << "  --compare-baseline         Compare VM benchmark metrics against v0.7/v0.8/v0.9 baselines\n"
         << "  --max <N>                  Limit disassembled instructions per section\n"
         << "  --verbose                  Enable informational logging\n"
         << "  --help, -h                 Show this help message\n"
@@ -285,6 +291,62 @@ int cmd_analyze_memory_references(const IBinaryFile& bin, std::size_t max_insns)
         }
     }
     std::cout << "  Total RIP/PC-relative references: " << total_refs << '\n';
+    return 0;
+}
+
+int cmd_analyze_simd(const IBinaryFile& bin, std::size_t max_insns) {
+    AnalysisResult analysis;
+    const int rc = run_analysis(bin, max_insns, analysis);
+    if (rc != 0) return rc;
+
+    const bool is_arm64 = (bin.info().architecture == Architecture::ARM64);
+    std::size_t simd_fns = 0;
+    std::cout << "=== SIMD & Floating-Point Analysis ===\n";
+    for (const auto& fn : analysis.functions) {
+        auto ir_fn = is_arm64
+            ? bytemorph::arch::aarch64::AArch64Lifter().lift_function(fn)
+            : bytemorph::arch::x86_64::X86_64Lifter().lift_function(fn);
+        std::size_t simd_ops = 0;
+        for (const auto& bb : ir_fn.blocks) {
+            for (const auto& insn : bb.instructions) {
+                if (insn.opcode == bytemorph::core::ir::IrOpcode::VMov ||
+                    insn.opcode == bytemorph::core::ir::IrOpcode::FAdd ||
+                    insn.opcode == bytemorph::core::ir::IrOpcode::FSub ||
+                    insn.opcode == bytemorph::core::ir::IrOpcode::FMul ||
+                    insn.opcode == bytemorph::core::ir::IrOpcode::FDiv ||
+                    insn.opcode == bytemorph::core::ir::IrOpcode::FCmp ||
+                    (insn.opcode == bytemorph::core::ir::IrOpcode::Xor && !insn.dsts.empty() && insn.dsts[0].bit_width == 128)) {
+                    ++simd_ops;
+                }
+            }
+        }
+        if (simd_ops > 0) {
+            ++simd_fns;
+            std::cout << "  " << std::left << std::setw(28) << fn.name
+                      << " entry=0x" << std::hex << fn.entry_va << std::dec
+                      << " simd_fp_ops=" << simd_ops << '\n';
+        }
+    }
+    std::cout << "  Total functions with modeled SIMD/FP ops: " << simd_fns << '\n';
+    return 0;
+}
+
+int cmd_analyze_exceptions(const std::string& path) {
+    auto res = bytemorph::prot::ProtectionEngine::analyze_exceptions(path);
+    if (!res) {
+        std::cerr << "Exception analysis failed: " << res.error().to_string() << '\n';
+        return 1;
+    }
+    std::cout << "=== Exception & Unwind Metadata Analysis ===\n";
+    for (const auto& e : res.value()) {
+        std::cout << "  " << std::left << std::setw(28) << e.function_name
+                  << " entry=0x" << std::hex << e.entry_va << std::dec
+                  << " mech=" << e.mechanism
+                  << " handler=" << (e.has_handler ? "YES" : "no")
+                  << " vm_compat=" << (e.compatible_with_vm ? "yes" : "REJECTED")
+                  << " (" << e.detail << ")\n";
+    }
+    std::cout << "  Total unwind entries inspected: " << res.value().size() << '\n';
     return 0;
 }
 
@@ -686,20 +748,51 @@ int cmd_eligibility_report(const std::string& bin_path, const std::string& repor
     return 0;
 }
 
-int cmd_verify(const std::string& path) {
+int cmd_verify(const std::string& path, bool deep = false) {
     auto res = bytemorph::prot::ProtectionEngine::verify(path);
     if (!res) {
         std::cerr << "Verify failed: " << res.error().to_string() << '\n';
         return 1;
     }
     const auto& v = res.value();
+    bool deep_ok = true;
+    std::string deep_note = "not requested";
+    if (deep) {
+        auto loader = create_default_loader();
+        auto bin_res = loader.load_file(path);
+        bool wx_ok = true;
+        bool nonces_unique = true;
+        if (bin_res) {
+            for (const auto& sec : bin_res.value()->sections()) {
+                if ((sec.name == ".bmrt" || sec.name == "__BMRT") && sec.writable && sec.executable) {
+                    wx_ok = false;
+                }
+                if ((sec.name == ".bmvm" || sec.name == "__BMVM") && sec.executable) {
+                    wx_ok = false;
+                }
+            }
+        }
+        std::set<std::array<std::uint8_t, 24>> seen_nonces;
+        for (const auto& ef : v.metadata.encrypted_functions) {
+            if (!seen_nonces.insert(ef.nonce.bytes).second) {
+                nonces_unique = false;
+            }
+        }
+        deep_ok = wx_ok && nonces_unique;
+        deep_note = std::string("W^X=") + (wx_ok ? "OK" : "VIOLATION") +
+                    ", bytecode_encrypted=" + (v.metadata.bytecode_encrypted ? "yes" : "no") +
+                    ", unique_nonces=" + (nonces_unique ? "OK" : "DUPLICATE") +
+                    " (static check only; does not guarantee absence of runtime tampering)";
+    }
     std::cout << "=== ByteMorph Protection Verification ===\n"
-              << "  Status              : " << (v.valid ? "VALID" : "INVALID") << '\n'
+              << "  Status              : " << (v.valid && deep_ok ? "VALID" : "INVALID") << '\n'
               << "  AEAD Authenticated  : " << (v.aead_authenticated ? "Yes" : "No") << '\n'
               << "  .text Integrity     : " << (v.text_integrity_ok ? "OK" : "TAMPERED") << '\n'
               << "  .bmrt Integrity     : " << (v.runtime_integrity_ok ? "OK" : "TAMPERED") << '\n'
+              << "  Runtime Bytecode Enc: " << (v.metadata.bytecode_encrypted ? "XChaCha20-Poly1305" : "Plain") << '\n'
+              << "  Deep Static Check   : " << deep_note << '\n'
               << "  Summary             : " << v.summary << '\n';
-    return v.valid ? 0 : 2;
+    return (v.valid && deep_ok) ? 0 : 2;
 }
 
 int cmd_protection_info(const std::string& path, bool functions_only, const std::string& format) {
@@ -759,7 +852,7 @@ int cmd_protection_info(const std::string& path, bool functions_only, const std:
     return 0;
 }
 
-int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_bench = false) {
+int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_bench = false, bool crypto_bench = false) {
     auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
     if (!cmp_res) {
         std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
@@ -913,7 +1006,31 @@ int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_b
             std::cout << "    Memory Pool Speedup vs Heap: " << std::setprecision(1) << pool_gain << "%\n";
         }
         (void)run_bench_stats("Loop/Branch", loop_prog, {});
+        if (crypto_bench || compare_baseline) {
+            bytemorph::virt::BvmProgram simd_prog;
+            simd_prog.instructions = {
+                {bytemorph::virt::VmOpcode::VAddF64, 0, 0, 1, 0},
+                {bytemorph::virt::VmOpcode::VMulF64, 0, 0, 1, 0},
+                {bytemorph::virt::VmOpcode::Ret, 0, 0, 0, 0}
+            };
+            (void)run_bench_stats("SIMD/FP64", simd_prog, {});
+        }
         const double ext_10k = run_bench_stats("External Call Bridge", ext_prog, ext_opts);
+        if (crypto_bench) {
+            const auto k = bytemorph::prot::CryptoAead::derive_key_from_seed(0x101010ULL, "bench");
+            const auto n = bytemorph::prot::CryptoAead::generate_nonce(0x101010ULL, 1);
+            std::vector<std::uint8_t> crypto_pt(256, 0x5A);
+            std::vector<std::uint8_t> aad(16, 0x11);
+            const auto tc0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 1000; ++i) {
+                auto bx = bytemorph::prot::CryptoAead::seal(crypto_pt, aad, k, n);
+                auto op = bytemorph::prot::CryptoAead::open(bx.value(), aad, k);
+                if (!op) return 1;
+            }
+            const auto tc1 = std::chrono::steady_clock::now();
+            const double crypto_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count();
+            std::cout << "    AEAD Seal+Open (256B, 1k): " << std::setprecision(3) << crypto_ms << " ms\n";
+        }
 
         if (compare_baseline) {
             constexpr double kV07Interpreter10kMs = 2.987;
@@ -965,7 +1082,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.9.0\n";
+        std::cout << "ByteMorph v0.10.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -975,12 +1092,14 @@ int main(int argc, char* argv[]) {
         bool detailed = false;
         bool compare_baseline = false;
         bool memory_bench = false;
+        bool crypto_bench = false;
         for (int i = 2; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--detailed") detailed = true;
             else if (std::string_view(argv[i]) == "--compare-baseline") compare_baseline = true;
             else if (std::string_view(argv[i]) == "--memory") memory_bench = true;
+            else if (std::string_view(argv[i]) == "--crypto") crypto_bench = true;
         }
-        return cmd_benchmark_protection(detailed, compare_baseline, memory_bench);
+        return cmd_benchmark_protection(detailed, compare_baseline, memory_bench, crypto_bench);
     }
 
     if (argc < 3) {
@@ -998,6 +1117,9 @@ int main(int argc, char* argv[]) {
     std::string eligibility_report_path;
     bool analyze_functions_only = false;
     bool memory_references_only = false;
+    bool simd_only = false;
+    bool exceptions_only = false;
+    bool deep_verify = false;
     bool detailed_flag = false;
     bytemorph::prot::ProtectOptions prot_opts;
 
@@ -1072,6 +1194,14 @@ int main(int argc, char* argv[]) {
             detailed_flag = true;
         } else if (arg == "--memory-references") {
             memory_references_only = true;
+        } else if (arg == "--simd") {
+            simd_only = true;
+        } else if (arg == "--exceptions") {
+            exceptions_only = true;
+        } else if (arg == "--encrypt-bytecode") {
+            prot_opts.encrypt_bytecode = true;
+        } else if (arg == "--deep") {
+            deep_verify = true;
         } else if (arg == "--eligibility-report" && i + 1 < argc) {
             eligibility_report_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
@@ -1089,8 +1219,9 @@ int main(int argc, char* argv[]) {
     if (cmd == "vm-inspect") return cmd_vm_inspect(file_path);
     if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
     if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls, detailed_flag);
-    if (cmd == "verify") return cmd_verify(file_path);
+    if (cmd == "verify") return cmd_verify(file_path, deep_verify);
     if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only, output_format);
+    if (cmd == "analyze" && exceptions_only) return cmd_analyze_exceptions(file_path);
     if (cmd == "analyze" && !eligibility_report_path.empty()) {
         return cmd_eligibility_report(file_path, eligibility_report_path, prot_opts.allow_external_calls);
     }
@@ -1106,6 +1237,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "info") { print_info(bin); return 0; }
     if (cmd == "disasm") return cmd_disasm(bin, max_insns);
     if (cmd == "analyze") {
+        if (simd_only) return cmd_analyze_simd(bin, max_insns);
         if (memory_references_only) return cmd_analyze_memory_references(bin, max_insns);
         return analyze_functions_only ? cmd_functions(bin, max_insns) : cmd_analyze(bin, max_insns);
     }

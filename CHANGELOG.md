@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.0] - 2026-11-24
+
+### Adicionado
+- **Bytecode Criptografado em Runtime (`--encrypt-bytecode` / `--profile maximum`):**
+  - Blobs `BMBC` v2 autenticados por função com `XChaCha20-Poly1305` (nonces exclusivos) e metadados `BMP4` v2 (`ProtectionMetadata::encrypted_functions`).
+  - Verificador/descriptografador PIC `XChaCha20-Poly1305` nativo em x86-64 e ARM64 antes da interpretação, rejeitando adulterações (`0xDEADAEADDEADAEAD`) e zerando buffers em pilha na saída.
+- **SIMD e Ponto Flutuante (IEEE 754):**
+  - Opcodes `VMov`, `FAdd`, `FSub`, `FMul`, `FDiv`, `FCmp` no IR, `VMovReg..VXor` no `.bvm` (`kOpcodeTableSize = 64`), suporte a SSE2 (`movdqa`/`movdqu`/`movss`/`movsd`/`addss`/`addsd`/`subss`/`subsd`/`mulss`/`mulsd`/`divss`/`divsd`/`ucomiss`/`ucomisd`/`xorps`) e ARM64 FP (`fmov`/`fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`), preservando `NaN`/`Inf`/`-0.0` e registradores callee-saved.
+- **Exceções/Unwind & Smart Eligibility 4.0:**
+  - `ProtectionEngine::analyze_exceptions` inspeciona `.pdata`/`.xdata` (PE), `.eh_frame` (ELF) e `__unwind_info` (Mach-O), rejeitando funções com handlers SEH/C++ EH ativos (`exception_unwind_incompatible`).
+- **CLI v0.10 & Documentação:**
+  - `--encrypt-bytecode`, `analyze --simd`, `analyze --exceptions`, `verify --deep`, `benchmark-protection --crypto`, [docs/CRYPTOGRAPHY.md](docs/CRYPTOGRAPHY.md) e [docs/VM_ARCHITECTURE.md](docs/VM_ARCHITECTURE.md).
+- **Testes:** 10 novos testes `ProtectionV010Test` (75 testes C++ + 3 testes Rust aprovados).
+
 ## [0.9.0] - 2026-11-24
 
 ### Adicionado

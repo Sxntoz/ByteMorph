@@ -77,9 +77,10 @@ ProtectionEngine::check_compatibility(const std::filesystem::path& path,
     }
 
     rep.known_limitations = {
-        "Functions with inline syscalls or privileged/SIMD instructions are rejected",
+        "Functions with inline syscalls or unmodeled privileged/vector instructions are rejected",
         "Indirect calls and jump tables require explicit authorized targets",
-        "Hardware exceptions / SEH / C++ unwinding across VM boundaries are not virtualized"
+        "Functions with active SEH/C++ EH handlers (.pdata EHANDLER, __cxa_throw) are rejected safely",
+        "Embedded runtime AEAD keys provide integrity/authenticity (anti-tamper), not absolute secrecy against full-process control"
     };
 
     if (!rep.binary_supported) {
@@ -223,6 +224,57 @@ ProtectionEngine::verify(const std::filesystem::path& path) {
         core::diagnostics::ErrorCode::UnsupportedFormat,
         "Protection verification in v0.5 supports PE32+, ELF64, and Mach-O 64-bit",
         "ProtectionEngine::verify");
+}
+
+core::diagnostics::Result<std::vector<ExceptionUnwindEntry>>
+ProtectionEngine::analyze_exceptions(const std::filesystem::path& path) {
+    BinaryLoader loader;
+    loader.register_parser(std::make_unique<formats::pe::PeParser>());
+    loader.register_parser(std::make_unique<formats::elf::ElfParser>());
+    loader.register_parser(std::make_unique<formats::macho::MachOParser>());
+
+    auto bin_res = loader.load_file(path);
+    if (!bin_res) {
+        return core::diagnostics::Result<std::vector<ExceptionUnwindEntry>>::err(
+            bin_res.error().code, bin_res.error().message, "ProtectionEngine::analyze_exceptions");
+    }
+    const auto& bin = *bin_res.value();
+    const bool is_arm64 = (bin.info().architecture == Architecture::ARM64);
+
+    arch::x86_64::X86_64Disassembler x64_dis;
+    arch::aarch64::AArch64Disassembler a64_dis;
+    IDisassemblerEngine& disasm = is_arm64 ? static_cast<IDisassemblerEngine&>(a64_dis)
+                                           : static_cast<IDisassemblerEngine&>(x64_dis);
+    BinaryAnalyzer analyzer;
+    auto an_res = analyzer.analyze(bin, disasm);
+    if (!an_res) {
+        return core::diagnostics::Result<std::vector<ExceptionUnwindEntry>>::err(
+            an_res.error().code, an_res.error().message, "ProtectionEngine::analyze_exceptions");
+    }
+
+    auto compat = check_compatibility(path, true);
+    if (!compat) {
+        return core::diagnostics::Result<std::vector<ExceptionUnwindEntry>>::err(
+            compat.error().code, compat.error().message, "ProtectionEngine::analyze_exceptions");
+    }
+
+    std::vector<ExceptionUnwindEntry> out;
+    auto push_entry = [&](const FunctionCompatibilityEntry& f) {
+        if (!f.has_exception_unwind && f.category != "exception_unwind_incompatible") return;
+        ExceptionUnwindEntry e;
+        e.function_name = f.name;
+        e.entry_va = f.entry_va;
+        e.mechanism = (bin.info().format == BinaryFormat::PE32Plus) ? "PE .pdata/.xdata"
+                    : (bin.info().format == BinaryFormat::ELF64) ? "DWARF .eh_frame"
+                                                                  : "Mach-O __unwind_info";
+        e.has_handler = (f.category == "exception_unwind_incompatible");
+        e.compatible_with_vm = f.eligible;
+        e.detail = f.exception_detail.empty() ? f.rejection_reason : f.exception_detail;
+        out.push_back(std::move(e));
+    };
+    for (const auto& f : compat.value().eligible_functions) push_entry(f);
+    for (const auto& f : compat.value().rejected_functions) push_entry(f);
+    return out;
 }
 
 } // namespace bytemorph::prot

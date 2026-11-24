@@ -1,5 +1,6 @@
 #include "bytemorph/core/ir/ir_interpreter.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <optional>
 #include <unordered_map>
@@ -96,6 +97,27 @@ diagnostics::Result<void> write_operand_checked(const IrOperand& op, std::uint64
     return diagnostics::Result<void>::ok();
 }
 
+std::optional<std::size_t> try_parse_vreg_index(const std::string& name) noexcept {
+    if (name.size() >= 4 && (name.rfind("xmm", 0) == 0 || name.rfind("ymm", 0) == 0)) {
+        std::size_t idx = 0;
+        for (std::size_t i = 3; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) return std::nullopt;
+            idx = idx * 10 + static_cast<std::size_t>(name[i] - '0');
+        }
+        return (idx < 32) ? std::optional<std::size_t>(idx) : std::nullopt;
+    }
+    if (name.size() >= 2 && (name[0] == 'v' || name[0] == 'd' || name[0] == 's' || name[0] == 'q')) {
+        std::size_t idx = 0;
+        for (std::size_t i = 1; i < name.size(); ++i) {
+            if (name[i] == '.') break; // handle v0.16b / v0.4s
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) return std::nullopt;
+            idx = idx * 10 + static_cast<std::size_t>(name[i] - '0');
+        }
+        return (idx < 32) ? std::optional<std::size_t>(idx) : std::nullopt;
+    }
+    return std::nullopt;
+}
+
 bool eval_condition(const std::string& cond, const IrExecState& state) {
     if (cond == "eq" || cond == "je" || cond == "jz" || cond == "b.eq") return state.zf;
     if (cond == "ne" || cond == "jne" || cond == "jnz" || cond == "b.ne") return !state.zf;
@@ -111,6 +133,8 @@ bool eval_condition(const std::string& cond, const IrExecState& state) {
     if (cond == "ns" || cond == "jns" || cond == "b.pl" || cond == "pl") return !state.sf;
     if (cond == "o" || cond == "jo" || cond == "b.vs" || cond == "vs") return state.of;
     if (cond == "no" || cond == "jno" || cond == "b.vc" || cond == "vc") return !state.of;
+    if (cond == "p" || cond == "jp" || cond == "jpe") return state.pf;
+    if (cond == "np" || cond == "jnp" || cond == "jpo") return !state.pf;
     return !state.zf;
 }
 
@@ -130,6 +154,7 @@ IrInterpreter::execute(const IrFunction& fn, const IrExecOptions& options) {
     }
 
     IrExecState state;
+    state.vregs = options.initial_vregs;
     state.memory.assign(options.memory_slots, 0ULL);
     if (options.memory_slots > 0) {
         const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
@@ -279,6 +304,109 @@ IrInterpreter::execute(const IrFunction& fn, const IrExecOptions& options) {
                         const std::uint64_t val = eval_condition(c, state) ? 1ULL : 0ULL;
                         auto w = write_operand_checked(insn.dsts[0], val, state);
                         if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
+                    }
+                    break;
+                }
+                case IrOpcode::VMov: {
+                    if (!insn.dsts.empty() && !insn.srcs.empty()) {
+                        const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                        const auto s_v = try_parse_vreg_index(insn.srcs[0].name);
+                        if (d_v && s_v) {
+                            if (insn.dsts[0].bit_width == 32) {
+                                state.vregs[*d_v][0] = (state.vregs[*d_v][0] & ~0xFFFFFFFFULL) | (state.vregs[*s_v][0] & 0xFFFFFFFFULL);
+                            } else if (insn.dsts[0].bit_width == 64) {
+                                state.vregs[*d_v][0] = state.vregs[*s_v][0];
+                            } else {
+                                state.vregs[*d_v] = state.vregs[*s_v];
+                            }
+                        } else if (d_v && insn.srcs[0].kind == IrOperand::Kind::Memory) {
+                            auto v = eval_operand_checked(insn.srcs[0], state);
+                            if (!v) return diagnostics::Result<IrExecState>::err(v.error().code, v.error().message, v.error().context);
+                            state.vregs[*d_v][0] = v.value();
+                        } else if (s_v && insn.dsts[0].kind == IrOperand::Kind::Memory) {
+                            auto w = write_operand_checked(insn.dsts[0], state.vregs[*s_v][0], state);
+                            if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
+                        } else if (d_v && (insn.srcs[0].kind == IrOperand::Kind::ArchReg || insn.srcs[0].kind == IrOperand::Kind::VirtualReg || insn.srcs[0].kind == IrOperand::Kind::Immediate)) {
+                            auto v = eval_operand_checked(insn.srcs[0], state);
+                            if (!v) return diagnostics::Result<IrExecState>::err(v.error().code, v.error().message, v.error().context);
+                            state.vregs[*d_v][0] = v.value();
+                        } else if (s_v && (insn.dsts[0].kind == IrOperand::Kind::ArchReg || insn.dsts[0].kind == IrOperand::Kind::VirtualReg)) {
+                            auto w = write_operand_checked(insn.dsts[0], state.vregs[*s_v][0], state);
+                            if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
+                        }
+                    }
+                    break;
+                }
+                case IrOpcode::FAdd:
+                case IrOpcode::FSub:
+                case IrOpcode::FMul:
+                case IrOpcode::FDiv: {
+                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
+                        const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                        const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                        const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                        if (d_v && s1_v && s2_v) {
+                            const bool is_f32 = (insn.dsts[0].bit_width == 32);
+                            if (is_f32) {
+                                float a = 0.0f, b = 0.0f;
+                                std::uint32_t ua = static_cast<std::uint32_t>(state.vregs[*s1_v][0]);
+                                std::uint32_t ub = static_cast<std::uint32_t>(state.vregs[*s2_v][0]);
+                                std::memcpy(&a, &ua, 4);
+                                std::memcpy(&b, &ub, 4);
+                                float r = 0.0f;
+                                if (insn.opcode == IrOpcode::FAdd) r = a + b;
+                                else if (insn.opcode == IrOpcode::FSub) r = a - b;
+                                else if (insn.opcode == IrOpcode::FMul) r = a * b;
+                                else r = a / b;
+                                std::uint32_t ur = 0;
+                                std::memcpy(&ur, &r, 4);
+                                state.vregs[*d_v][0] = (state.vregs[*d_v][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(ur);
+                            } else {
+                                double a = 0.0, b = 0.0;
+                                std::memcpy(&a, &state.vregs[*s1_v][0], 8);
+                                std::memcpy(&b, &state.vregs[*s2_v][0], 8);
+                                double r = 0.0;
+                                if (insn.opcode == IrOpcode::FAdd) r = a + b;
+                                else if (insn.opcode == IrOpcode::FSub) r = a - b;
+                                else if (insn.opcode == IrOpcode::FMul) r = a * b;
+                                else r = a / b;
+                                std::memcpy(&state.vregs[*d_v][0], &r, 8);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case IrOpcode::FCmp: {
+                    if (insn.srcs.size() >= 2) {
+                        const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                        const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                        if (s1_v && s2_v) {
+                            const bool is_f32 = (insn.srcs[0].bit_width == 32);
+                            double a = 0.0, b = 0.0;
+                            if (is_f32) {
+                                float fa = 0.0f, fb = 0.0f;
+                                std::uint32_t ua = static_cast<std::uint32_t>(state.vregs[*s1_v][0]);
+                                std::uint32_t ub = static_cast<std::uint32_t>(state.vregs[*s2_v][0]);
+                                std::memcpy(&fa, &ua, 4);
+                                std::memcpy(&fb, &ub, 4);
+                                a = static_cast<double>(fa);
+                                b = static_cast<double>(fb);
+                            } else {
+                                std::memcpy(&a, &state.vregs[*s1_v][0], 8);
+                                std::memcpy(&b, &state.vregs[*s2_v][0], 8);
+                            }
+                            if (std::isnan(a) || std::isnan(b)) {
+                                state.zf = true; state.cf = true; state.pf = true;
+                            } else if (a < b) {
+                                state.zf = false; state.cf = true; state.pf = false;
+                            } else if (a > b) {
+                                state.zf = false; state.cf = false; state.pf = false;
+                            } else {
+                                state.zf = true; state.cf = false; state.pf = false;
+                            }
+                            state.sf = false;
+                            state.of = false;
+                        }
                     }
                     break;
                 }

@@ -94,8 +94,29 @@ VmCondCode map_vm_cond_code(const std::string& cond) noexcept {
 }
 
 std::uint8_t normalize_mem_width(std::uint8_t w) noexcept {
-    if (w == 8 || w == 16 || w == 32 || w == 64) return w;
+    if (w == 8 || w == 16 || w == 32 || w == 64 || w == 128) return w;
     return 64;
+}
+
+std::optional<std::uint8_t> try_parse_vreg_index(const std::string& name) noexcept {
+    if (name.size() >= 4 && (name.rfind("xmm", 0) == 0 || name.rfind("ymm", 0) == 0)) {
+        std::size_t idx = 0;
+        for (std::size_t i = 3; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) return std::nullopt;
+            idx = idx * 10 + static_cast<std::size_t>(name[i] - '0');
+        }
+        return (idx < 32) ? std::optional<std::uint8_t>(static_cast<std::uint8_t>(idx)) : std::nullopt;
+    }
+    if (name.size() >= 2 && (name[0] == 'v' || name[0] == 'd' || name[0] == 's' || name[0] == 'q')) {
+        std::size_t idx = 0;
+        for (std::size_t i = 1; i < name.size(); ++i) {
+            if (name[i] == '.') break;
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) return std::nullopt;
+            idx = idx * 10 + static_cast<std::size_t>(name[i] - '0');
+        }
+        return (idx < 32) ? std::optional<std::uint8_t>(static_cast<std::uint8_t>(idx)) : std::nullopt;
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -214,6 +235,17 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                 case IrOpcode::And:
                 case IrOpcode::Or:
                 case IrOpcode::Xor:
+                    if (insn.dsts.size() == 1 && insn.srcs.size() >= 2) {
+                        if (auto d_v = try_parse_vreg_index(insn.dsts[0].name)) {
+                            auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                            auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                            if (s1_v && s2_v) {
+                                prog.instructions.push_back(VmInstruction{VmOpcode::VXor, *d_v, *s1_v, *s2_v, 0});
+                                break;
+                            }
+                        }
+                    }
+                    [[fallthrough]];
                 case IrOpcode::Shl:
                 case IrOpcode::Shr: {
                     if (insn.dsts.size() != 1 || insn.srcs.size() < 2) {
@@ -305,6 +337,64 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                     prog.instructions.push_back(VmInstruction{VmOpcode::SetCc, 31, 0, cf_cc, 0});
                     prog.instructions.push_back(VmInstruction{bin_op, 28, s1.value(), s2.value(), 0});
                     prog.instructions.push_back(VmInstruction{bin_op, dst_r.value(), 28, 31, 0});
+                    break;
+                }
+                case IrOpcode::VMov: {
+                    if (insn.dsts.size() != 1 || insn.srcs.size() != 1) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid VMov arity", "IrToVmTranslator::translate");
+                    }
+                    const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                    const auto s_v = try_parse_vreg_index(insn.srcs[0].name);
+                    if (d_v && s_v) {
+                        prog.instructions.push_back(VmInstruction{VmOpcode::VMovReg, *d_v, *s_v, 0, insn.dsts[0].bit_width});
+                    } else if (d_v && insn.srcs[0].kind == IrOperand::Kind::Memory) {
+                        auto base_r = reg_alloc.get_or_alloc(insn.srcs[0].name);
+                        if (!base_r) return diagnostics::Result<BvmProgram>::err(base_r.error().code, base_r.error().message, base_r.error().context);
+                        prog.instructions.push_back(VmInstruction{
+                            VmOpcode::VLoad, *d_v, base_r.value(), normalize_mem_width(insn.srcs[0].bit_width), insn.srcs[0].imm});
+                    } else if (s_v && insn.dsts[0].kind == IrOperand::Kind::Memory) {
+                        auto base_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                        if (!base_r) return diagnostics::Result<BvmProgram>::err(base_r.error().code, base_r.error().message, base_r.error().context);
+                        prog.instructions.push_back(VmInstruction{
+                            VmOpcode::VStore, base_r.value(), *s_v, normalize_mem_width(insn.dsts[0].bit_width), insn.dsts[0].imm});
+                    } else {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "Unsupported VMov operand combination", "IrToVmTranslator::translate");
+                    }
+                    break;
+                }
+                case IrOpcode::FAdd:
+                case IrOpcode::FSub:
+                case IrOpcode::FMul:
+                case IrOpcode::FDiv: {
+                    if (insn.dsts.size() != 1 || insn.srcs.size() < 2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid FP arithmetic arity", "IrToVmTranslator::translate");
+                    }
+                    const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                    const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                    const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                    if (!d_v || !s1_v || !s2_v) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "FP arithmetic requires vector registers", "IrToVmTranslator::translate");
+                    }
+                    const bool is_f32 = (insn.dsts[0].bit_width == 32);
+                    VmOpcode vop = VmOpcode::VAddF64;
+                    if (insn.opcode == IrOpcode::FAdd) vop = is_f32 ? VmOpcode::VAddF32 : VmOpcode::VAddF64;
+                    else if (insn.opcode == IrOpcode::FSub) vop = is_f32 ? VmOpcode::VSubF32 : VmOpcode::VSubF64;
+                    else if (insn.opcode == IrOpcode::FMul) vop = is_f32 ? VmOpcode::VMulF32 : VmOpcode::VMulF64;
+                    else vop = is_f32 ? VmOpcode::VDivF32 : VmOpcode::VDivF64;
+                    prog.instructions.push_back(VmInstruction{vop, *d_v, *s1_v, *s2_v, 0});
+                    break;
+                }
+                case IrOpcode::FCmp: {
+                    if (insn.srcs.size() < 2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid FCmp arity", "IrToVmTranslator::translate");
+                    }
+                    const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                    const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                    if (!s1_v || !s2_v) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "FCmp requires vector registers", "IrToVmTranslator::translate");
+                    }
+                    const VmOpcode vop = (insn.srcs[0].bit_width == 32) ? VmOpcode::VCmpF32 : VmOpcode::VCmpF64;
+                    prog.instructions.push_back(VmInstruction{vop, 0, *s1_v, *s2_v, 0});
                     break;
                 }
                 case IrOpcode::Jump: {

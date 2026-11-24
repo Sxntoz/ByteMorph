@@ -79,6 +79,20 @@ std::string_view to_string(VmOpcode op) noexcept {
         case VmOpcode::LeaPic: return "vm.leapic";
         case VmOpcode::SelectCc: return "vm.selectcc";
         case VmOpcode::SetCc: return "vm.setcc";
+        case VmOpcode::VMovReg: return "vm.vmov";
+        case VmOpcode::VAddF32: return "vm.vadd.f32";
+        case VmOpcode::VAddF64: return "vm.vadd.f64";
+        case VmOpcode::VSubF32: return "vm.vsub.f32";
+        case VmOpcode::VSubF64: return "vm.vsub.f64";
+        case VmOpcode::VMulF32: return "vm.vmul.f32";
+        case VmOpcode::VMulF64: return "vm.vmul.f64";
+        case VmOpcode::VDivF32: return "vm.vdiv.f32";
+        case VmOpcode::VDivF64: return "vm.vdiv.f64";
+        case VmOpcode::VCmpF32: return "vm.vcmp.f32";
+        case VmOpcode::VCmpF64: return "vm.vcmp.f64";
+        case VmOpcode::VLoad: return "vm.vload";
+        case VmOpcode::VStore: return "vm.vstore";
+        case VmOpcode::VXor: return "vm.vxor";
         case VmOpcode::MaxOpcode: return "vm.invalid";
     }
     return "vm.invalid";
@@ -120,8 +134,10 @@ BvmCodec::encode(const BvmProgram& program) {
                 ErrorCode::ParseError, "Invalid VmOpcode in encode", "BvmCodec::encode");
         }
         const bool dst_is_trap = (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF);
-        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
-        const bool valid_width = (insn.src2 == 0 || insn.src2 == 8 || insn.src2 == 16 || insn.src2 == 32 || insn.src2 == 64);
+        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store ||
+                                    insn.opcode == VmOpcode::VLoad || insn.opcode == VmOpcode::VStore);
+        const bool valid_width = (insn.src2 == 0 || insn.src2 == 8 || insn.src2 == 16 ||
+                                  insn.src2 == 32 || insn.src2 == 64 || insn.src2 == 128);
         if ((!dst_is_trap && insn.dst >= BvmProgram::kNumRegisters) ||
             insn.src1 >= BvmProgram::kNumRegisters ||
             (src2_is_width ? !valid_width : insn.src2 >= BvmProgram::kNumRegisters)) {
@@ -222,8 +238,10 @@ BvmCodec::decode(std::span<const std::uint8_t> data) {
         const std::uint8_t src1 = payload[off + 2];
         const std::uint8_t src2 = payload[off + 3];
         const bool dst_is_trap = (op == VmOpcode::Halt && dst == 0xFF);
-        const bool src2_is_width = (op == VmOpcode::Load || op == VmOpcode::Store);
-        const bool valid_width = (src2 == 0 || src2 == 8 || src2 == 16 || src2 == 32 || src2 == 64);
+        const bool src2_is_width = (op == VmOpcode::Load || op == VmOpcode::Store ||
+                                    op == VmOpcode::VLoad || op == VmOpcode::VStore);
+        const bool valid_width = (src2 == 0 || src2 == 8 || src2 == 16 ||
+                                  src2 == 32 || src2 == 64 || src2 == 128);
         if ((!dst_is_trap && dst >= BvmProgram::kNumRegisters) ||
             src1 >= BvmProgram::kNumRegisters ||
             (src2_is_width ? !valid_width : src2 >= BvmProgram::kNumRegisters)) {

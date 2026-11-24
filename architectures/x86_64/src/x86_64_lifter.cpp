@@ -357,6 +357,52 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if ((insn.mnemonic == "movdqa" || insn.mnemonic == "movdqu" || insn.mnemonic == "movaps" ||
+                insn.mnemonic == "movups" || insn.mnemonic == "movss" || insn.mnemonic == "movsd" ||
+                insn.mnemonic == "movq") && ops.size() == 2) {
+        const std::uint8_t w = (insn.mnemonic == "movss") ? 32 : (insn.mnemonic == "movsd" || insn.mnemonic == "movq") ? 64 : 128;
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = w;
+        src.bit_width = w;
+        ir.opcode = IrOpcode::VMov;
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "addss" || insn.mnemonic == "addsd" ||
+                insn.mnemonic == "subss" || insn.mnemonic == "subsd" ||
+                insn.mnemonic == "mulss" || insn.mnemonic == "mulsd" ||
+                insn.mnemonic == "divss" || insn.mnemonic == "divsd") && ops.size() == 2) {
+        const std::uint8_t w = (insn.mnemonic.back() == 's') ? 32 : 64;
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = w;
+        src.bit_width = w;
+        if (insn.mnemonic.rfind("add", 0) == 0) ir.opcode = IrOpcode::FAdd;
+        else if (insn.mnemonic.rfind("sub", 0) == 0) ir.opcode = IrOpcode::FSub;
+        else if (insn.mnemonic.rfind("mul", 0) == 0) ir.opcode = IrOpcode::FMul;
+        else ir.opcode = IrOpcode::FDiv;
+        ir.dsts.push_back(dst);
+        ir.srcs.push_back(dst);
+        ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "ucomiss" || insn.mnemonic == "comiss" ||
+                insn.mnemonic == "ucomisd" || insn.mnemonic == "comisd") && ops.size() == 2) {
+        const std::uint8_t w = (insn.mnemonic.back() == 's') ? 32 : 64;
+        auto s1 = parse_operand_text(ops[0]);
+        auto s2 = parse_operand_text(ops[1]);
+        s1.bit_width = w;
+        s2.bit_width = w;
+        ir.opcode = IrOpcode::FCmp;
+        ir.srcs.push_back(std::move(s1));
+        ir.srcs.push_back(std::move(s2));
+    } else if ((insn.mnemonic == "xorps" || insn.mnemonic == "xorpd" || insn.mnemonic == "pxor") && ops.size() == 2) {
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = 128;
+        src.bit_width = 128;
+        ir.opcode = IrOpcode::Xor;
+        ir.dsts.push_back(dst);
+        ir.srcs.push_back(dst);
+        ir.srcs.push_back(std::move(src));
     } else if (insn.mnemonic == "and" && ops.size() == 2) {
         ir.opcode = IrOpcode::And;
         ir.dsts.push_back(parse_operand_text(ops[0]));

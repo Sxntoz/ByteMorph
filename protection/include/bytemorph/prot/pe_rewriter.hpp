@@ -42,6 +42,7 @@ struct ProtectOptions {
     bool auto_select_functions{false};
     bool protect_all_eligible{false};
     bool rollback_on_failure{true};
+    bool encrypt_bytecode{false};
 };
 
 struct FunctionCompatibilityEntry {
@@ -49,13 +50,25 @@ struct FunctionCompatibilityEntry {
     std::uint64_t entry_va{0};
     std::uint64_t size_bytes{0};
     bool eligible{false};
+    bool uses_simd{false};
+    bool has_exception_unwind{false};
     std::uint32_t ir_ops{0};
     std::uint32_t vm_ops{0};
     std::string category;
     std::uint32_t estimated_overhead_pct{0};
     std::uint32_t estimated_runtime_bytes{0};
     std::vector<std::string> unsupported_instructions;
+    std::string exception_detail;
     std::string rejection_reason;
+};
+
+struct ExceptionUnwindEntry {
+    std::string function_name;
+    std::uint64_t entry_va{0};
+    std::string mechanism;
+    bool has_handler{false};
+    bool compatible_with_vm{true};
+    std::string detail;
 };
 
 struct CompatibilityReport {
@@ -78,17 +91,27 @@ struct ProtectedFunctionRecord {
     std::uint32_t vm_ops{0};
 };
 
+struct EncryptedBytecodeRecord {
+    std::uint32_t fn_index{0};
+    AeadNonce nonce;
+    std::array<std::uint8_t, 16> mac{};
+    std::uint32_t plaintext_size{0};
+    std::array<std::uint8_t, 32> aad_hash{};
+};
+
 struct ProtectionMetadata {
     static constexpr std::uint32_t kMagic = 0x34504D42u; // "BMP4" LE
-    static constexpr std::uint16_t kVersion = 1;
+    static constexpr std::uint16_t kVersion = 2;
 
     ProtectionProfile profile{ProtectionProfile::Balanced};
     std::uint64_t seed{0};
+    bool bytecode_encrypted{false};
     std::array<std::uint8_t, 32> text_blake2b{};
     std::array<std::uint8_t, 32> runtime_blake2b{};
     AeadSealedBox sealed_payload; // AEAD-encrypted BVM + protected strings/constants
     std::vector<ProtectedFunctionRecord> functions;
     std::uint32_t protected_strings_count{0};
+    std::vector<EncryptedBytecodeRecord> encrypted_functions;
 };
 
 struct ProtectionReport {
@@ -190,6 +213,9 @@ public:
     [[nodiscard]] static core::diagnostics::Result<CompatibilityReport>
     check_compatibility(const std::filesystem::path& path,
                         bool allow_external_calls = false);
+
+    [[nodiscard]] static core::diagnostics::Result<std::vector<ExceptionUnwindEntry>>
+    analyze_exceptions(const std::filesystem::path& path);
 };
 
 } // namespace bytemorph::prot

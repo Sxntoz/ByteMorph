@@ -1,5 +1,6 @@
 #include "bytemorph/virt/vm_interpreter.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace bytemorph::virt {
@@ -34,7 +35,8 @@ core::diagnostics::Result<bool> validate_program(const BvmProgram& program) {
         if (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF) {
             continue; // Runtime trap sentinel
         }
-        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
+        const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store ||
+                                    insn.opcode == VmOpcode::VLoad || insn.opcode == VmOpcode::VStore);
         const bool src2_is_cc = (insn.opcode == VmOpcode::SelectCc || insn.opcode == VmOpcode::SetCc);
         if (src2_is_width) {
             has_mem_ops = true;
@@ -93,6 +95,7 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
 
     VmExecState state;
     state.regs = options.initial_regs;
+    state.vregs = options.initial_vregs;
 
     thread_local std::vector<std::uint64_t> tls_memory_pool;
     std::size_t mem_slots = 0;
@@ -324,6 +327,124 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 regs[insn.dst] = eval_vm_cc(insn.src2, zf, sf, cf, of) ? 1ULL : 0ULL;
                 ++pc;
                 break;
+            case VmOpcode::VMovReg:
+                if (insn.imm == 32) {
+                    state.vregs[insn.dst][0] = (state.vregs[insn.dst][0] & ~0xFFFFFFFFULL) |
+                                               (state.vregs[insn.src1][0] & 0xFFFFFFFFULL);
+                } else if (insn.imm == 64) {
+                    state.vregs[insn.dst][0] = state.vregs[insn.src1][0];
+                } else {
+                    state.vregs[insn.dst] = state.vregs[insn.src1];
+                }
+                ++pc;
+                break;
+            case VmOpcode::VAddF32:
+            case VmOpcode::VSubF32:
+            case VmOpcode::VMulF32:
+            case VmOpcode::VDivF32: {
+                float a = 0.0f, b = 0.0f;
+                const std::uint32_t ua = static_cast<std::uint32_t>(state.vregs[insn.src1][0]);
+                const std::uint32_t ub = static_cast<std::uint32_t>(state.vregs[insn.src2][0]);
+                std::memcpy(&a, &ua, 4);
+                std::memcpy(&b, &ub, 4);
+                float r = 0.0f;
+                if (insn.opcode == VmOpcode::VAddF32) r = a + b;
+                else if (insn.opcode == VmOpcode::VSubF32) r = a - b;
+                else if (insn.opcode == VmOpcode::VMulF32) r = a * b;
+                else r = a / b;
+                std::uint32_t ur = 0;
+                std::memcpy(&ur, &r, 4);
+                state.vregs[insn.dst][0] = (state.vregs[insn.dst][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(ur);
+                ++pc;
+                break;
+            }
+            case VmOpcode::VAddF64:
+            case VmOpcode::VSubF64:
+            case VmOpcode::VMulF64:
+            case VmOpcode::VDivF64: {
+                double a = 0.0, b = 0.0;
+                std::memcpy(&a, &state.vregs[insn.src1][0], 8);
+                std::memcpy(&b, &state.vregs[insn.src2][0], 8);
+                double r = 0.0;
+                if (insn.opcode == VmOpcode::VAddF64) r = a + b;
+                else if (insn.opcode == VmOpcode::VSubF64) r = a - b;
+                else if (insn.opcode == VmOpcode::VMulF64) r = a * b;
+                else r = a / b;
+                std::memcpy(&state.vregs[insn.dst][0], &r, 8);
+                ++pc;
+                break;
+            }
+            case VmOpcode::VCmpF32:
+            case VmOpcode::VCmpF64: {
+                double a = 0.0, b = 0.0;
+                if (insn.opcode == VmOpcode::VCmpF32) {
+                    float fa = 0.0f, fb = 0.0f;
+                    const std::uint32_t ua = static_cast<std::uint32_t>(state.vregs[insn.src1][0]);
+                    const std::uint32_t ub = static_cast<std::uint32_t>(state.vregs[insn.src2][0]);
+                    std::memcpy(&fa, &ua, 4);
+                    std::memcpy(&fb, &ub, 4);
+                    a = static_cast<double>(fa);
+                    b = static_cast<double>(fb);
+                } else {
+                    std::memcpy(&a, &state.vregs[insn.src1][0], 8);
+                    std::memcpy(&b, &state.vregs[insn.src2][0], 8);
+                }
+                if (std::isnan(a) || std::isnan(b)) {
+                    zf = true; cf = true; state.pf = true;
+                } else if (a < b) {
+                    zf = false; cf = true; state.pf = false;
+                } else if (a > b) {
+                    zf = false; cf = false; state.pf = false;
+                } else {
+                    zf = true; cf = false; state.pf = false;
+                }
+                sf = false;
+                of = false;
+                ++pc;
+                break;
+            }
+            case VmOpcode::VLoad: {
+                if (mem_slots == 0) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute");
+                }
+                const std::size_t width_bytes = (insn.src2 == 32) ? 4 : (insn.src2 == 64) ? 8 : 16;
+                const std::int64_t byte_addr = static_cast<std::int64_t>(regs[insn.src1]) + insn.imm;
+                if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_mem_bytes) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::OutOfBounds, "VM vector memory load out of bounds", "VmInterpreter::execute");
+                }
+                if (width_bytes <= 8) {
+                    std::uint64_t tmp = 0;
+                    std::memcpy(&tmp, mem_bytes + byte_addr, width_bytes);
+                    state.vregs[insn.dst][0] = tmp;
+                    state.vregs[insn.dst][1] = 0;
+                } else {
+                    std::memcpy(state.vregs[insn.dst].data(), mem_bytes + byte_addr, 16);
+                }
+                ++pc;
+                break;
+            }
+            case VmOpcode::VStore: {
+                if (mem_slots == 0) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute");
+                }
+                const std::size_t width_bytes = (insn.src2 == 32) ? 4 : (insn.src2 == 64) ? 8 : 16;
+                const std::int64_t byte_addr = static_cast<std::int64_t>(regs[insn.dst]) + insn.imm;
+                if (byte_addr < 0 || static_cast<std::size_t>(byte_addr) + width_bytes > total_mem_bytes) {
+                    return core::diagnostics::Result<VmExecState>::err(
+                        ErrorCode::OutOfBounds, "VM vector memory store out of bounds", "VmInterpreter::execute");
+                }
+                std::memcpy(mem_bytes + byte_addr, state.vregs[insn.src1].data(), width_bytes);
+                ++pc;
+                break;
+            }
+            case VmOpcode::VXor:
+                state.vregs[insn.dst][0] = state.vregs[insn.src1][0] ^ state.vregs[insn.src2][0];
+                state.vregs[insn.dst][1] = state.vregs[insn.src1][1] ^ state.vregs[insn.src2][1];
+                ++pc;
+                break;
             case VmOpcode::Jmp:
                 pc = static_cast<std::size_t>(insn.imm);
                 break;
@@ -363,6 +484,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                     state.steps_executed = steps;
                     state.zf = zf;
                     state.sf = sf;
+                    state.cf = cf;
+                    state.of = of;
                     state.return_value = regs[0];
                     return state;
                 }
@@ -374,6 +497,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 state.steps_executed = steps;
                 state.zf = zf;
                 state.sf = sf;
+                state.cf = cf;
+                state.of = of;
                 if (insn.dst == 0xFF) {
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "Unauthorized indirect control-flow target at runtime", "VmInterpreter::execute");

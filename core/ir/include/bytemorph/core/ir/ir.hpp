@@ -34,6 +34,12 @@ enum class IrOpcode {
     SetCc,
     Adc,
     Sbb,
+    VMov,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    FCmp,
     Unknown
 };
 

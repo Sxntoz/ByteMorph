@@ -18,11 +18,13 @@ struct VmExecOptions {
     bool use_memory_pool{true};
     std::uint64_t pic_base_va{0};
     std::array<std::uint64_t, BvmProgram::kNumRegisters> initial_regs{};
+    std::array<std::array<std::uint64_t, 2>, BvmProgram::kNumRegisters> initial_vregs{};
     std::function<std::optional<std::uint64_t>(std::int64_t, const std::array<std::uint64_t, BvmProgram::kNumRegisters>&)> external_call_handler;
 };
 
 struct VmExecState {
     std::array<std::uint64_t, BvmProgram::kNumRegisters> regs{};
+    std::array<std::array<std::uint64_t, 2>, BvmProgram::kNumRegisters> vregs{};
     std::vector<std::uint64_t> memory;
     std::vector<std::size_t> call_stack;
     std::size_t pc{0};
@@ -30,6 +32,7 @@ struct VmExecState {
     bool sf{false};
     bool cf{false};
     bool of{false};
+    bool pf{false};
     std::uint64_t steps_executed{0};
     std::uint64_t allocations_count{0};
     std::uint64_t return_value{0};

@@ -186,6 +186,37 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
         ir.srcs.push_back(IrOperand::immediate(0xFFFF, 64));
+    } else if (insn.mnemonic == "fmov" && ops.size() >= 2) {
+        const std::uint8_t w = (!ops[0].empty() && ops[0][0] == 's') ? 32 : 64;
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = w;
+        src.bit_width = w;
+        ir.opcode = IrOpcode::VMov;
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "fadd" || insn.mnemonic == "fsub" ||
+                insn.mnemonic == "fmul" || insn.mnemonic == "fdiv") && ops.size() >= 3) {
+        const std::uint8_t w = (!ops[0].empty() && ops[0][0] == 's') ? 32 : (!ops[0].empty() && ops[0][0] == 'd') ? 64 : 128;
+        auto dst = parse_operand_text(ops[0]);
+        auto s1 = parse_operand_text(ops[1]);
+        auto s2 = parse_operand_text(ops[2]);
+        dst.bit_width = w; s1.bit_width = w; s2.bit_width = w;
+        if (insn.mnemonic == "fadd") ir.opcode = IrOpcode::FAdd;
+        else if (insn.mnemonic == "fsub") ir.opcode = IrOpcode::FSub;
+        else if (insn.mnemonic == "fmul") ir.opcode = IrOpcode::FMul;
+        else ir.opcode = IrOpcode::FDiv;
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(s1));
+        ir.srcs.push_back(std::move(s2));
+    } else if ((insn.mnemonic == "fcmp" || insn.mnemonic == "fcmpe") && ops.size() >= 2) {
+        const std::uint8_t w = (!ops[0].empty() && ops[0][0] == 's') ? 32 : 64;
+        auto s1 = parse_operand_text(ops[0]);
+        auto s2 = parse_operand_text(ops[1]);
+        s1.bit_width = w; s2.bit_width = w;
+        ir.opcode = IrOpcode::FCmp;
+        ir.srcs.push_back(std::move(s1));
+        ir.srcs.push_back(std::move(s2));
     } else if (insn.mnemonic == "uxtw" && ops.size() >= 2) {
         ir.opcode = IrOpcode::And;
         ir.dsts.push_back(parse_operand_text(ops[0]));

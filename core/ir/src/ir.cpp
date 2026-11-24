@@ -30,6 +30,12 @@ std::string_view to_string(IrOpcode op) noexcept {
         case IrOpcode::SetCc: return "setcc";
         case IrOpcode::Adc: return "adc";
         case IrOpcode::Sbb: return "sbb";
+        case IrOpcode::VMov: return "vmov";
+        case IrOpcode::FAdd: return "fadd";
+        case IrOpcode::FSub: return "fsub";
+        case IrOpcode::FMul: return "fmul";
+        case IrOpcode::FDiv: return "fdiv";
+        case IrOpcode::FCmp: return "fcmp";
         case IrOpcode::Unknown: return "unknown";
     }
     return "unknown";

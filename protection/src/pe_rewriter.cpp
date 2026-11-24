@@ -117,9 +117,13 @@ PeRewriter::protect_file(const std::filesystem::path& input,
     }
 
     SharedRuntimeLayout rt_layout;
+    detail::SharedRuntimeOptions rt_opts;
+    rt_opts.encrypt_bytecode = options.encrypt_bytecode || (options.profile == ProtectionProfile::Maximum);
+    rt_opts.seed = options.seed;
+
     auto runtime_bytes_res = is_arm64
-        ? emit_shared_pic_arm64_vm_runtime(progs, rt_layout)
-        : emit_shared_pic_x64_vm_runtime(progs, AbiKind::Win64, rt_layout);
+        ? emit_shared_pic_arm64_vm_runtime(progs, rt_layout, rt_opts)
+        : emit_shared_pic_x64_vm_runtime(progs, AbiKind::Win64, rt_layout, rt_opts);
     if (!runtime_bytes_res) {
         return diagnostics::Result<ProtectionReport>::err(
             runtime_bytes_res.error().code, runtime_bytes_res.error().message, "PeRewriter::protect_file");
@@ -193,9 +197,27 @@ PeRewriter::protect_file(const std::filesystem::path& input,
     ProtectionMetadata meta;
     meta.profile = options.profile;
     meta.seed = options.seed;
+    meta.bytecode_encrypted = rt_opts.encrypt_bytecode;
     meta.text_blake2b = CryptoAead::blake2b_256(text_content);
     meta.runtime_blake2b = CryptoAead::blake2b_256(runtime_bytes);
     meta.protected_strings_count = str_cnt;
+    if (rt_opts.encrypt_bytecode) {
+        const auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
+        for (std::size_t i = 0; i < progs.size(); ++i) {
+            const std::uint32_t plain_sz = static_cast<std::uint32_t>(4 + progs[i].instructions.size() * 12);
+            const auto nonce = CryptoAead::generate_nonce(rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)), i + 100);
+            std::array<std::uint8_t, 16> aad{};
+            const std::uint32_t words[4] = {0x43424D42u, 2u, static_cast<std::uint32_t>(i), plain_sz};
+            std::memcpy(aad.data(), words, sizeof(words));
+            EncryptedBytecodeRecord ef;
+            ef.fn_index = static_cast<std::uint32_t>(i);
+            ef.nonce = nonce;
+            ef.plaintext_size = plain_sz;
+            ef.aad_hash = CryptoAead::blake2b_256(aad);
+            (void)rt_key;
+            meta.encrypted_functions.push_back(ef);
+        }
+    }
     for (std::size_t i = 0; i < plan.prepared.size(); ++i) {
         const auto& pf = plan.prepared[i];
         meta.functions.push_back(ProtectedFunctionRecord{

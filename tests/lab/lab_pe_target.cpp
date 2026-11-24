@@ -57,6 +57,23 @@ extern "C" BM_EXPORT std::int64_t bm_target_unsigned_cmp(std::uint64_t a, std::u
     return (a < b) ? 11LL : 29LL;
 }
 
+extern "C" BM_EXPORT double bm_target_simd_fp64(double a, double b) {
+    return (a * 1.5 + b) - (a / 2.0);
+}
+
+extern "C" BM_EXPORT float bm_target_simd_fp32(float a, float b) {
+    return (a + b) * 2.5f;
+}
+
+extern "C" BM_EXPORT std::int64_t bm_target_eh_seh(std::int64_t x) {
+    try {
+        if (x < 0) throw 42;
+        return x + 10;
+    } catch (...) {
+        return -99;
+    }
+}
+
 int main(int argc, char* argv[]) {
     std::int64_t a = 42;
     std::int64_t b = 19;
@@ -86,6 +103,13 @@ int main(int argc, char* argv[]) {
         const std::int64_t uc = bm_target_unsigned_cmp(static_cast<std::uint64_t>(a), static_cast<std::uint64_t>(b));
         std::cout << "RESULT=" << res << " GLOBAL1=" << g1 << " GLOBAL2=" << g2
                   << " CMOV=" << cm << " UCMP=" << uc << '\n';
+        return 0;
+    }
+    if (argc >= 4 && std::strcmp(argv[3], "--v010") == 0) {
+        const double d = bm_target_simd_fp64(static_cast<double>(a), static_cast<double>(b));
+        const float f = bm_target_simd_fp32(static_cast<float>(a), static_cast<float>(b));
+        const std::int64_t eh = bm_target_eh_seh(-1);
+        std::cout << "RESULT=" << res << " FP64=" << d << " FP32=" << f << " EH=" << eh << '\n';
         return 0;
     }
     std::cout << "RESULT=" << res << '\n';

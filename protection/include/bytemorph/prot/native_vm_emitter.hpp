@@ -77,13 +77,30 @@ emit_pic_x64_vm_runtime(const virt::BvmProgram& prog, AbiKind abi);
 [[nodiscard]] core::diagnostics::Result<std::vector<std::uint8_t>>
 emit_pic_arm64_vm_runtime(const virt::BvmProgram& prog);
 
+struct SharedRuntimeOptions {
+    bool encrypt_bytecode{false};
+    std::uint64_t seed{0};
+    std::string key_domain{"ByteMorph-v0.10-Runtime"};
+};
+
 [[nodiscard]] core::diagnostics::Result<std::vector<std::uint8_t>>
 emit_shared_pic_x64_vm_runtime(const std::vector<virt::BvmProgram>& progs,
                                AbiKind abi,
                                SharedRuntimeLayout& out_layout);
 
 [[nodiscard]] core::diagnostics::Result<std::vector<std::uint8_t>>
+emit_shared_pic_x64_vm_runtime(const std::vector<virt::BvmProgram>& progs,
+                               AbiKind abi,
+                               SharedRuntimeLayout& out_layout,
+                               const SharedRuntimeOptions& rt_opts);
+
+[[nodiscard]] core::diagnostics::Result<std::vector<std::uint8_t>>
 emit_shared_pic_arm64_vm_runtime(const std::vector<virt::BvmProgram>& progs,
                                  SharedRuntimeLayout& out_layout);
+
+[[nodiscard]] core::diagnostics::Result<std::vector<std::uint8_t>>
+emit_shared_pic_arm64_vm_runtime(const std::vector<virt::BvmProgram>& progs,
+                                 SharedRuntimeLayout& out_layout,
+                                 const SharedRuntimeOptions& rt_opts);
 
 } // namespace bytemorph::prot::detail

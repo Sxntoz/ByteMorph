@@ -2,11 +2,27 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.9.0):**  
+> **Status atual (v0.10.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
 > - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility`):**
->   - **Validado com execução nativa:** Windows PE32+ x86-64 (incluindo globais RIP-relative/ASLR, `cmovcc`, `setcc`), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
+>   - **Validado com execução nativa:** Windows PE32+ x86-64 (incluindo bytecode criptografado em runtime com `XChaCha20-Poly1305`, SIMD/FP64, globais RIP-relative/ASLR, `cmovcc`, `setcc`), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
 >   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, compilador cruzado `MSVC Hostx64\arm64` disponível localmente, sem runner nativo Windows ARM64) e Mach-O Fat/Universal multi-slice.
+
+## Recursos da v0.10
+
+- **Bytecode Criptografado em Runtime (`--encrypt-bytecode` / `--profile maximum`):**
+  - Selagem `XChaCha20-Poly1305` (Monocypher 4.0.2) por função com nonces exclusivos (`BMBC` v2) e metadados `BMP4` v2.
+  - Verificação da tag Poly1305 em tempo constante e descriptografia diretamente nos runtimes nativos PIC x86-64 e ARM64 antes da execução, com rejeição segura em adulterações (`0xDEADAEADDEADAEAD`) e limpeza do buffer em pilha ao sair.
+  - Consulte [docs/CRYPTOGRAPHY.md](docs/CRYPTOGRAPHY.md) para a distinção explícita entre integridade, autenticidade e confidencialidade.
+- **SIMD e Ponto Flutuante (IEEE 754):**
+  - Suporte incremental para `movdqa`/`movdqu`/`movaps`/`movups`/`movss`/`movsd`/`addss`/`addsd`/`subss`/`subsd`/`mulss`/`mulsd`/`divss`/`divsd`/`ucomiss`/`ucomisd`/`xorps` (x86-64) e `fmov`/`fadd`/`fsub`/`fmul`/`fdiv`/`fcmp` (ARM64), preservando `NaN`, `+Inf`/`-Inf`, `-0.0` e registradores callee-saved (`xmm6..xmm15`, `d8..d15`).
+  - Consulte [docs/VM_ARCHITECTURE.md](docs/VM_ARCHITECTURE.md).
+- **Exceções, Unwind & Smart Eligibility 4.0:**
+  - Inspeção de `.pdata`/`.xdata` (`UNW_FLAG_EHANDLER`/`UHANDLER`) no PE e APIs de throw/unwind (`__cxa_throw`, `_Unwind_Resume`, `CxxThrow`) no ELF/Mach-O, rejeitando funções incompatíveis com diagnóstico claro (`exception_unwind_incompatible`).
+- **CLI v0.10:**
+  - `protect --profile maximum --encrypt-bytecode`
+  - `analyze <bin> --simd` e `analyze <bin> --exceptions`
+  - `verify <bin> --deep` e `benchmark-protection --crypto`
 
 ## Recursos da v0.9
 
@@ -32,27 +48,29 @@ ctest --test-dir build -C Release --output-on-failure
 cargo test --workspace
 ```
 
-## Uso da CLI (v0.9)
+## Uso da CLI (v0.10)
 
 ```bash
 bytemorph compatibility input_bin --detailed --format json
+bytemorph analyze input_bin --simd
+bytemorph analyze input_bin --exceptions
 bytemorph analyze input_bin --memory-references
-bytemorph analyze input_bin --eligibility-report report.json
-bytemorph protect input_bin --output protected_bin --profile balanced --functions all-eligible --allow-ext-calls
-bytemorph verify protected_bin
+bytemorph protect input_bin --output protected_bin --profile maximum --encrypt-bytecode --functions all-eligible
+bytemorph verify protected_bin --deep
 bytemorph protection-info protected_bin --format json
-bytemorph benchmark-protection --detailed --memory --compare-baseline
+bytemorph benchmark-protection --detailed --memory --crypto --compare-baseline
 ```
 
 ## Benchmarks Reproduzíveis (Windows x64 Release)
 
-- `bytemorph benchmark-protection --detailed --memory --compare-baseline`:
-  - `Native Execution (10k iters)`: `0.018 ms`
-  - `VM Interpreter (10k iters)`: `0.720 ms` (multi-sample normalized `0.623 ms`, `-79.2%` vs v0.7 `2.987 ms`)
-  - `Memory Load/Store (Pool, 10k)`: `3.033 ms` (`-39.5%` vs v0.8 `5.016 ms`; 2k median `0.607 ms` vs Heap `1.066 ms`, **+43.1%** speedup, `3,297,609 execs/s`)
-  - `External Call Bridge (10k)`: `0.620 ms` (multi-sample normalized `0.524 ms`, `-78.2%` vs v0.7 `2.405 ms`)
-  - `Loop/Branch (2k sample)`: median `0.226 ms`, `8,837,826 execs/s`
-  - Shared Runtime Scaling: 2 funcs (`x64=2092B`, `ARM64=1972B`), 5 funcs (`x64=2444B`, `ARM64=2308B`), 10 funcs (`x64=3020B`, `ARM64=2868B`), 20 funcs (`x64=4180B`, `ARM64=3988B`)
+- `bytemorph benchmark-protection --detailed --memory --crypto --compare-baseline`:
+  - `Native Execution (10k iters)`: `0.021 ms`
+  - `VM Interpreter (10k iters)`: `1.573 ms` (multi-sample normalized `1.247 ms`, `-58.3%` vs v0.7 `2.987 ms`)
+  - `Memory Load/Store (Pool, 2k/sample)`: median `1.338 ms` vs `Heap` `2.415 ms` (**+44.6%** speedup, `1,494,768 execs/s`)
+  - `SIMD/FP64 (2k/sample)`: median `0.248 ms`, `8,064,516 execs/s`
+  - `External Call Bridge (2k/sample)`: median `0.210 ms`, `9,514,748 execs/s`
+  - `AEAD Seal+Open (256B, 1k)`: `6.517 ms` (`XChaCha20-Poly1305 1k ops: 3.823 ms`)
+  - Shared Runtime Scaling: 2 funcs (`x64=2100B`, `ARM64=1972B`), 5 funcs (`x64=2444B`, `ARM64=2308B`), 10 funcs (`x64=3028B`, `ARM64=2868B`), 20 funcs (`x64=4188B`, `ARM64=3988B`)
   - `PIC Runtime Emission (avg)`: `0.049 ms` (`x86-64=1996B`, `ARM64=1860B`)
   - `VM Working Set RAM (per ctx)`: `33024 bytes` (`native frame=1360B x64 / 1376B ARM64`)
   - `XChaCha20-Poly1305 (1k ops)`: `1.897 ms`

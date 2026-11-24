@@ -41,7 +41,21 @@ enum class VmOpcode : std::uint8_t {
     LeaPic = 0x1A,
     SelectCc = 0x1B,
     SetCc = 0x1C,
-    MaxOpcode = 0x1D
+    VMovReg = 0x1D,
+    VAddF32 = 0x1E,
+    VAddF64 = 0x1F,
+    VSubF32 = 0x20,
+    VSubF64 = 0x21,
+    VMulF32 = 0x22,
+    VMulF64 = 0x23,
+    VDivF32 = 0x24,
+    VDivF64 = 0x25,
+    VCmpF32 = 0x26,
+    VCmpF64 = 0x27,
+    VLoad = 0x28,
+    VStore = 0x29,
+    VXor = 0x2A,
+    MaxOpcode = 0x2B
 };
 
 enum class VmCondCode : std::uint8_t {
@@ -76,7 +90,7 @@ struct BvmProgram {
     static constexpr std::uint16_t kVersion = 1;
     static constexpr std::size_t kInstructionSize = 12;
     static constexpr std::size_t kNumRegisters = 32;
-    static constexpr std::size_t kOpcodeTableSize = 32;
+    static constexpr std::size_t kOpcodeTableSize = 64;
     static constexpr std::size_t kMaxInstructions = 1048576;
 
     std::uint64_t build_seed{0};
