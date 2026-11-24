@@ -410,6 +410,105 @@ IrInterpreter::execute(const IrFunction& fn, const IrExecOptions& options) {
                     }
                     break;
                 }
+                case IrOpcode::FCvt: {
+                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
+                        const std::int64_t mode = insn.srcs[1].imm;
+                        const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                        const auto s_v = try_parse_vreg_index(insn.srcs[0].name);
+                        if (mode == 0 || mode == 1) {
+                            // int -> fp
+                            if (d_v) {
+                                auto src_val = eval_operand_checked(insn.srcs[0], state);
+                                if (!src_val) return diagnostics::Result<IrExecState>::err(src_val.error().code, src_val.error().message, src_val.error().context);
+                                const bool src64 = (insn.srcs[0].bit_width == 64);
+                                const bool dst64 = (insn.dsts[0].bit_width == 64);
+                                if (dst64) {
+                                    const double d = (mode == 1)
+                                        ? (src64 ? static_cast<double>(src_val.value()) : static_cast<double>(static_cast<std::uint32_t>(src_val.value())))
+                                        : (src64 ? static_cast<double>(static_cast<std::int64_t>(src_val.value())) : static_cast<double>(static_cast<std::int32_t>(src_val.value())));
+                                    std::memcpy(&state.vregs[*d_v][0], &d, 8);
+                                } else {
+                                    const float f = (mode == 1)
+                                        ? (src64 ? static_cast<float>(src_val.value()) : static_cast<float>(static_cast<std::uint32_t>(src_val.value())))
+                                        : (src64 ? static_cast<float>(static_cast<std::int64_t>(src_val.value())) : static_cast<float>(static_cast<std::int32_t>(src_val.value())));
+                                    std::uint32_t uf = 0;
+                                    std::memcpy(&uf, &f, 4);
+                                    state.vregs[*d_v][0] = (state.vregs[*d_v][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(uf);
+                                }
+                            }
+                        } else if (mode == 2 || mode == 3) {
+                            // fp -> int (trunc)
+                            if (s_v) {
+                                const bool src64 = (insn.srcs[0].bit_width == 64);
+                                const bool dst64 = (insn.dsts[0].bit_width == 64);
+                                double dv = 0.0;
+                                if (src64) {
+                                    std::memcpy(&dv, &state.vregs[*s_v][0], 8);
+                                } else {
+                                    float fv = 0.0f;
+                                    const std::uint32_t uf = static_cast<std::uint32_t>(state.vregs[*s_v][0]);
+                                    std::memcpy(&fv, &uf, 4);
+                                    dv = static_cast<double>(fv);
+                                }
+                                std::uint64_t out_i = 0;
+                                if (mode == 3) {
+                                    out_i = dst64 ? static_cast<std::uint64_t>(dv) : static_cast<std::uint64_t>(static_cast<std::uint32_t>(dv));
+                                } else {
+                                    out_i = dst64 ? static_cast<std::uint64_t>(static_cast<std::int64_t>(dv))
+                                                  : static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(dv)));
+                                }
+                                auto w = write_operand_checked(insn.dsts[0], out_i, state);
+                                if (!w) return diagnostics::Result<IrExecState>::err(w.error().code, w.error().message, w.error().context);
+                            }
+                        } else if (mode == 4 && d_v && s_v) {
+                            // fp32 <-> fp64
+                            if (insn.dsts[0].bit_width == 64) {
+                                float fv = 0.0f;
+                                const std::uint32_t uf = static_cast<std::uint32_t>(state.vregs[*s_v][0]);
+                                std::memcpy(&fv, &uf, 4);
+                                const double dv = static_cast<double>(fv);
+                                std::memcpy(&state.vregs[*d_v][0], &dv, 8);
+                            } else {
+                                double dv = 0.0;
+                                std::memcpy(&dv, &state.vregs[*s_v][0], 8);
+                                const float fv = static_cast<float>(dv);
+                                std::uint32_t uf = 0;
+                                std::memcpy(&uf, &fv, 4);
+                                state.vregs[*d_v][0] = (state.vregs[*d_v][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(uf);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case IrOpcode::VPAdd:
+                case IrOpcode::VPSub: {
+                    if (!insn.dsts.empty() && insn.srcs.size() >= 2) {
+                        const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                        const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                        const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                        if (d_v && s1_v && s2_v) {
+                            const bool is_sub = (insn.opcode == IrOpcode::VPSub);
+                            if (insn.dsts[0].bit_width == 64) {
+                                for (int lane = 0; lane < 2; ++lane) {
+                                    state.vregs[*d_v][lane] = is_sub
+                                        ? (state.vregs[*s1_v][lane] - state.vregs[*s2_v][lane])
+                                        : (state.vregs[*s1_v][lane] + state.vregs[*s2_v][lane]);
+                                }
+                            } else {
+                                for (int half = 0; half < 2; ++half) {
+                                    const std::uint64_t a = state.vregs[*s1_v][half];
+                                    const std::uint64_t b = state.vregs[*s2_v][half];
+                                    const std::uint32_t lo = is_sub ? (static_cast<std::uint32_t>(a) - static_cast<std::uint32_t>(b))
+                                                                    : (static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
+                                    const std::uint32_t hi = is_sub ? (static_cast<std::uint32_t>(a >> 32) - static_cast<std::uint32_t>(b >> 32))
+                                                                    : (static_cast<std::uint32_t>(a >> 32) + static_cast<std::uint32_t>(b >> 32));
+                                    state.vregs[*d_v][half] = static_cast<std::uint64_t>(lo) | (static_cast<std::uint64_t>(hi) << 32);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
                 case IrOpcode::Jump:
                     if (!insn.srcs.empty() && insn.srcs[0].kind == IrOperand::Kind::Label) {
                         const std::uint64_t target = static_cast<std::uint64_t>(insn.srcs[0].imm);

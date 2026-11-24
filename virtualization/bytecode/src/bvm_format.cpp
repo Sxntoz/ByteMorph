@@ -93,6 +93,17 @@ std::string_view to_string(VmOpcode op) noexcept {
         case VmOpcode::VLoad: return "vm.vload";
         case VmOpcode::VStore: return "vm.vstore";
         case VmOpcode::VXor: return "vm.vxor";
+        case VmOpcode::VCvtI2F: return "vm.vcvti2f";
+        case VmOpcode::VCvtF2I: return "vm.vcvtf2i";
+        case VmOpcode::VCvtF2F: return "vm.vcvtf2f";
+        case VmOpcode::VMovGprToVec: return "vm.vmov.g2v";
+        case VmOpcode::VMovVecToGpr: return "vm.vmov.v2g";
+        case VmOpcode::VPAdd32: return "vm.vpadd32";
+        case VmOpcode::VPAdd64: return "vm.vpadd64";
+        case VmOpcode::VPSub32: return "vm.vpsub32";
+        case VmOpcode::VPSub64: return "vm.vpsub64";
+        case VmOpcode::VAnd: return "vm.vand";
+        case VmOpcode::VOr: return "vm.vor";
         case VmOpcode::MaxOpcode: return "vm.invalid";
     }
     return "vm.invalid";

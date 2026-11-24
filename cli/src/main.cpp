@@ -37,7 +37,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.8.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.11.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -657,8 +657,14 @@ std::string build_compatibility_json(const bytemorph::prot::CompatibilityReport&
             << hex_u64(f.entry_va) << "\", \"size_bytes\": " << f.size_bytes
             << ", \"category\": \"" << json_escape(f.category) << "\""
             << ", \"ir_ops\": " << f.ir_ops << ", \"vm_ops\": " << f.vm_ops
+            << ", \"uses_simd\": " << (f.uses_simd ? "true" : "false")
+            << ", \"simd_ops_count\": " << f.simd_ops_count
+            << ", \"is_recursive\": " << (f.is_recursive ? "true" : "false")
+            << ", \"has_side_effects\": " << (f.has_side_effects ? "true" : "false")
+            << ", \"has_exception_unwind\": " << (f.has_exception_unwind ? "true" : "false")
             << ", \"estimated_overhead_pct\": " << f.estimated_overhead_pct
-            << ", \"estimated_runtime_bytes\": " << f.estimated_runtime_bytes << "}"
+            << ", \"estimated_runtime_bytes\": " << f.estimated_runtime_bytes
+            << ", \"decision_explanation\": \"" << json_escape(f.decision_explanation) << "\"}"
             << (i + 1 < c.eligible_functions.size() ? "," : "") << '\n';
     }
     oss << "  ],\n  \"rejected_functions\": [\n";
@@ -1070,6 +1076,131 @@ int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_b
     return 0;
 }
 
+int cmd_test_equivalence(const std::string& orig_exe,
+                         const std::string& prot_exe,
+                         const std::string& extra_args,
+                         const std::string& out_orig,
+                         const std::string& out_prot) {
+    auto run_capture = [](const std::string& exe, const std::string& args_str, int& exit_code) -> std::string {
+        std::string cmd = "\"" + exe + "\"";
+        if (!args_str.empty()) {
+            cmd += " " + args_str;
+        }
+#ifdef _WIN32
+        cmd = "\"" + cmd + "\"";
+        FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+        FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+        if (!pipe) {
+            exit_code = -1;
+            return {};
+        }
+        std::string out;
+        char buf[512];
+        while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+            out += buf;
+        }
+#ifdef _WIN32
+        exit_code = _pclose(pipe);
+#else
+        const int st = pclose(pipe);
+        exit_code = st;
+#endif
+        return out;
+    };
+
+    std::string orig_args = extra_args;
+    std::string prot_args = extra_args;
+    if (!out_orig.empty()) orig_args += (orig_args.empty() ? "" : " ") + std::string("--out \"") + out_orig + "\"";
+    if (!out_prot.empty()) prot_args += (prot_args.empty() ? "" : " ") + std::string("--out \"") + out_prot + "\"";
+
+    int rc_orig = -1;
+    int rc_prot = -1;
+    const std::string stdout_orig = run_capture(orig_exe, orig_args, rc_orig);
+    const std::string stdout_prot = run_capture(prot_exe, prot_args, rc_prot);
+
+    bool files_match = true;
+    if (!out_orig.empty() && !out_prot.empty()) {
+        std::ifstream f1(out_orig, std::ios::binary);
+        std::ifstream f2(out_prot, std::ios::binary);
+        const std::string s1((std::istreambuf_iterator<char>(f1)), std::istreambuf_iterator<char>());
+        const std::string s2((std::istreambuf_iterator<char>(f2)), std::istreambuf_iterator<char>());
+        files_match = (f1.good() || f1.eof()) && (f2.good() || f2.eof()) && (s1 == s2);
+    }
+
+    const bool ok = (rc_orig == rc_prot) && (stdout_orig == stdout_prot) && files_match;
+    std::cout << "=== ByteMorph Equivalence Check ===\n"
+              << "  Original  : " << orig_exe << " (exit=" << rc_orig << ", stdout=" << stdout_orig.size() << "B)\n"
+              << "  Protected : " << prot_exe << " (exit=" << rc_prot << ", stdout=" << stdout_prot.size() << "B)\n"
+              << "  Stdout Eq : " << (stdout_orig == stdout_prot ? "PASS" : "FAIL") << '\n'
+              << "  Files Eq  : " << (files_match ? "PASS" : "FAIL") << '\n'
+              << "  Overall   : " << (ok ? "EQUIVALENT" : "MISMATCH") << '\n';
+    return ok ? 0 : 1;
+}
+
+int cmd_report(const std::string& path, const std::string& output_path) {
+    auto ver_res = bytemorph::prot::ProtectionEngine::verify(path);
+    auto comp_res = bytemorph::prot::ProtectionEngine::check_compatibility(path, true);
+    if (!ver_res && !comp_res) {
+        std::cerr << "Report failed: " << ver_res.error().to_string() << '\n';
+        return 1;
+    }
+
+    std::ostringstream oss;
+    oss << "{\n  \"binary\": \"" << json_escape(path) << "\",\n";
+    if (ver_res) {
+        const auto& v = ver_res.value();
+        oss << "  \"integrity\": {\n"
+            << "    \"valid\": " << (v.valid ? "true" : "false") << ",\n"
+            << "    \"text_integrity_ok\": " << (v.text_integrity_ok ? "true" : "false") << ",\n"
+            << "    \"runtime_integrity_ok\": " << (v.runtime_integrity_ok ? "true" : "false") << ",\n"
+            << "    \"aead_authenticated\": " << (v.aead_authenticated ? "true" : "false") << ",\n"
+            << "    \"bytecode_encrypted\": " << (v.metadata.bytecode_encrypted ? "true" : "false") << ",\n"
+            << "    \"profile\": \"" << json_escape(bytemorph::prot::to_string(v.metadata.profile)) << "\"\n"
+            << "  },\n  \"protected_functions\": [\n";
+        for (std::size_t i = 0; i < v.metadata.functions.size(); ++i) {
+            const auto& fn = v.metadata.functions[i];
+            oss << "    {\"name\": \"" << json_escape(fn.name)
+                << "\", \"original_rva\": \"" << hex_u64(fn.original_rva)
+                << "\", \"stub_rva\": \"" << hex_u64(fn.stub_rva)
+                << "\", \"orig_ir_ops\": " << fn.orig_ir_ops
+                << ", \"obf_ir_ops\": " << fn.obf_ir_ops
+                << ", \"vm_ops\": " << fn.vm_ops << "}"
+                << (i + 1 < v.metadata.functions.size() ? "," : "") << '\n';
+        }
+        oss << "  ],\n";
+    }
+    if (comp_res) {
+        const auto& c = comp_res.value();
+        oss << "  \"compatibility_summary\": {\n"
+            << "    \"eligible_count\": " << c.eligible_functions.size() << ",\n"
+            << "    \"rejected_count\": " << c.rejected_functions.size() << "\n"
+            << "  },\n  \"known_limitations\": [";
+        for (std::size_t i = 0; i < c.known_limitations.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << "\"" << json_escape(c.known_limitations[i]) << "\"";
+        }
+        oss << "]\n";
+    } else {
+        oss << "  \"compatibility_summary\": null,\n  \"known_limitations\": []\n";
+    }
+    oss << "}\n";
+
+    if (!output_path.empty()) {
+        std::ofstream ofs(output_path, std::ios::binary);
+        if (!ofs) {
+            std::cerr << "Failed to write report: " << output_path << '\n';
+            return 1;
+        }
+        ofs << oss.str();
+        std::cout << "Report written to: " << output_path << '\n';
+    } else {
+        std::cout << oss.str();
+    }
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage();
@@ -1082,7 +1213,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.10.0\n";
+        std::cout << "ByteMorph v0.11.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -1094,12 +1225,35 @@ int main(int argc, char* argv[]) {
         bool memory_bench = false;
         bool crypto_bench = false;
         for (int i = 2; i < argc; ++i) {
-            if (std::string_view(argv[i]) == "--detailed") detailed = true;
-            else if (std::string_view(argv[i]) == "--compare-baseline") compare_baseline = true;
-            else if (std::string_view(argv[i]) == "--memory") memory_bench = true;
-            else if (std::string_view(argv[i]) == "--crypto") crypto_bench = true;
+            const std::string_view a = argv[i];
+            if (a == "--detailed") detailed = true;
+            else if (a == "--compare-baseline") compare_baseline = true;
+            else if (a == "--memory") memory_bench = true;
+            else if (a == "--crypto") crypto_bench = true;
+            else if (a == "--full") {
+                detailed = true;
+                compare_baseline = true;
+                memory_bench = true;
+                crypto_bench = true;
+            }
         }
         return cmd_benchmark_protection(detailed, compare_baseline, memory_bench, crypto_bench);
+    }
+    if (cmd == "test-equivalence") {
+        if (argc < 4) {
+            std::cerr << "Usage: bytemorph test-equivalence <original.exe> <protected.exe> [--args \"...\"] [--out-orig f1] [--out-prot f2]\n";
+            return 1;
+        }
+        std::string orig_exe = argv[2];
+        std::string prot_exe = argv[3];
+        std::string extra_args, out_orig, out_prot;
+        for (int i = 4; i < argc; ++i) {
+            const std::string_view a = argv[i];
+            if (a == "--args" && i + 1 < argc) extra_args = argv[++i];
+            else if (a == "--out-orig" && i + 1 < argc) out_orig = argv[++i];
+            else if (a == "--out-prot" && i + 1 < argc) out_prot = argv[++i];
+        }
+        return cmd_test_equivalence(orig_exe, prot_exe, extra_args, out_orig, out_prot);
     }
 
     if (argc < 3) {
@@ -1200,6 +1354,12 @@ int main(int argc, char* argv[]) {
             exceptions_only = true;
         } else if (arg == "--encrypt-bytecode") {
             prot_opts.encrypt_bytecode = true;
+        } else if (arg == "--max-overhead" && i + 1 < argc) {
+            try {
+                prot_opts.max_overhead_budget_pct = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+            } catch (...) {
+                return 1;
+            }
         } else if (arg == "--deep") {
             deep_verify = true;
         } else if (arg == "--eligibility-report" && i + 1 < argc) {
@@ -1220,6 +1380,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
     if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls, detailed_flag);
     if (cmd == "verify") return cmd_verify(file_path, deep_verify);
+    if (cmd == "report") return cmd_report(file_path, output_path);
     if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only, output_format);
     if (cmd == "analyze" && exceptions_only) return cmd_analyze_exceptions(file_path);
     if (cmd == "analyze" && !eligibility_report_path.empty()) {

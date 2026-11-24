@@ -33,6 +33,9 @@ struct VmExecState {
     bool cf{false};
     bool of{false};
     bool pf{false};
+    std::uint32_t mxcsr{0x1F80};
+    std::uint32_t fpcr{0};
+    std::uint32_t fpsr{0};
     std::uint64_t steps_executed{0};
     std::uint64_t allocations_count{0};
     std::uint64_t return_value{0};

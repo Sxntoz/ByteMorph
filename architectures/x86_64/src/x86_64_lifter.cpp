@@ -359,14 +359,72 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.srcs.push_back(parse_operand_text(ops[1]));
     } else if ((insn.mnemonic == "movdqa" || insn.mnemonic == "movdqu" || insn.mnemonic == "movaps" ||
                 insn.mnemonic == "movups" || insn.mnemonic == "movss" || insn.mnemonic == "movsd" ||
-                insn.mnemonic == "movq") && ops.size() == 2) {
-        const std::uint8_t w = (insn.mnemonic == "movss") ? 32 : (insn.mnemonic == "movsd" || insn.mnemonic == "movq") ? 64 : 128;
+                insn.mnemonic == "movq" || insn.mnemonic == "movd") && ops.size() == 2) {
+        const std::uint8_t w = (insn.mnemonic == "movss" || insn.mnemonic == "movd") ? 32
+                             : (insn.mnemonic == "movsd" || insn.mnemonic == "movq") ? 64 : 128;
         auto dst = parse_operand_text(ops[0]);
         auto src = parse_operand_text(ops[1]);
         dst.bit_width = w;
         src.bit_width = w;
         ir.opcode = IrOpcode::VMov;
         ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "cvtsi2ss" || insn.mnemonic == "cvtsi2sd" ||
+                insn.mnemonic == "cvttss2si" || insn.mnemonic == "cvttsd2si" ||
+                insn.mnemonic == "cvtss2sd" || insn.mnemonic == "cvtsd2ss") && ops.size() == 2) {
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        std::int64_t mode = 0;
+        if (insn.mnemonic == "cvtsi2ss") {
+            dst.bit_width = 32;
+            if (src.bit_width != 64) src.bit_width = 32;
+            mode = 0;
+        } else if (insn.mnemonic == "cvtsi2sd") {
+            dst.bit_width = 64;
+            if (src.bit_width != 64) src.bit_width = 32;
+            mode = 0;
+        } else if (insn.mnemonic == "cvttss2si") {
+            if (dst.bit_width != 64) dst.bit_width = 32;
+            src.bit_width = 32;
+            mode = 2;
+        } else if (insn.mnemonic == "cvttsd2si") {
+            if (dst.bit_width != 64) dst.bit_width = 32;
+            src.bit_width = 64;
+            mode = 2;
+        } else if (insn.mnemonic == "cvtss2sd") {
+            dst.bit_width = 64;
+            src.bit_width = 32;
+            mode = 4;
+        } else {
+            dst.bit_width = 32;
+            src.bit_width = 64;
+            mode = 4;
+        }
+        ir.opcode = IrOpcode::FCvt;
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(src));
+        ir.srcs.push_back(IrOperand::immediate(mode, 64));
+    } else if ((insn.mnemonic == "paddd" || insn.mnemonic == "paddq" ||
+                insn.mnemonic == "psubd" || insn.mnemonic == "psubq") && ops.size() == 2) {
+        const std::uint8_t lane_w = (insn.mnemonic.back() == 'q') ? 64 : 32;
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = lane_w;
+        src.bit_width = lane_w;
+        ir.opcode = (insn.mnemonic.rfind("padd", 0) == 0) ? IrOpcode::VPAdd : IrOpcode::VPSub;
+        ir.dsts.push_back(dst);
+        ir.srcs.push_back(dst);
+        ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "andps" || insn.mnemonic == "andpd" || insn.mnemonic == "pand" ||
+                insn.mnemonic == "orps" || insn.mnemonic == "orpd" || insn.mnemonic == "por") && ops.size() == 2) {
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = 128;
+        src.bit_width = 128;
+        ir.opcode = (insn.mnemonic.rfind("and", 0) == 0 || insn.mnemonic == "pand")
+                  ? IrOpcode::And : IrOpcode::Or;
+        ir.dsts.push_back(dst);
+        ir.srcs.push_back(dst);
         ir.srcs.push_back(std::move(src));
     } else if ((insn.mnemonic == "addss" || insn.mnemonic == "addsd" ||
                 insn.mnemonic == "subss" || insn.mnemonic == "subsd" ||

@@ -40,6 +40,9 @@ enum class IrOpcode {
     FMul,
     FDiv,
     FCmp,
+    FCvt,
+    VPAdd,
+    VPSub,
     Unknown
 };
 

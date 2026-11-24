@@ -1,4 +1,4 @@
-# Arquitetura do ByteMorph (v0.10)
+# Arquitetura do ByteMorph (v0.11)
 
 ## Camadas
 
@@ -9,5 +9,5 @@
 - `protection/`:
   - `CryptoAead` (Monocypher 4.0.2: **XChaCha20-Poly1305 AEAD** + **BLAKE2b-256**), metadados `BMP4` v2 e blobs `BMBC` v2 com nonces exclusivos.
   - `native_vm_emitter`: emissor PIC compartilhado para **Win64**, **System V AMD64** e **ARM64 (AAPCS64)** com verificador/descriptografador AEAD `XChaCha20-Poly1305` em runtime, limpeza do buffer ao sair e execução nativa SIMD/FP.
-  - `PeRewriter`, `ElfRewriter`, `MachORewriter`, análise de exceções/unwind (`analyze_exceptions`) e Smart Eligibility 4.0.
+  - `PeRewriter`, `ElfRewriter`, `MachORewriter`, análise de exceções/unwind (`analyze_exceptions`) e Smart Eligibility 5.0 (`--max-overhead`, métricas de recursão/efeitos colaterais/SIMD).
 - `rust/bytemorph-verify`: pré-validador seguro (`#![forbid(unsafe_code)]`) e entropia.

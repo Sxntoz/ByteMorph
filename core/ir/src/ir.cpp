@@ -36,6 +36,9 @@ std::string_view to_string(IrOpcode op) noexcept {
         case IrOpcode::FMul: return "fmul";
         case IrOpcode::FDiv: return "fdiv";
         case IrOpcode::FCmp: return "fcmp";
+        case IrOpcode::FCvt: return "fcvt";
+        case IrOpcode::VPAdd: return "vpadd";
+        case IrOpcode::VPSub: return "vpsub";
         case IrOpcode::Unknown: return "unknown";
     }
     return "unknown";

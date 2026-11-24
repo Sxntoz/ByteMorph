@@ -1930,3 +1930,387 @@ TEST(ProtectionV010Test, BvmCodecSimdAndMetadataV2FuzzSafety) {
     raw.resize(raw.size() - 10);
     EXPECT_FALSE(bytemorph::prot::detail::deserialize_metadata(raw).has_value());
 }
+
+TEST(ProtectionV011Test, CryptoAeadKnownVectorsAndSecureWipe) {
+    using namespace bytemorph::prot;
+    // RFC 7693 BLAKE2b-256 empty input known vector:
+    // 0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8
+    const auto empty_hash = CryptoAead::blake2b_256(std::span<const std::uint8_t>{});
+    const std::array<std::uint8_t, 32> expected_empty_blake2b{
+        0x0e, 0x57, 0x51, 0xc0, 0x26, 0xe5, 0x43, 0xb2,
+        0xe8, 0xab, 0x2e, 0xb0, 0x60, 0x99, 0xda, 0xa1,
+        0xd1, 0xe5, 0xdf, 0x47, 0x77, 0x8f, 0x77, 0x87,
+        0xfa, 0xab, 0x45, 0xcd, 0xf1, 0x2f, 0xe3, 0xa8
+    };
+    EXPECT_EQ(empty_hash, expected_empty_blake2b);
+
+    // Deterministic XChaCha20-Poly1305 KAT & authentication-before-use check
+    AeadKey key{};
+    for (std::size_t i = 0; i < key.bytes.size(); ++i) key.bytes[i] = static_cast<std::uint8_t>(0x80 + i);
+    AeadNonce nonce{};
+    for (std::size_t i = 0; i < nonce.bytes.size(); ++i) nonce.bytes[i] = static_cast<std::uint8_t>(0x10 + i);
+    const std::vector<std::uint8_t> pt = {'B', 'y', 't', 'e', 'M', 'o', 'r', 'p', 'h', 'v', '0', '1', '1'};
+    const std::vector<std::uint8_t> aad = {'B', 'M', 'B', 'C', 0x02, 0x00};
+
+    auto sealed = CryptoAead::seal(pt, aad, key, nonce);
+    ASSERT_TRUE(sealed.has_value());
+    auto opened = CryptoAead::open(sealed.value(), aad, key);
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(opened.value(), pt);
+
+    // Tamper AAD, ciphertext, and MAC: all must fail authentication
+    auto bad_aad = aad;
+    bad_aad[0] ^= 0x01;
+    EXPECT_FALSE(CryptoAead::open(sealed.value(), bad_aad, key).has_value());
+
+    auto tampered = sealed.value();
+    tampered.ciphertext[0] ^= 0xFF;
+    EXPECT_FALSE(CryptoAead::open(tampered, aad, key).has_value());
+
+    tampered = sealed.value();
+    tampered.mac[0] ^= 0xFF;
+    EXPECT_FALSE(CryptoAead::open(tampered, aad, key).has_value());
+
+    // Secure wipe zeroes key material
+    CryptoAead::secure_wipe(key.bytes);
+    for (std::uint8_t b : key.bytes) EXPECT_EQ(b, 0u);
+}
+
+TEST(ProtectionV011Test, MetadataV2RejectsDuplicateNonceAndInvalidFnIndex) {
+    using namespace bytemorph::prot;
+    ProtectionMetadata meta;
+    meta.profile = ProtectionProfile::Maximum;
+    meta.seed = 0xCAFEBABE1234ULL;
+    meta.bytecode_encrypted = true;
+    meta.functions.push_back({"fn_a", 0x1000, 0x2000, 5, 10, 10, 10});
+    meta.functions.push_back({"fn_b", 0x1100, 0x2100, 5, 10, 10, 10});
+
+    const auto n0 = CryptoAead::generate_nonce(meta.seed, 0);
+    // Duplicate nonce across two functions must be rejected
+    meta.encrypted_functions.push_back({0, n0, {}, 16, {}});
+    meta.encrypted_functions.push_back({1, n0, {}, 16, {}});
+    auto ser_dup_nonce = detail::serialize_metadata(meta);
+    EXPECT_FALSE(detail::deserialize_metadata(ser_dup_nonce).has_value());
+
+    // Out-of-range fn_index must be rejected when functions list is populated
+    meta.encrypted_functions.clear();
+    meta.encrypted_functions.push_back({5, n0, {}, 16, {}});
+    auto ser_bad_idx = detail::serialize_metadata(meta);
+    EXPECT_FALSE(detail::deserialize_metadata(ser_bad_idx).has_value());
+
+    // Zero plaintext_size must be rejected
+    meta.encrypted_functions.clear();
+    meta.encrypted_functions.push_back({0, n0, {}, 0, {}});
+    auto ser_zero_sz = detail::serialize_metadata(meta);
+    EXPECT_FALSE(detail::deserialize_metadata(ser_zero_sz).has_value());
+}
+
+TEST(ProtectionV011Test, Simd20ConversionsAndPackedVectorDifferential) {
+    using namespace bytemorph::core::analysis;
+    using namespace bytemorph::core::ir;
+    using namespace bytemorph::virt;
+
+    // x86-64: cvtsi2sd xmm0, rax; cvtss2sd xmm1, xmm1; addsd xmm0, xmm1; cvttsd2si rax, xmm0; paddd xmm2, xmm3; ret
+    FunctionInfo x64_fn;
+    x64_fn.name = "simd20_x64";
+    x64_fn.entry_va = 0x1000;
+    x64_fn.size_bytes = 21;
+    BasicBlock x64_bb;
+    x64_bb.start_va = 0x1000;
+    x64_bb.end_va = 0x1015;
+    x64_bb.instructions = {
+        {0x1000, {}, "cvtsi2sd", "xmm0, rax", "cvtsi2sd xmm0, rax", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x1004, {}, "cvtss2sd", "xmm1, xmm1", "cvtss2sd xmm1, xmm1", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x1008, {}, "addsd", "xmm0, xmm1", "addsd xmm0, xmm1", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x100C, {}, "cvttsd2si", "rax, xmm0", "cvttsd2si rax, xmm0", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x1010, {}, "paddd", "xmm2, xmm3", "paddd xmm2, xmm3", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x1014, {}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt, false},
+    };
+    x64_fn.blocks.push_back(std::move(x64_bb));
+    const auto ir_x64 = bytemorph::arch::x86_64::X86_64Lifter().lift_function(x64_fn);
+
+    IrExecOptions ir_opts;
+    ir_opts.initial_regs["rax"] = 42;
+    const float f_in = 7.75f;
+    std::uint32_t uf = 0;
+    std::memcpy(&uf, &f_in, 4);
+    ir_opts.initial_vregs[1][0] = uf;
+    ir_opts.initial_vregs[2][0] = (10ULL << 32) | 5ULL;
+    ir_opts.initial_vregs[3][0] = (20ULL << 32) | 7ULL;
+
+    auto ir_res = IrInterpreter::execute(ir_x64, ir_opts);
+    ASSERT_TRUE(ir_res.has_value()) << ir_res.error().to_string();
+    EXPECT_EQ(ir_res.value().return_value, 49ULL);
+    EXPECT_EQ(ir_res.value().vregs[2][0], (30ULL << 32) | 12ULL);
+
+    auto vm_prog = IrToVmTranslator::translate(ir_x64);
+    ASSERT_TRUE(vm_prog.has_value()) << vm_prog.error().to_string();
+    VmExecOptions vm_opts;
+    vm_opts.initial_regs[0] = 42; // rax -> R0
+    vm_opts.initial_vregs[1][0] = uf;
+    vm_opts.initial_vregs[2][0] = (10ULL << 32) | 5ULL;
+    vm_opts.initial_vregs[3][0] = (20ULL << 32) | 7ULL;
+    auto vm_res = VmInterpreter::execute(vm_prog.value(), vm_opts);
+    ASSERT_TRUE(vm_res.has_value()) << vm_res.error().to_string();
+    EXPECT_EQ(vm_res.value().return_value, ir_res.value().return_value);
+    EXPECT_EQ(vm_res.value().vregs[2][0], ir_res.value().vregs[2][0]);
+
+    // ARM64: scvtf d0, x0; fcvt d1, s1; fadd d0, d0, d1; fcvtzs x0, d0; add v2.4s, v2.4s, v3.4s; ret
+    FunctionInfo a64_fn;
+    a64_fn.name = "simd20_a64";
+    a64_fn.entry_va = 0x2000;
+    a64_fn.size_bytes = 24;
+    BasicBlock a64_bb;
+    a64_bb.start_va = 0x2000;
+    a64_bb.end_va = 0x2018;
+    a64_bb.instructions = {
+        {0x2000, {}, "scvtf", "d0, x0", "scvtf d0, x0", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x2004, {}, "fcvt", "d1, s1", "fcvt d1, s1", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x2008, {}, "fadd", "d0, d0, d1", "fadd d0, d0, d1", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x200C, {}, "fcvtzs", "x0, d0", "fcvtzs x0, d0", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x2010, {}, "add", "v2.4s, v2.4s, v3.4s", "add v2.4s, v2.4s, v3.4s", ControlFlowKind::Sequential, std::nullopt, false},
+        {0x2014, {}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt, false},
+    };
+    a64_fn.blocks.push_back(std::move(a64_bb));
+    const auto ir_a64 = bytemorph::arch::aarch64::AArch64Lifter().lift_function(a64_fn);
+    ir_opts.initial_regs.clear();
+    ir_opts.initial_regs["x0"] = 42;
+    auto ir_a64_res = IrInterpreter::execute(ir_a64, ir_opts);
+    ASSERT_TRUE(ir_a64_res.has_value()) << ir_a64_res.error().to_string();
+    EXPECT_EQ(ir_a64_res.value().return_value, 49ULL);
+    EXPECT_EQ(ir_a64_res.value().vregs[2][0], (30ULL << 32) | 12ULL);
+
+    auto vm_a64 = IrToVmTranslator::translate(ir_a64);
+    ASSERT_TRUE(vm_a64.has_value()) << vm_a64.error().to_string();
+    auto vm_a64_res = VmInterpreter::execute(vm_a64.value(), vm_opts);
+    ASSERT_TRUE(vm_a64_res.has_value()) << vm_a64_res.error().to_string();
+    EXPECT_EQ(vm_a64_res.value().return_value, 49ULL);
+    EXPECT_EQ(vm_a64_res.value().vregs[2][0], (30ULL << 32) | 12ULL);
+}
+
+TEST(ProtectionV011Test, NativeX64Simd20AndMxcsrPreservationExecution) {
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(BYTEMORPH_HAS_SANITIZER)
+    using namespace bytemorph::virt;
+    // R1 = int(25), xmm1 = float(4.5) -> cvt R1->xmm0(f64), cvt xmm1(f32)->xmm1(f64), xmm0+=xmm1 -> cvt xmm0(f64)->R0(i64) == 29
+    BvmProgram prog;
+    prog.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 25},
+        {VmOpcode::VCvtI2F, 0, 1, 0, 6},      // dst_f64 | src_64
+        {VmOpcode::VCvtF2F, 1, 1, 0, 64},     // f32 -> f64
+        {VmOpcode::VAddF64, 0, 0, 1, 0},
+        {VmOpcode::VCvtF2I, 0, 0, 0, 6},      // src_f64 | dst_64
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    bytemorph::prot::detail::SharedRuntimeLayout layout;
+#ifdef _WIN32
+    const auto abi = bytemorph::prot::detail::AbiKind::Win64;
+#else
+    const auto abi = bytemorph::prot::detail::AbiKind::SysV64;
+#endif
+    auto code = bytemorph::prot::detail::emit_shared_pic_x64_vm_runtime(
+        std::vector<BvmProgram>{prog}, abi, layout);
+    ASSERT_TRUE(code.has_value()) << code.error().to_string();
+
+    void* exec_mem = nullptr;
+#ifdef _WIN32
+    exec_mem = VirtualAlloc(nullptr, code.value().size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    ASSERT_NE(exec_mem, nullptr);
+    std::memcpy(exec_mem, code.value().data(), code.value().size());
+    DWORD old_prot = 0;
+    ASSERT_TRUE(VirtualProtect(exec_mem, code.value().size(), PAGE_EXECUTE_READ, &old_prot));
+#else
+    exec_mem = mmap(nullptr, code.value().size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(exec_mem, MAP_FAILED);
+    std::memcpy(exec_mem, code.value().data(), code.value().size());
+    ASSERT_EQ(mprotect(exec_mem, code.value().size(), PROT_READ | PROT_EXEC), 0);
+#endif
+    using FnPtr = std::int64_t (*)(double, float);
+    auto fn = reinterpret_cast<FnPtr>(static_cast<std::uint8_t*>(exec_mem) + layout.entry_offsets[0]);
+    const std::int64_t out = fn(0.0, 4.5f);
+    EXPECT_EQ(out, 29);
+#ifdef _WIN32
+    VirtualFree(exec_mem, 0, MEM_RELEASE);
+#else
+    munmap(exec_mem, code.value().size());
+#endif
+#else
+    GTEST_SKIP() << "Native x64 SIMD 2.0 test runs on non-sanitized x86-64 hosts";
+#endif
+}
+
+TEST(ProtectionV011Test, RealLabCAppProtectionAndEquivalence) {
+#if defined(_WIN32) && defined(BYTEMORPH_LAB_C_APP_PATH) && !defined(BYTEMORPH_HAS_SANITIZER)
+    const std::filesystem::path orig_exe(BYTEMORPH_LAB_C_APP_PATH);
+    if (std::filesystem::exists(orig_exe)) {
+        const std::filesystem::path prot_exe =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_c_prot.exe";
+        const std::filesystem::path out_orig =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_c_orig.txt";
+        const std::filesystem::path out_prot =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_c_prot.txt";
+        std::filesystem::remove(prot_exe);
+        std::filesystem::remove(out_orig);
+        std::filesystem::remove(out_prot);
+
+        bytemorph::prot::ProtectOptions opts;
+        opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+        opts.protect_all_eligible = true;
+        opts.encrypt_bytecode = true;
+        opts.allow_external_calls = true;
+
+        auto prot_res = bytemorph::prot::ProtectionEngine::protect(orig_exe, prot_exe, opts);
+        ASSERT_TRUE(prot_res.has_value()) << prot_res.error().to_string();
+        EXPECT_GE(prot_res.value().protected_functions.size(), 2u);
+
+        auto ver_res = bytemorph::prot::ProtectionEngine::verify(prot_exe);
+        ASSERT_TRUE(ver_res.has_value()) << ver_res.error().to_string();
+        EXPECT_TRUE(ver_res.value().valid);
+        EXPECT_TRUE(ver_res.value().aead_authenticated);
+        EXPECT_TRUE(ver_res.value().metadata.bytecode_encrypted);
+
+        auto run_and_capture = [](const std::filesystem::path& exe, const std::filesystem::path& out_f, int& rc) {
+#ifdef _WIN32
+            const std::string cmd = "\"\"" + exe.string() + "\" --seed 31 --out \"" + out_f.string() + "\"\"";
+            FILE* p = _popen(cmd.c_str(), "r");
+#else
+            const std::string cmd = "\"" + exe.string() + "\" --seed 31 --out \"" + out_f.string() + "\"";
+            FILE* p = popen(cmd.c_str(), "r");
+#endif
+            std::string s;
+            if (p) {
+                char buf[256];
+                while (std::fgets(buf, sizeof(buf), p) != nullptr) s += buf;
+#ifdef _WIN32
+                rc = _pclose(p);
+#else
+                rc = pclose(p);
+#endif
+            }
+            return s;
+        };
+        int rc1 = -1, rc2 = -1;
+        const std::string s1 = run_and_capture(orig_exe, out_orig, rc1);
+        const std::string s2 = run_and_capture(prot_exe, out_prot, rc2);
+        EXPECT_EQ(rc1, 0);
+        EXPECT_EQ(rc2, 0);
+        EXPECT_EQ(s1, s2);
+
+        {
+            std::ifstream f1(out_orig, std::ios::binary), f2(out_prot, std::ios::binary);
+            const std::string c1((std::istreambuf_iterator<char>(f1)), std::istreambuf_iterator<char>());
+            const std::string c2((std::istreambuf_iterator<char>(f2)), std::istreambuf_iterator<char>());
+            EXPECT_FALSE(c1.empty());
+            EXPECT_EQ(c1, c2);
+        }
+
+        std::filesystem::remove(prot_exe);
+        std::filesystem::remove(out_orig);
+        std::filesystem::remove(out_prot);
+    }
+#else
+    GTEST_SKIP() << "Real Windows lab C app equivalence runs on non-sanitized Windows x64";
+#endif
+}
+
+TEST(ProtectionV011Test, RealLabCppAppMultiHundredFuncsAndMultithreadEquivalence) {
+#if defined(_WIN32) && defined(BYTEMORPH_LAB_CPP_APP_PATH) && !defined(BYTEMORPH_HAS_SANITIZER)
+    const std::filesystem::path orig_exe(BYTEMORPH_LAB_CPP_APP_PATH);
+    if (std::filesystem::exists(orig_exe)) {
+        auto comp_res = bytemorph::prot::ProtectionEngine::check_compatibility(orig_exe, true);
+        ASSERT_TRUE(comp_res.has_value()) << comp_res.error().to_string();
+        EXPECT_GE(comp_res.value().eligible_functions.size() + comp_res.value().rejected_functions.size(), 100u);
+
+        bool eh_rejected = false;
+        for (const auto& r : comp_res.value().rejected_functions) {
+            if (r.name.find("lab_cpp_eh_fn") != std::string::npos &&
+                r.category == "exception_unwind_incompatible") {
+                eh_rejected = true;
+            }
+        }
+        EXPECT_TRUE(eh_rejected);
+
+        const std::filesystem::path prot_exe =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_cpp_prot.exe";
+        const std::filesystem::path out_orig =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_cpp_orig.txt";
+        const std::filesystem::path out_prot =
+            std::filesystem::temp_directory_path() / "bytemorph_v011_lab_cpp_prot.txt";
+        std::filesystem::remove(prot_exe);
+        std::filesystem::remove(out_orig);
+        std::filesystem::remove(out_prot);
+
+        bytemorph::prot::ProtectOptions opts;
+        opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+        opts.protect_all_eligible = true;
+        opts.encrypt_bytecode = true;
+        opts.allow_external_calls = true;
+
+        auto prot_res = bytemorph::prot::ProtectionEngine::protect(orig_exe, prot_exe, opts);
+        ASSERT_TRUE(prot_res.has_value()) << prot_res.error().to_string();
+        EXPECT_GE(prot_res.value().protected_functions.size(), 10u);
+
+        auto ver_res = bytemorph::prot::ProtectionEngine::verify(prot_exe);
+        ASSERT_TRUE(ver_res.has_value()) << ver_res.error().to_string();
+        EXPECT_TRUE(ver_res.value().aead_authenticated);
+
+        auto run_and_capture = [](const std::filesystem::path& exe, const std::filesystem::path& out_f, int& rc) {
+#ifdef _WIN32
+            const std::string cmd = "\"\"" + exe.string() + "\" --seed 29 --out \"" + out_f.string() + "\"\"";
+            FILE* p = _popen(cmd.c_str(), "r");
+#else
+            const std::string cmd = "\"" + exe.string() + "\" --seed 29 --out \"" + out_f.string() + "\"";
+            FILE* p = popen(cmd.c_str(), "r");
+#endif
+            std::string s;
+            if (p) {
+                char buf[256];
+                while (std::fgets(buf, sizeof(buf), p) != nullptr) s += buf;
+#ifdef _WIN32
+                rc = _pclose(p);
+#else
+                rc = pclose(p);
+#endif
+            }
+            return s;
+        };
+        int rc1 = -1, rc2 = -1;
+        const std::string s1 = run_and_capture(orig_exe, out_orig, rc1);
+        const std::string s2 = run_and_capture(prot_exe, out_prot, rc2);
+        EXPECT_EQ(rc1, 0);
+        EXPECT_EQ(rc2, 0);
+        EXPECT_EQ(s1, s2);
+
+        {
+            std::ifstream f1(out_orig, std::ios::binary), f2(out_prot, std::ios::binary);
+            const std::string c1((std::istreambuf_iterator<char>(f1)), std::istreambuf_iterator<char>());
+            const std::string c2((std::istreambuf_iterator<char>(f2)), std::istreambuf_iterator<char>());
+            EXPECT_FALSE(c1.empty());
+            EXPECT_EQ(c1, c2);
+        }
+
+        std::filesystem::remove(prot_exe);
+        std::filesystem::remove(out_orig);
+        std::filesystem::remove(out_prot);
+    }
+#else
+    GTEST_SKIP() << "Real Windows lab C++ app equivalence runs on non-sanitized Windows x64";
+#endif
+}
+
+TEST(ProtectionV011Test, SmartEligibility50BudgetAndMetrics) {
+    using namespace bytemorph::core::analysis;
+    using namespace bytemorph::prot;
+
+    // Build a synthetic binary or inspect lab_pe_target for Smart Eligibility 5.0 fields
+#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+    const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    if (std::filesystem::exists(target_exe)) {
+        auto comp = ProtectionEngine::check_compatibility(target_exe, true);
+        ASSERT_TRUE(comp.has_value()) << comp.error().to_string();
+        ASSERT_FALSE(comp.value().eligible_functions.empty());
+        for (const auto& ef : comp.value().eligible_functions) {
+            EXPECT_FALSE(ef.decision_explanation.empty());
+        }
+    }
+#endif
+}

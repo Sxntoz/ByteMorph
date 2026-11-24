@@ -43,6 +43,7 @@ struct ProtectOptions {
     bool protect_all_eligible{false};
     bool rollback_on_failure{true};
     bool encrypt_bytecode{false};
+    std::optional<std::uint32_t> max_overhead_budget_pct;
 };
 
 struct FunctionCompatibilityEntry {
@@ -52,13 +53,19 @@ struct FunctionCompatibilityEntry {
     bool eligible{false};
     bool uses_simd{false};
     bool has_exception_unwind{false};
+    bool is_recursive{false};
+    bool has_side_effects{false};
     std::uint32_t ir_ops{0};
     std::uint32_t vm_ops{0};
+    std::uint32_t external_calls_count{0};
+    std::uint32_t global_refs_count{0};
+    std::uint32_t simd_ops_count{0};
     std::string category;
     std::uint32_t estimated_overhead_pct{0};
     std::uint32_t estimated_runtime_bytes{0};
     std::vector<std::string> unsupported_instructions;
     std::string exception_detail;
+    std::string decision_explanation;
     std::string rejection_reason;
 };
 

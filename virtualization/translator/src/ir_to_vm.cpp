@@ -240,7 +240,10 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                             auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
                             auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
                             if (s1_v && s2_v) {
-                                prog.instructions.push_back(VmInstruction{VmOpcode::VXor, *d_v, *s1_v, *s2_v, 0});
+                                const VmOpcode vop = (insn.opcode == IrOpcode::And) ? VmOpcode::VAnd
+                                                   : (insn.opcode == IrOpcode::Or) ? VmOpcode::VOr
+                                                                                   : VmOpcode::VXor;
+                                prog.instructions.push_back(VmInstruction{vop, *d_v, *s1_v, *s2_v, 0});
                                 break;
                             }
                         }
@@ -357,9 +360,63 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                         if (!base_r) return diagnostics::Result<BvmProgram>::err(base_r.error().code, base_r.error().message, base_r.error().context);
                         prog.instructions.push_back(VmInstruction{
                             VmOpcode::VStore, base_r.value(), *s_v, normalize_mem_width(insn.dsts[0].bit_width), insn.dsts[0].imm});
+                    } else if (d_v && (insn.srcs[0].kind == IrOperand::Kind::ArchReg || insn.srcs[0].kind == IrOperand::Kind::VirtualReg || insn.srcs[0].kind == IrOperand::Kind::Immediate)) {
+                        auto src_r = materialize_src(insn.srcs[0], 29);
+                        if (!src_r) return diagnostics::Result<BvmProgram>::err(src_r.error().code, src_r.error().message, src_r.error().context);
+                        prog.instructions.push_back(VmInstruction{
+                            VmOpcode::VMovGprToVec, *d_v, src_r.value(), 0, insn.dsts[0].bit_width == 32 ? 32 : 64});
+                    } else if (s_v && (insn.dsts[0].kind == IrOperand::Kind::ArchReg || insn.dsts[0].kind == IrOperand::Kind::VirtualReg)) {
+                        auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                        if (!dst_r) return diagnostics::Result<BvmProgram>::err(dst_r.error().code, dst_r.error().message, dst_r.error().context);
+                        prog.instructions.push_back(VmInstruction{
+                            VmOpcode::VMovVecToGpr, dst_r.value(), *s_v, 0, insn.dsts[0].bit_width == 32 ? 32 : 64});
                     } else {
                         return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "Unsupported VMov operand combination", "IrToVmTranslator::translate");
                     }
+                    break;
+                }
+                case IrOpcode::FCvt: {
+                    if (insn.dsts.size() != 1 || insn.srcs.size() < 2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid FCvt arity", "IrToVmTranslator::translate");
+                    }
+                    const std::int64_t mode = insn.srcs[1].imm;
+                    const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                    const auto s_v = try_parse_vreg_index(insn.srcs[0].name);
+                    if (mode == 0 || mode == 1) {
+                        if (!d_v) return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "FCvt I2F requires vector dst", "IrToVmTranslator::translate");
+                        auto src_r = materialize_src(insn.srcs[0], 29);
+                        if (!src_r) return diagnostics::Result<BvmProgram>::err(src_r.error().code, src_r.error().message, src_r.error().context);
+                        const std::int64_t flags = (mode == 1 ? 1 : 0) | (insn.dsts[0].bit_width == 64 ? 2 : 0) | (insn.srcs[0].bit_width == 64 ? 4 : 0);
+                        prog.instructions.push_back(VmInstruction{VmOpcode::VCvtI2F, *d_v, src_r.value(), 0, flags});
+                    } else if (mode == 2 || mode == 3) {
+                        if (!s_v) return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "FCvt F2I requires vector src", "IrToVmTranslator::translate");
+                        auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                        if (!dst_r) return diagnostics::Result<BvmProgram>::err(dst_r.error().code, dst_r.error().message, dst_r.error().context);
+                        const std::int64_t flags = (mode == 3 ? 1 : 0) | (insn.srcs[0].bit_width == 64 ? 2 : 0) | (insn.dsts[0].bit_width == 64 ? 4 : 0);
+                        prog.instructions.push_back(VmInstruction{VmOpcode::VCvtF2I, dst_r.value(), *s_v, 0, flags});
+                    } else if (mode == 4 && d_v && s_v) {
+                        prog.instructions.push_back(VmInstruction{VmOpcode::VCvtF2F, *d_v, *s_v, 0, insn.dsts[0].bit_width == 64 ? 64 : 32});
+                    } else {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "Unsupported FCvt mode", "IrToVmTranslator::translate");
+                    }
+                    break;
+                }
+                case IrOpcode::VPAdd:
+                case IrOpcode::VPSub: {
+                    if (insn.dsts.size() != 1 || insn.srcs.size() < 2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid packed vector arithmetic arity", "IrToVmTranslator::translate");
+                    }
+                    const auto d_v = try_parse_vreg_index(insn.dsts[0].name);
+                    const auto s1_v = try_parse_vreg_index(insn.srcs[0].name);
+                    const auto s2_v = try_parse_vreg_index(insn.srcs[1].name);
+                    if (!d_v || !s1_v || !s2_v) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::UnsupportedFormat, "Packed vector op requires vector registers", "IrToVmTranslator::translate");
+                    }
+                    const bool is_64 = (insn.dsts[0].bit_width == 64);
+                    const VmOpcode vop = (insn.opcode == IrOpcode::VPAdd)
+                        ? (is_64 ? VmOpcode::VPAdd64 : VmOpcode::VPAdd32)
+                        : (is_64 ? VmOpcode::VPSub64 : VmOpcode::VPSub32);
+                    prog.instructions.push_back(VmInstruction{vop, *d_v, *s1_v, *s2_v, 0});
                     break;
                 }
                 case IrOpcode::FAdd:

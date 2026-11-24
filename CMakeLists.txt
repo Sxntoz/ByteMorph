@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(ByteMorph
-    VERSION 0.10.0
+    VERSION 0.11.0
     DESCRIPTION "Cross-platform modular binary analysis and software protection engine"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 set(CMAKE_CXX_STANDARD 20)

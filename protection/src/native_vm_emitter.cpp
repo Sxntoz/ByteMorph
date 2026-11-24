@@ -183,6 +183,16 @@ diagnostics::Result<ProtectionMetadata> deserialize_metadata(std::span<const std
             std::memcpy(ef.mac.data(), data.data() + pos, 16); pos += 16;
             ef.plaintext_size = read_u32(data, pos); pos += 4;
             std::memcpy(ef.aad_hash.data(), data.data() + pos, 32); pos += 32;
+            if ((!m.functions.empty() && ef.fn_index >= m.functions.size()) || ef.plaintext_size == 0) {
+                return diagnostics::Result<ProtectionMetadata>::err(
+                    ErrorCode::ParseError, "Invalid encrypted function index or size in BMP4", "deserialize_metadata");
+            }
+            for (const auto& prev : m.encrypted_functions) {
+                if (prev.fn_index == ef.fn_index || prev.nonce.bytes == ef.nonce.bytes) {
+                    return diagnostics::Result<ProtectionMetadata>::err(
+                        ErrorCode::ParseError, "Duplicate encrypted function index or nonce in BMP4", "deserialize_metadata");
+                }
+            }
             m.encrypted_functions.push_back(ef);
         }
     }
@@ -398,6 +408,11 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
         entry.rejection_reason = "Function smaller than minimum trampoline patch size (" + std::to_string(min_patch) + " bytes)";
         return entry;
     }
+    if (fn.from_unwind_metadata && !fn.from_symbol && fn.size_bytes <= 8) {
+        entry.category = "crt_or_eh_funclet";
+        entry.rejection_reason = "Unnamed tiny unwind-only stub/funclet excluded for runtime safety";
+        return entry;
+    }
     if (has_mixed_data_or_padding(fn)) {
         entry.category = "mixed_data_or_padding";
         entry.rejection_reason = "Function body consists solely of padding/traps or invalid bytes";
@@ -450,6 +465,22 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
                 break;
             }
         }
+    } else if (bin.info().format == core::binary::BinaryFormat::ELF64) {
+        for (const auto& sec : bin.sections()) {
+            if (sec.name == ".eh_frame" || sec.name == ".eh_frame_hdr") {
+                entry.has_exception_unwind = true;
+                entry.exception_detail = "ELF .eh_frame DWARF CFI metadata present";
+                break;
+            }
+        }
+    } else if (bin.info().format == core::binary::BinaryFormat::MachO64) {
+        for (const auto& sec : bin.sections()) {
+            if (sec.name == "__unwind_info" || sec.name == "__eh_frame") {
+                entry.has_exception_unwind = true;
+                entry.exception_detail = "Mach-O __unwind_info / __eh_frame metadata present";
+                break;
+            }
+        }
     }
 
     IrFunction ir_fn = is_arm64
@@ -476,21 +507,36 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
             if (insn.opcode == IrOpcode::VMov || insn.opcode == IrOpcode::FAdd ||
                 insn.opcode == IrOpcode::FSub || insn.opcode == IrOpcode::FMul ||
                 insn.opcode == IrOpcode::FDiv || insn.opcode == IrOpcode::FCmp ||
-                (insn.opcode == IrOpcode::Xor && !insn.dsts.empty() && insn.dsts[0].bit_width == 128)) {
+                insn.opcode == IrOpcode::FCvt || insn.opcode == IrOpcode::VPAdd ||
+                insn.opcode == IrOpcode::VPSub ||
+                ((insn.opcode == IrOpcode::Xor || insn.opcode == IrOpcode::And || insn.opcode == IrOpcode::Or) &&
+                 !insn.dsts.empty() && insn.dsts[0].bit_width == 128)) {
                 entry.uses_simd = true;
+                ++entry.simd_ops_count;
+            }
+            if (insn.opcode == IrOpcode::Store) {
+                entry.has_side_effects = true;
             }
             if (insn.opcode == IrOpcode::Call && !insn.srcs.empty() && insn.srcs[0].kind == IrOperand::Kind::Label) {
+                entry.has_side_effects = true;
                 const std::uint64_t call_va = static_cast<std::uint64_t>(insn.srcs[0].imm);
+                if (call_va == fn.entry_va) {
+                    entry.is_recursive = true;
+                }
+                ++entry.external_calls_count;
                 for (const auto& imp : bin.imports()) {
                     if (imp.address == call_va &&
                         (imp.symbol.find("CxxThrow") != std::string::npos ||
                          imp.symbol.find("__cxa_throw") != std::string::npos ||
+                         imp.symbol.find("__cxa_begin_catch") != std::string::npos ||
+                         imp.symbol.find("__gxx_personality") != std::string::npos ||
                          imp.symbol.find("_Unwind_Resume") != std::string::npos ||
                          imp.symbol.find("objc_exception_throw") != std::string::npos)) {
                         entry.has_exception_unwind = true;
                         entry.exception_detail = "Calls exception throw/unwind API: " + imp.symbol;
                         entry.category = "exception_unwind_incompatible";
                         entry.rejection_reason = "Function invokes exception throw/resume runtime (" + imp.symbol + ")";
+                        entry.decision_explanation = entry.rejection_reason;
                         return entry;
                     }
                 }
@@ -500,10 +546,12 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
                     insn.comment.empty() ? std::string(core::ir::to_string(insn.opcode)) : insn.comment);
             }
             if (insn.opcode == IrOpcode::LeaGlobal) {
+                ++entry.global_refs_count;
                 if (insn.srcs.empty() || insn.srcs[0].kind != IrOperand::Kind::Label ||
                     !is_valid_global_va(static_cast<std::uint64_t>(insn.srcs[0].imm))) {
                     entry.category = "rip_relative_or_unresolved_mem";
                     entry.rejection_reason = "RIP/PC-relative global reference points outside mapped binary sections";
+                    entry.decision_explanation = entry.rejection_reason;
                     return entry;
                 }
             }
@@ -558,6 +606,12 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
     entry.estimated_overhead_pct = (entry.ir_ops > 0)
         ? static_cast<std::uint32_t>((entry.vm_ops * 100u) / entry.ir_ops)
         : 100u;
+    entry.decision_explanation = "Eligible: ir_ops=" + std::to_string(entry.ir_ops) +
+        ", vm_ops=" + std::to_string(entry.vm_ops) +
+        ", est_overhead=" + std::to_string(entry.estimated_overhead_pct) + "%" +
+        (entry.uses_simd ? (", simd_ops=" + std::to_string(entry.simd_ops_count)) : "") +
+        (entry.is_recursive ? ", recursive" : "") +
+        (entry.has_side_effects ? ", side_effects" : ", pure");
 
     if (out_orig_ir_ops) *out_orig_ir_ops = entry.ir_ops;
     if (out_program) *out_program = std::move(bvm_res.value());
@@ -647,6 +701,16 @@ prepare_target_functions(const core::binary::IBinaryFile& bin,
             auto elig = evaluate_function_eligibility(
                 bin, analysis, fn, auth_calls, options.allow_external_calls, is_arm64);
             if (!elig.eligible) {
+                plan.rejected.push_back(std::move(elig));
+                continue;
+            }
+            if (options.max_overhead_budget_pct.has_value() &&
+                elig.estimated_overhead_pct > *options.max_overhead_budget_pct) {
+                elig.eligible = false;
+                elig.category = "overhead_budget_exceeded";
+                elig.rejection_reason = "Estimated overhead (" + std::to_string(elig.estimated_overhead_pct) +
+                    "%) exceeds budget (" + std::to_string(*options.max_overhead_budget_pct) + "%)";
+                elig.decision_explanation = elig.rejection_reason;
                 plan.rejected.push_back(std::move(elig));
                 continue;
             }
@@ -1125,10 +1189,6 @@ void emit_x64_aead_open_subroutine(asmjit::x86::Assembler& a,
         a.mov(x86::dword_ptr(x86::rsp, co), x86::ecx);
         a.mov(x86::dword_ptr(x86::rsp, do_), x86::edx);
     };
-    a.push(x86::r14);
-    a.mov(x86::r14d, 10);
-    // With extra push r14, state is at [rsp + 16 .. 79] -> adjust? No, use r11d without push!
-    a.pop(x86::r14);
     a.mov(x86::r11d, 10);
     Label l_round_loop = a.new_label();
     a.bind(l_round_loop);
@@ -1251,7 +1311,7 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         const std::size_t pbytes = 4 + progs[i].instructions.size() * 12;
         if (pbytes > max_plain_bytes) max_plain_bytes = pbytes;
         for (const auto& insn : progs[i].instructions) {
-            if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VXor) {
+            if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VOr) {
                 has_simd = true;
             }
         }
@@ -1299,6 +1359,12 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     Label l_op_vcmp32 = a.new_label(); Label l_op_vcmp64 = a.new_label();
     Label l_op_vload = a.new_label();  Label l_op_vstore = a.new_label();
     Label l_op_vxor = a.new_label();
+    Label l_op_vcvti2f = a.new_label(); Label l_op_vcvtf2i = a.new_label();
+    Label l_op_vcvtf2f = a.new_label();
+    Label l_op_vmovg2v = a.new_label(); Label l_op_vmovv2g = a.new_label();
+    Label l_op_vpadd32 = a.new_label(); Label l_op_vpadd64 = a.new_label();
+    Label l_op_vpsub32 = a.new_label(); Label l_op_vpsub64 = a.new_label();
+    Label l_op_vand = a.new_label(); Label l_op_vor = a.new_label();
 
     a.bind(l_entry);
     for (std::size_t i = 0; i < progs.size(); ++i) {
@@ -1316,12 +1382,13 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.push(x86::r13);
     a.push(x86::r14);
     a.push(x86::r15);
-    const std::size_t saved_xmm_bytes = has_simd ? 160 : 0;
+    const std::size_t saved_xmm_bytes = has_simd ? 176 : 0;
     if (has_simd) {
-        a.sub(x86::rsp, 160);
+        a.sub(x86::rsp, 176);
         for (int i = 0; i < 10; ++i) {
             a.movups(x86::xmmword_ptr(x86::rsp, i * 16), x86::xmm(6 + i));
         }
+        a.stmxcsr(x86::dword_ptr(x86::rsp, 160));
     }
 
     // Preserve bytecode/blob pointer passed from per-function stub in r10
@@ -1421,13 +1488,17 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.movzx(x86::r9d, x86::byte_ptr(x86::rbx, 3));
     a.mov(x86::r11, x86::qword_ptr(x86::rbx, 4));
 
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Nop));     a.je(l_op_nop);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::MovReg));  a.je(l_op_movreg);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::MovImm));  a.je(l_op_movimm);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Load));    a.je(l_op_load);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Store));   a.je(l_op_store);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Add));     a.je(l_op_add);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Sub));     a.je(l_op_sub);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Load));    a.je(l_op_load);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Store));   a.je(l_op_store);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Cmp));     a.je(l_op_cmp);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jne));     a.je(l_op_jne);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jmp));     a.je(l_op_jmp);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Ret));     a.je(l_op_ret);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Nop));     a.je(l_op_nop);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Mul));     a.je(l_op_mul);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Div));     a.je(l_op_div);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::And));     a.je(l_op_and);
@@ -1435,18 +1506,14 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Xor));     a.je(l_op_xor);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Shl));     a.je(l_op_shl);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Shr));     a.je(l_op_shr);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Cmp));      a.je(l_op_cmp);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::LeaPic));   a.je(l_op_leapic);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::SelectCc)); a.je(l_op_selectcc);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::SetCc));    a.je(l_op_setcc);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jmp));      a.je(l_op_jmp);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jeq));     a.je(l_op_jeq);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jne));     a.je(l_op_jne);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jlt));     a.je(l_op_jlt);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jle));     a.je(l_op_jle);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jgt));     a.je(l_op_jgt);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jge));     a.je(l_op_jge);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Ret));     a.je(l_op_ret);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Halt));    a.je(l_op_ret);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::CallExt)); a.je(l_op_callext);
     if (has_simd) {
@@ -1463,7 +1530,18 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.cmp(x86::eax, static_cast<int>(VmOpcode::VCmpF64)); a.je(l_op_vcmp64);
         a.cmp(x86::eax, static_cast<int>(VmOpcode::VLoad));   a.je(l_op_vload);
         a.cmp(x86::eax, static_cast<int>(VmOpcode::VStore));  a.je(l_op_vstore);
-        a.cmp(x86::eax, static_cast<int>(VmOpcode::VXor));    a.je(l_op_vxor);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VXor));         a.je(l_op_vxor);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VCvtI2F));      a.je(l_op_vcvti2f);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VCvtF2I));      a.je(l_op_vcvtf2i);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VCvtF2F));      a.je(l_op_vcvtf2f);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VMovGprToVec)); a.je(l_op_vmovg2v);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VMovVecToGpr)); a.je(l_op_vmovv2g);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VPAdd32));      a.je(l_op_vpadd32);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VPAdd64));      a.je(l_op_vpadd64);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VPSub32));      a.je(l_op_vpsub32);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VPSub64));      a.je(l_op_vpsub64);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VAnd));         a.je(l_op_vand);
+        a.cmp(x86::eax, static_cast<int>(VmOpcode::VOr));          a.je(l_op_vor);
     }
     a.jmp(l_vm_done);
 
@@ -1763,7 +1841,127 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         emit_fp_bin(l_op_vmul64, [&]() { a.mulsd(x86::xmm0, x86::xmm1); });
         emit_fp_bin(l_op_vdiv32, [&]() { a.divss(x86::xmm0, x86::xmm1); });
         emit_fp_bin(l_op_vdiv64, [&]() { a.divsd(x86::xmm0, x86::xmm1); });
-        emit_fp_bin(l_op_vxor,   [&]() { a.pxor(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vxor,    [&]() { a.pxor(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vand,    [&]() { a.pand(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vor,     [&]() { a.por(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vpadd32, [&]() { a.paddd(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vpadd64, [&]() { a.paddq(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vpsub32, [&]() { a.psubd(x86::xmm0, x86::xmm1); });
+        emit_fp_bin(l_op_vpsub64, [&]() { a.psubq(x86::xmm0, x86::xmm1); });
+
+        a.bind(l_op_vmovg2v);
+        a.mov(x86::rax, x86::qword_ptr(x86::rsp, x86::r8, 3));
+        a.cmp(x86::r11d, 32);
+        {
+            Label l_g2v_64 = a.new_label(), l_g2v_st = a.new_label();
+            a.jne(l_g2v_64);
+            a.movd(x86::xmm0, x86::eax);
+            a.jmp(l_g2v_st);
+            a.bind(l_g2v_64);
+            a.movq(x86::xmm0, x86::rax);
+            a.bind(l_g2v_st);
+        }
+        voff(x86::rcx, x86::rdx);
+        a.movups(x86::xmmword_ptr(x86::rsp, x86::rdx), x86::xmm0);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+        a.bind(l_op_vmovv2g);
+        voff(x86::r8, x86::rdx);
+        a.movups(x86::xmm0, x86::xmmword_ptr(x86::rsp, x86::rdx));
+        a.cmp(x86::r11d, 32);
+        {
+            Label l_v2g_64 = a.new_label(), l_v2g_st = a.new_label();
+            a.jne(l_v2g_64);
+            a.movd(x86::eax, x86::xmm0);
+            a.jmp(l_v2g_st);
+            a.bind(l_v2g_64);
+            a.movq(x86::rax, x86::xmm0);
+            a.bind(l_v2g_st);
+        }
+        a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+        a.bind(l_op_vcvti2f);
+        a.mov(x86::rax, x86::qword_ptr(x86::rsp, x86::r8, 3));
+        a.test(x86::r11d, 2);
+        {
+            Label l_i2f_32 = a.new_label(), l_i2f_st = a.new_label();
+            a.jz(l_i2f_32);
+            a.test(x86::r11d, 4);
+            {
+                Label l_i2f_64s = a.new_label();
+                a.jnz(l_i2f_64s);
+                a.mov(x86::eax, x86::eax);
+                a.cvtsi2sd(x86::xmm0, x86::eax);
+                a.jmp(l_i2f_st);
+                a.bind(l_i2f_64s);
+                a.cvtsi2sd(x86::xmm0, x86::rax);
+                a.jmp(l_i2f_st);
+            }
+            a.bind(l_i2f_32);
+            a.test(x86::r11d, 4);
+            {
+                Label l_i2f_32_64s = a.new_label();
+                a.jnz(l_i2f_32_64s);
+                a.cvtsi2ss(x86::xmm0, x86::eax);
+                a.jmp(l_i2f_st);
+                a.bind(l_i2f_32_64s);
+                a.cvtsi2ss(x86::xmm0, x86::rax);
+            }
+            a.bind(l_i2f_st);
+        }
+        voff(x86::rcx, x86::rdx);
+        a.movups(x86::xmmword_ptr(x86::rsp, x86::rdx), x86::xmm0);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+        a.bind(l_op_vcvtf2i);
+        voff(x86::r8, x86::rdx);
+        a.movups(x86::xmm0, x86::xmmword_ptr(x86::rsp, x86::rdx));
+        a.test(x86::r11d, 2);
+        {
+            Label l_f2i_32 = a.new_label(), l_f2i_st = a.new_label();
+            a.jz(l_f2i_32);
+            a.test(x86::r11d, 4);
+            {
+                Label l_f2i_64d = a.new_label();
+                a.jnz(l_f2i_64d);
+                a.cvttsd2si(x86::eax, x86::xmm0);
+                a.jmp(l_f2i_st);
+                a.bind(l_f2i_64d);
+                a.cvttsd2si(x86::rax, x86::xmm0);
+                a.jmp(l_f2i_st);
+            }
+            a.bind(l_f2i_32);
+            a.test(x86::r11d, 4);
+            {
+                Label l_f2i_32_64d = a.new_label();
+                a.jnz(l_f2i_32_64d);
+                a.cvttss2si(x86::eax, x86::xmm0);
+                a.jmp(l_f2i_st);
+                a.bind(l_f2i_32_64d);
+                a.cvttss2si(x86::rax, x86::xmm0);
+            }
+            a.bind(l_f2i_st);
+        }
+        a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+        a.bind(l_op_vcvtf2f);
+        voff(x86::r8, x86::rdx);
+        a.movups(x86::xmm0, x86::xmmword_ptr(x86::rsp, x86::rdx));
+        a.cmp(x86::r11d, 64);
+        {
+            Label l_f2f_to32 = a.new_label(), l_f2f_st = a.new_label();
+            a.jne(l_f2f_to32);
+            a.cvtss2sd(x86::xmm0, x86::xmm0);
+            a.jmp(l_f2f_st);
+            a.bind(l_f2f_to32);
+            a.cvtsd2ss(x86::xmm0, x86::xmm0);
+            a.bind(l_f2f_st);
+        }
+        voff(x86::rcx, x86::rdx);
+        a.movups(x86::xmmword_ptr(x86::rsp, x86::rdx), x86::xmm0);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
 
         auto emit_fp_cmp = [&](Label lbl, bool f32) {
             a.bind(lbl);
@@ -1828,10 +2026,11 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     }
     a.add(x86::rsp, static_cast<std::uint32_t>(total_frame_bytes));
     if (has_simd) {
+        a.ldmxcsr(x86::dword_ptr(x86::rsp, 160));
         for (int i = 0; i < 10; ++i) {
             a.movups(x86::xmm(6 + i), x86::xmmword_ptr(x86::rsp, i * 16));
         }
-        a.add(x86::rsp, 160);
+        a.add(x86::rsp, 176);
     }
     a.pop(x86::r15);
     a.pop(x86::r14);
@@ -1843,18 +2042,17 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.pop(x86::rbx);
     a.ret();
 
+    auto rt_key = rt_opts.encrypt_bytecode
+        ? CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain)
+        : AeadKey{};
     if (rt_opts.encrypt_bytecode) {
         emit_x64_aead_open_subroutine(a, l_aead_open, plain_buf_bytes);
         a.align(AlignMode::kData, 8);
         a.bind(l_crypto_key);
-        const auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
         a.embed(rt_key.bytes.data(), rt_key.bytes.size());
     }
 
     a.align(AlignMode::kData, 8);
-    const auto rt_key = rt_opts.encrypt_bytecode
-        ? CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain)
-        : AeadKey{};
     for (std::size_t i = 0; i < progs.size(); ++i) {
         a.align(AlignMode::kData, 8);
         a.bind(l_bytecodes[i]);
@@ -1880,7 +2078,9 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
             const auto nonce = CryptoAead::generate_nonce(
                 rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)), i + 100);
             auto sealed = CryptoAead::seal(plain_bytes, aad, rt_key, nonce);
+            CryptoAead::secure_wipe(plain_bytes);
             if (!sealed) {
+                CryptoAead::secure_wipe(rt_key.bytes);
                 return diagnostics::Result<std::vector<std::uint8_t>>::err(
                     sealed.error().code, sealed.error().message, "emit_shared_pic_x64_vm_runtime");
             }
@@ -1890,8 +2090,10 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
             a.embed(sealed.value().ciphertext.data(), sealed.value().ciphertext.size());
         } else {
             a.embed(plain_bytes.data(), plain_bytes.size());
+            CryptoAead::secure_wipe(plain_bytes);
         }
     }
+    CryptoAead::secure_wipe(rt_key.bytes);
 
     code.flatten();
     out_layout.entry_offsets.clear();
@@ -2300,7 +2502,7 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         const std::size_t pbytes = 4 + progs[i].instructions.size() * 12;
         if (pbytes > max_plain_bytes) max_plain_bytes = pbytes;
         for (const auto& insn : progs[i].instructions) {
-            if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VXor) {
+            if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VOr) {
                 has_simd = true;
             }
         }
@@ -2348,6 +2550,12 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     Label l_op_vcmp32 = a.new_label(); Label l_op_vcmp64 = a.new_label();
     Label l_op_vload = a.new_label();  Label l_op_vstore = a.new_label();
     Label l_op_vxor = a.new_label();
+    Label l_op_vcvti2f = a.new_label(); Label l_op_vcvtf2i = a.new_label();
+    Label l_op_vcvtf2f = a.new_label();
+    Label l_op_vmovg2v = a.new_label(); Label l_op_vmovv2g = a.new_label();
+    Label l_op_vpadd32 = a.new_label(); Label l_op_vpadd64 = a.new_label();
+    Label l_op_vpsub32 = a.new_label(); Label l_op_vpsub64 = a.new_label();
+    Label l_op_vand = a.new_label(); Label l_op_vor = a.new_label();
 
     a.bind(l_entry);
     for (std::size_t i = 0; i < progs.size(); ++i) {
@@ -2472,7 +2680,18 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.cmp(a64::w10, static_cast<int>(VmOpcode::VCmpF64)); a.b_eq(l_op_vcmp64);
         a.cmp(a64::w10, static_cast<int>(VmOpcode::VLoad));   a.b_eq(l_op_vload);
         a.cmp(a64::w10, static_cast<int>(VmOpcode::VStore));  a.b_eq(l_op_vstore);
-        a.cmp(a64::w10, static_cast<int>(VmOpcode::VXor));    a.b_eq(l_op_vxor);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VXor));         a.b_eq(l_op_vxor);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VCvtI2F));      a.b_eq(l_op_vcvti2f);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VCvtF2I));      a.b_eq(l_op_vcvtf2i);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VCvtF2F));      a.b_eq(l_op_vcvtf2f);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VMovGprToVec)); a.b_eq(l_op_vmovg2v);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VMovVecToGpr)); a.b_eq(l_op_vmovv2g);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VPAdd32));      a.b_eq(l_op_vpadd32);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VPAdd64));      a.b_eq(l_op_vpadd64);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VPSub32));      a.b_eq(l_op_vpsub32);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VPSub64));      a.b_eq(l_op_vpsub64);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VAnd));         a.b_eq(l_op_vand);
+        a.cmp(a64::w10, static_cast<int>(VmOpcode::VOr));          a.b_eq(l_op_vor);
     }
     a.b(l_vm_done);
 
@@ -2714,7 +2933,124 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         emit_a64_fp_bin(l_op_vmul64, [&]() { a.fmul(a64::d0, a64::d0, a64::d1); });
         emit_a64_fp_bin(l_op_vdiv32, [&]() { a.fdiv(a64::s0, a64::s0, a64::s1); });
         emit_a64_fp_bin(l_op_vdiv64, [&]() { a.fdiv(a64::d0, a64::d0, a64::d1); });
-        emit_a64_fp_bin(l_op_vxor,   [&]() { a.eor(a64::v0.b16(), a64::v0.b16(), a64::v1.b16()); });
+        emit_a64_fp_bin(l_op_vxor,    [&]() { a.eor(a64::v0.b16(), a64::v0.b16(), a64::v1.b16()); });
+        emit_a64_fp_bin(l_op_vand,    [&]() { a.and_(a64::v0.b16(), a64::v0.b16(), a64::v1.b16()); });
+        emit_a64_fp_bin(l_op_vor,     [&]() { a.orr(a64::v0.b16(), a64::v0.b16(), a64::v1.b16()); });
+        emit_a64_fp_bin(l_op_vpadd32, [&]() { a.add(a64::v0.s4(), a64::v0.s4(), a64::v1.s4()); });
+        emit_a64_fp_bin(l_op_vpadd64, [&]() { a.add(a64::v0.d2(), a64::v0.d2(), a64::v1.d2()); });
+        emit_a64_fp_bin(l_op_vpsub32, [&]() { a.sub(a64::v0.s4(), a64::v0.s4(), a64::v1.s4()); });
+        emit_a64_fp_bin(l_op_vpsub64, [&]() { a.sub(a64::v0.d2(), a64::v0.d2(), a64::v1.d2()); });
+
+        a.bind(l_op_vmovg2v);
+        a.mov(a64::x15, a64::sp);
+        a.ldr(a64::x0, a64::ptr(a64::x15, a64::x12, a64::lsl(3)));
+        a.cmp(a64::w14, 32);
+        {
+            Label l_a_g2v64 = a.new_label(), l_a_g2vst = a.new_label();
+            a.b_ne(l_a_g2v64);
+            a.fmov(a64::s0, a64::w0);
+            a.b(l_a_g2vst);
+            a.bind(l_a_g2v64);
+            a.fmov(a64::d0, a64::x0);
+            a.bind(l_a_g2vst);
+        }
+        vptr(a64::x11, a64::x15); a.str(a64::q0, a64::ptr(a64::x15));
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+        a.bind(l_op_vmovv2g);
+        vptr(a64::x12, a64::x15); a.ldr(a64::q0, a64::ptr(a64::x15));
+        a.cmp(a64::w14, 32);
+        {
+            Label l_a_v2g64 = a.new_label(), l_a_v2gst = a.new_label();
+            a.b_ne(l_a_v2g64);
+            a.fmov(a64::w0, a64::s0);
+            a.b(l_a_v2gst);
+            a.bind(l_a_v2g64);
+            a.fmov(a64::x0, a64::d0);
+            a.bind(l_a_v2gst);
+        }
+        a.mov(a64::x15, a64::sp);
+        a.str(a64::x0, a64::ptr(a64::x15, a64::x11, a64::lsl(3)));
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+        a.bind(l_op_vcvti2f);
+        a.mov(a64::x15, a64::sp);
+        a.ldr(a64::x0, a64::ptr(a64::x15, a64::x12, a64::lsl(3)));
+        a.tst(a64::x14, 2);
+        {
+            Label l_a_i2f32 = a.new_label(), l_a_i2fst = a.new_label();
+            a.b_eq(l_a_i2f32);
+            a.tst(a64::x14, 1);
+            {
+                Label l_a_i2f64u = a.new_label();
+                a.b_ne(l_a_i2f64u);
+                a.scvtf(a64::d0, a64::x0);
+                a.b(l_a_i2fst);
+                a.bind(l_a_i2f64u);
+                a.ucvtf(a64::d0, a64::x0);
+                a.b(l_a_i2fst);
+            }
+            a.bind(l_a_i2f32);
+            a.tst(a64::x14, 1);
+            {
+                Label l_a_i2f32u = a.new_label();
+                a.b_ne(l_a_i2f32u);
+                a.scvtf(a64::s0, a64::w0);
+                a.b(l_a_i2fst);
+                a.bind(l_a_i2f32u);
+                a.ucvtf(a64::s0, a64::w0);
+            }
+            a.bind(l_a_i2fst);
+        }
+        vptr(a64::x11, a64::x15); a.str(a64::q0, a64::ptr(a64::x15));
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+        a.bind(l_op_vcvtf2i);
+        vptr(a64::x12, a64::x15); a.ldr(a64::q0, a64::ptr(a64::x15));
+        a.tst(a64::x14, 2);
+        {
+            Label l_a_f2i32 = a.new_label(), l_a_f2ist = a.new_label();
+            a.b_eq(l_a_f2i32);
+            a.tst(a64::x14, 1);
+            {
+                Label l_a_f2i64u = a.new_label();
+                a.b_ne(l_a_f2i64u);
+                a.fcvtzs(a64::x0, a64::d0);
+                a.b(l_a_f2ist);
+                a.bind(l_a_f2i64u);
+                a.fcvtzu(a64::x0, a64::d0);
+                a.b(l_a_f2ist);
+            }
+            a.bind(l_a_f2i32);
+            a.tst(a64::x14, 1);
+            {
+                Label l_a_f2i32u = a.new_label();
+                a.b_ne(l_a_f2i32u);
+                a.fcvtzs(a64::w0, a64::s0);
+                a.b(l_a_f2ist);
+                a.bind(l_a_f2i32u);
+                a.fcvtzu(a64::w0, a64::s0);
+            }
+            a.bind(l_a_f2ist);
+        }
+        a.mov(a64::x15, a64::sp);
+        a.str(a64::x0, a64::ptr(a64::x15, a64::x11, a64::lsl(3)));
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+        a.bind(l_op_vcvtf2f);
+        vptr(a64::x12, a64::x15); a.ldr(a64::q0, a64::ptr(a64::x15));
+        a.cmp(a64::w14, 64);
+        {
+            Label l_a_f2f32 = a.new_label(), l_a_f2fst = a.new_label();
+            a.b_ne(l_a_f2f32);
+            a.fcvt(a64::d0, a64::s0);
+            a.b(l_a_f2fst);
+            a.bind(l_a_f2f32);
+            a.fcvt(a64::s0, a64::d0);
+            a.bind(l_a_f2fst);
+        }
+        vptr(a64::x11, a64::x15); a.str(a64::q0, a64::ptr(a64::x15));
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
 
         auto emit_a64_fp_cmp = [&](Label lbl, bool f32) {
             a.bind(lbl);
@@ -2781,18 +3117,17 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 96));
     a.ret(a64::x30);
 
+    auto rt_key = rt_opts.encrypt_bytecode
+        ? CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain)
+        : AeadKey{};
     if (rt_opts.encrypt_bytecode) {
         emit_arm64_aead_open_subroutine(a, l_aead_open, plain_buf_bytes);
         a.align(AlignMode::kData, 8);
         a.bind(l_crypto_key);
-        const auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
         a.embed(rt_key.bytes.data(), rt_key.bytes.size());
     }
 
     a.align(AlignMode::kData, 8);
-    const auto rt_key = rt_opts.encrypt_bytecode
-        ? CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain)
-        : AeadKey{};
     for (std::size_t i = 0; i < progs.size(); ++i) {
         a.align(AlignMode::kData, 8);
         a.bind(l_bytecodes[i]);
@@ -2818,7 +3153,9 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
             const auto nonce = CryptoAead::generate_nonce(
                 rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)), i + 100);
             auto sealed = CryptoAead::seal(plain_bytes, aad, rt_key, nonce);
+            CryptoAead::secure_wipe(plain_bytes);
             if (!sealed) {
+                CryptoAead::secure_wipe(rt_key.bytes);
                 return diagnostics::Result<std::vector<std::uint8_t>>::err(
                     sealed.error().code, sealed.error().message, "emit_shared_pic_arm64_vm_runtime");
             }
@@ -2828,8 +3165,10 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
             a.embed(sealed.value().ciphertext.data(), sealed.value().ciphertext.size());
         } else {
             a.embed(plain_bytes.data(), plain_bytes.size());
+            CryptoAead::secure_wipe(plain_bytes);
         }
     }
+    CryptoAead::secure_wipe(rt_key.bytes);
 
     code.flatten();
     out_layout.entry_offsets.clear();

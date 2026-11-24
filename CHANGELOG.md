@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0] - 2026-11-24
+
+### Adicionado
+- **Criptografia e Integridade 2.0:**
+  - `CryptoAead::secure_wipe` (`crypto_wipe` do Monocypher) aplicado em chaves derivadas (`rt_key`), contextos `BLAKE2b` e buffers de bytecode em texto plano após selagem nos emissores PIC x86-64/ARM64.
+  - Validação estrita em `deserialize_metadata` para `BMP4` v2: rejeição de nonces duplicados, índices `fn_index` duplicados ou fora dos limites e `plaintext_size == 0`.
+  - Testes com vetores conhecidos RFC 7693 (`BLAKE2b-256`) e KAT/tamper `XChaCha20-Poly1305`.
+- **SIMD e Ponto Flutuante 2.0:**
+  - Novos opcodes `FCvt`, `VPAdd`, `VPSub` no IR e `VCvtI2F` (`0x2B`)..`VOr` (`0x35`) no `.bvm` (`MaxOpcode = 0x36`), cobrindo `cvtsi2ss`/`cvtsi2sd`/`cvttss2si`/`cvttsd2si`/`cvtss2sd`/`cvtsd2ss`, `movd`, `paddd`/`paddq`/`psubd`/`psubq`, `andps`/`andpd`/`pand`/`orps`/`orpd`/`por` (x86-64) e `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu`/`fcvt`, `fmov` GPR↔FP, `add`/`sub` `.4s`/`.2d`, `and`/`orr`/`eor` `.16b` (ARM64).
+  - Preservação de `MXCSR` (`stmxcsr`/`ldmxcsr`) no runtime PIC x86-64 quando `has_simd` está ativo.
+- **Laboratório de Aplicações Reais & Equivalência:**
+  - Adicionados `lab_c_lib` + `lab_c_app` (C11, structs, arrays, `calloc`/`free`, globais e saída em arquivo) e `lab_cpp_app` (C++20, 120+ funções, `std::vector`, `std::thread`, SIMD/FP e `try/catch` EH).
+- **Exception & Unwind Compatibility 2.0 + Smart Eligibility 5.0:**
+  - Inspeção de `.eh_frame` (ELF), `__unwind_info` (Mach-O) e `.pdata`/`.xdata` (PE), além de métricas `is_recursive`, `has_side_effects`, `external_calls_count`, `global_refs_count`, `simd_ops_count`, `decision_explanation` e seleção por orçamento (`--max-overhead`).
+- **VM Performance 3.0 & CLI v0.11:**
+  - `tls_call_stack` no `VmInterpreter` e reordenação *hot-path* no dispatch PIC nativo.
+  - Novos comandos: `test-equivalence`, `report`, `benchmark-protection --full` e `--max-overhead`.
+- **Testes:** 7 novos testes `ProtectionV011Test` (82 testes C++ + 3 testes Rust).
+
 ## [0.10.0] - 2026-11-24
 
 ### Adicionado

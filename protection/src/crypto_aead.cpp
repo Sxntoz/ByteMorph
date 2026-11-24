@@ -13,6 +13,7 @@ AeadKey CryptoAead::derive_key_from_seed(std::uint64_t seed, std::string_view do
     crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&seed), sizeof(seed));
     crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(domain.data()), domain.size());
     crypto_blake2b_final(&ctx, key.bytes.data());
+    crypto_wipe(&ctx, sizeof(ctx));
     return key;
 }
 
@@ -28,6 +29,7 @@ AeadNonce CryptoAead::generate_nonce(std::uint64_t seed, std::uint64_t counter) 
     crypto_blake2b_final(&ctx, digest.data());
     std::memcpy(nonce.bytes.data(), digest.data(), nonce.bytes.size());
     crypto_wipe(digest.data(), digest.size());
+    crypto_wipe(&ctx, sizeof(ctx));
     return nonce;
 }
 
@@ -82,6 +84,12 @@ CryptoAead::open(const AeadSealedBox& box,
             "CryptoAead::open");
     }
     return plaintext;
+}
+
+void CryptoAead::secure_wipe(std::span<std::uint8_t> buffer) noexcept {
+    if (!buffer.empty()) {
+        crypto_wipe(buffer.data(), buffer.size());
+    }
 }
 
 } // namespace bytemorph::prot

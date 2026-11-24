@@ -1,4 +1,4 @@
-# Criptografia do ByteMorph (v0.10)
+# Criptografia do ByteMorph (v0.11)
 
 ## Algoritmos Consolidados
 
@@ -13,7 +13,8 @@ O **ByteMorph** não inventa algoritmos criptográficos. Toda a camada criptogr�
 2. **Nonces exclusivos:** cada função recebe um nonce derivado de `seed ^ (0x9E3779B97F4A7C15 * (fn_index + 1))` e contador exclusivo.
 3. **Metadados públicos vs. material secreto:** os metadados `BMP4` v2 (`.bmvm`) armazenam apenas os nonces públicos, MACs e hashes `BLAKE2b-256` do AAD (`aad_hash`) para auditoria via `verify --deep`; a chave derivada permanece separada no runtime.
 4. **Verificação e descriptografia em runtime:** os emissores PIC nativos (`x86-64` e `ARM64`) validam a tag Poly1305 em tempo constante **antes** de interpretar qualquer instrução da VM. Em caso de adulteração, a execução é interrompida (`0xDEADAEADDEADAEAD`) e o buffer é zerado.
-5. **Limpeza de buffers:** após `Ret`/`Halt` (ou falha de tag), o buffer temporário em pilha contendo o bytecode descriptografado é sobrescrito com zeros (`0x00`).
+5. **Limpeza de buffers:** após `Ret`/`Halt` (ou falha de tag), o buffer temporário em pilha contendo o bytecode descriptografado é sobrescrito com zeros (`0x00`). No host, `CryptoAead::secure_wipe` zera `rt_key`, contextos `BLAKE2b` e buffers `plain_bytes` após selagem.
+6. **Validação estrita de metadados (`BMP4` v2):** `deserialize_metadata` rejeita nonces duplicados entre funções, `fn_index` duplicados/inválidos e registros com `plaintext_size == 0`.
 
 ## Modelo de Ameaça e Limitações Explícitas
 

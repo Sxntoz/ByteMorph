@@ -42,6 +42,8 @@ public:
     open(const AeadSealedBox& box,
          std::span<const std::uint8_t> associated_data,
          const AeadKey& key);
+
+    static void secure_wipe(std::span<std::uint8_t> buffer) noexcept;
 };
 
 } // namespace bytemorph::prot

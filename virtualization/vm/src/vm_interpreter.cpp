@@ -98,6 +98,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     state.vregs = options.initial_vregs;
 
     thread_local std::vector<std::uint64_t> tls_memory_pool;
+    thread_local std::vector<std::size_t> tls_call_stack;
+    tls_call_stack.clear();
     std::size_t mem_slots = 0;
     std::uint64_t* mem_data = nullptr;
 
@@ -445,6 +447,118 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 state.vregs[insn.dst][1] = state.vregs[insn.src1][1] ^ state.vregs[insn.src2][1];
                 ++pc;
                 break;
+            case VmOpcode::VAnd:
+                state.vregs[insn.dst][0] = state.vregs[insn.src1][0] & state.vregs[insn.src2][0];
+                state.vregs[insn.dst][1] = state.vregs[insn.src1][1] & state.vregs[insn.src2][1];
+                ++pc;
+                break;
+            case VmOpcode::VOr:
+                state.vregs[insn.dst][0] = state.vregs[insn.src1][0] | state.vregs[insn.src2][0];
+                state.vregs[insn.dst][1] = state.vregs[insn.src1][1] | state.vregs[insn.src2][1];
+                ++pc;
+                break;
+            case VmOpcode::VMovGprToVec:
+                if (insn.imm == 32) {
+                    state.vregs[insn.dst][0] = regs[insn.src1] & 0xFFFFFFFFULL;
+                } else {
+                    state.vregs[insn.dst][0] = regs[insn.src1];
+                }
+                state.vregs[insn.dst][1] = 0;
+                ++pc;
+                break;
+            case VmOpcode::VMovVecToGpr:
+                regs[insn.dst] = (insn.imm == 32)
+                    ? (state.vregs[insn.src1][0] & 0xFFFFFFFFULL)
+                    : state.vregs[insn.src1][0];
+                ++pc;
+                break;
+            case VmOpcode::VCvtI2F: {
+                const bool is_unsigned = (insn.imm & 1) != 0;
+                const bool dst_f64 = (insn.imm & 2) != 0;
+                const bool src_64 = (insn.imm & 4) != 0;
+                const std::uint64_t raw = regs[insn.src1];
+                if (dst_f64) {
+                    const double d = is_unsigned
+                        ? (src_64 ? static_cast<double>(raw) : static_cast<double>(static_cast<std::uint32_t>(raw)))
+                        : (src_64 ? static_cast<double>(static_cast<std::int64_t>(raw)) : static_cast<double>(static_cast<std::int32_t>(raw)));
+                    std::memcpy(&state.vregs[insn.dst][0], &d, 8);
+                } else {
+                    const float f = is_unsigned
+                        ? (src_64 ? static_cast<float>(raw) : static_cast<float>(static_cast<std::uint32_t>(raw)))
+                        : (src_64 ? static_cast<float>(static_cast<std::int64_t>(raw)) : static_cast<float>(static_cast<std::int32_t>(raw)));
+                    std::uint32_t uf = 0;
+                    std::memcpy(&uf, &f, 4);
+                    state.vregs[insn.dst][0] = (state.vregs[insn.dst][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(uf);
+                }
+                ++pc;
+                break;
+            }
+            case VmOpcode::VCvtF2I: {
+                const bool is_unsigned = (insn.imm & 1) != 0;
+                const bool src_f64 = (insn.imm & 2) != 0;
+                const bool dst_64 = (insn.imm & 4) != 0;
+                double dv = 0.0;
+                if (src_f64) {
+                    std::memcpy(&dv, &state.vregs[insn.src1][0], 8);
+                } else {
+                    float fv = 0.0f;
+                    const std::uint32_t uf = static_cast<std::uint32_t>(state.vregs[insn.src1][0]);
+                    std::memcpy(&fv, &uf, 4);
+                    dv = static_cast<double>(fv);
+                }
+                if (is_unsigned) {
+                    regs[insn.dst] = dst_64 ? static_cast<std::uint64_t>(dv) : static_cast<std::uint64_t>(static_cast<std::uint32_t>(dv));
+                } else {
+                    regs[insn.dst] = dst_64
+                        ? static_cast<std::uint64_t>(static_cast<std::int64_t>(dv))
+                        : static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(dv)));
+                }
+                ++pc;
+                break;
+            }
+            case VmOpcode::VCvtF2F: {
+                if (insn.imm == 64) {
+                    float fv = 0.0f;
+                    const std::uint32_t uf = static_cast<std::uint32_t>(state.vregs[insn.src1][0]);
+                    std::memcpy(&fv, &uf, 4);
+                    const double dv = static_cast<double>(fv);
+                    std::memcpy(&state.vregs[insn.dst][0], &dv, 8);
+                } else {
+                    double dv = 0.0;
+                    std::memcpy(&dv, &state.vregs[insn.src1][0], 8);
+                    const float fv = static_cast<float>(dv);
+                    std::uint32_t uf = 0;
+                    std::memcpy(&uf, &fv, 4);
+                    state.vregs[insn.dst][0] = (state.vregs[insn.dst][0] & ~0xFFFFFFFFULL) | static_cast<std::uint64_t>(uf);
+                }
+                ++pc;
+                break;
+            }
+            case VmOpcode::VPAdd32:
+            case VmOpcode::VPSub32: {
+                const bool is_sub = (insn.opcode == VmOpcode::VPSub32);
+                for (int half = 0; half < 2; ++half) {
+                    const std::uint64_t a = state.vregs[insn.src1][half];
+                    const std::uint64_t b = state.vregs[insn.src2][half];
+                    const std::uint32_t lo = is_sub ? (static_cast<std::uint32_t>(a) - static_cast<std::uint32_t>(b))
+                                                    : (static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
+                    const std::uint32_t hi = is_sub ? (static_cast<std::uint32_t>(a >> 32) - static_cast<std::uint32_t>(b >> 32))
+                                                    : (static_cast<std::uint32_t>(a >> 32) + static_cast<std::uint32_t>(b >> 32));
+                    state.vregs[insn.dst][half] = static_cast<std::uint64_t>(lo) | (static_cast<std::uint64_t>(hi) << 32);
+                }
+                ++pc;
+                break;
+            }
+            case VmOpcode::VPAdd64:
+                state.vregs[insn.dst][0] = state.vregs[insn.src1][0] + state.vregs[insn.src2][0];
+                state.vregs[insn.dst][1] = state.vregs[insn.src1][1] + state.vregs[insn.src2][1];
+                ++pc;
+                break;
+            case VmOpcode::VPSub64:
+                state.vregs[insn.dst][0] = state.vregs[insn.src1][0] - state.vregs[insn.src2][0];
+                state.vregs[insn.dst][1] = state.vregs[insn.src1][1] - state.vregs[insn.src2][1];
+                ++pc;
+                break;
             case VmOpcode::Jmp:
                 pc = static_cast<std::size_t>(insn.imm);
                 break;
@@ -467,19 +581,20 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 pc = (sf == of) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Call:
-                if (state.call_stack.size() >= options.max_call_depth) {
+                if (tls_call_stack.size() >= options.max_call_depth) {
                     state.pc = pc;
                     state.steps_executed = steps;
                     state.zf = zf;
                     state.sf = sf;
+                    state.call_stack = tls_call_stack;
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "VM call stack overflow", "VmInterpreter::execute");
                 }
-                state.call_stack.push_back(pc + 1);
+                tls_call_stack.push_back(pc + 1);
                 pc = static_cast<std::size_t>(insn.imm);
                 break;
             case VmOpcode::Ret:
-                if (state.call_stack.empty()) {
+                if (tls_call_stack.empty()) {
                     state.pc = pc;
                     state.steps_executed = steps;
                     state.zf = zf;
@@ -489,8 +604,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                     state.return_value = regs[0];
                     return state;
                 }
-                pc = state.call_stack.back();
-                state.call_stack.pop_back();
+                pc = tls_call_stack.back();
+                tls_call_stack.pop_back();
                 break;
             case VmOpcode::Halt:
                 state.pc = pc;

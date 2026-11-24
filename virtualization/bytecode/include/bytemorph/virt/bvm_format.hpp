@@ -55,7 +55,18 @@ enum class VmOpcode : std::uint8_t {
     VLoad = 0x28,
     VStore = 0x29,
     VXor = 0x2A,
-    MaxOpcode = 0x2B
+    VCvtI2F = 0x2B,
+    VCvtF2I = 0x2C,
+    VCvtF2F = 0x2D,
+    VMovGprToVec = 0x2E,
+    VMovVecToGpr = 0x2F,
+    VPAdd32 = 0x30,
+    VPAdd64 = 0x31,
+    VPSub32 = 0x32,
+    VPSub64 = 0x33,
+    VAnd = 0x34,
+    VOr = 0x35,
+    MaxOpcode = 0x36
 };
 
 enum class VmCondCode : std::uint8_t {

@@ -187,7 +187,8 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
         ir.srcs.push_back(parse_operand_text(ops[1]));
         ir.srcs.push_back(IrOperand::immediate(0xFFFF, 64));
     } else if (insn.mnemonic == "fmov" && ops.size() >= 2) {
-        const std::uint8_t w = (!ops[0].empty() && ops[0][0] == 's') ? 32 : 64;
+        const std::uint8_t w = (!ops[0].empty() && (ops[0][0] == 's' || ops[0][0] == 'w' ||
+                                (!ops[1].empty() && ops[1][0] == 's'))) ? 32 : 64;
         auto dst = parse_operand_text(ops[0]);
         auto src = parse_operand_text(ops[1]);
         dst.bit_width = w;
@@ -195,6 +196,48 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
         ir.opcode = IrOpcode::VMov;
         ir.dsts.push_back(std::move(dst));
         ir.srcs.push_back(std::move(src));
+    } else if ((insn.mnemonic == "scvtf" || insn.mnemonic == "ucvtf" ||
+                insn.mnemonic == "fcvtzs" || insn.mnemonic == "fcvtzu" ||
+                insn.mnemonic == "fcvt") && ops.size() >= 2) {
+        auto dst = parse_operand_text(ops[0]);
+        auto src = parse_operand_text(ops[1]);
+        dst.bit_width = (!ops[0].empty() && (ops[0][0] == 's' || ops[0][0] == 'w')) ? 32 : 64;
+        src.bit_width = (!ops[1].empty() && (ops[1][0] == 's' || ops[1][0] == 'w')) ? 32 : 64;
+        std::int64_t mode = 0;
+        if (insn.mnemonic == "scvtf") mode = 0;
+        else if (insn.mnemonic == "ucvtf") mode = 1;
+        else if (insn.mnemonic == "fcvtzs") mode = 2;
+        else if (insn.mnemonic == "fcvtzu") mode = 3;
+        else mode = 4;
+        ir.opcode = IrOpcode::FCvt;
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(src));
+        ir.srcs.push_back(IrOperand::immediate(mode, 64));
+    } else if ((insn.mnemonic == "add" || insn.mnemonic == "sub" ||
+                insn.mnemonic == "and" || insn.mnemonic == "orr" || insn.mnemonic == "eor") &&
+               ops.size() >= 3 && ops[0].find('.') != std::string::npos) {
+        const auto dot_pos = ops[0].find('.');
+        const std::string suffix = ops[0].substr(dot_pos + 1);
+        auto strip_vec = [](const std::string& reg) {
+            const auto d = reg.find('.');
+            return d == std::string::npos ? reg : reg.substr(0, d);
+        };
+        auto dst = parse_operand_text(strip_vec(ops[0]));
+        auto s1 = parse_operand_text(strip_vec(ops[1]));
+        auto s2 = parse_operand_text(strip_vec(ops[2]));
+        if (insn.mnemonic == "add" || insn.mnemonic == "sub") {
+            const std::uint8_t lane_w = (suffix == "2d") ? 64 : 32;
+            dst.bit_width = lane_w; s1.bit_width = lane_w; s2.bit_width = lane_w;
+            ir.opcode = (insn.mnemonic == "add") ? IrOpcode::VPAdd : IrOpcode::VPSub;
+        } else {
+            dst.bit_width = 128; s1.bit_width = 128; s2.bit_width = 128;
+            if (insn.mnemonic == "and") ir.opcode = IrOpcode::And;
+            else if (insn.mnemonic == "orr") ir.opcode = IrOpcode::Or;
+            else ir.opcode = IrOpcode::Xor;
+        }
+        ir.dsts.push_back(std::move(dst));
+        ir.srcs.push_back(std::move(s1));
+        ir.srcs.push_back(std::move(s2));
     } else if ((insn.mnemonic == "fadd" || insn.mnemonic == "fsub" ||
                 insn.mnemonic == "fmul" || insn.mnemonic == "fdiv") && ops.size() >= 3) {
         const std::uint8_t w = (!ops[0].empty() && ops[0][0] == 's') ? 32 : (!ops[0].empty() && ops[0][0] == 'd') ? 64 : 128;

@@ -2,11 +2,19 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.10.0):**  
+> **Status atual (v0.11.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
-> - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility`):**
->   - **Validado com execução nativa:** Windows PE32+ x86-64 (incluindo bytecode criptografado em runtime com `XChaCha20-Poly1305`, SIMD/FP64, globais RIP-relative/ASLR, `cmovcc`, `setcc`), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
+> - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility` / `test-equivalence` / `report`):**
+>   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11 e C++20 com 130+ funções protegidas, multithreading, alocação dinâmica, structs/globais, bytecode criptografado `XChaCha20-Poly1305` e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
 >   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, compilador cruzado `MSVC Hostx64\arm64` disponível localmente, sem runner nativo Windows ARM64) e Mach-O Fat/Universal multi-slice.
+
+## Recursos da v0.11
+
+- **Criptografia e Integridade 2.0:** `CryptoAead::secure_wipe` zerando chaves/buffers sensíveis, validação de unicidade de nonces e índices em `BMP4` v2, e vetores conhecidos RFC 7693 / `XChaCha20-Poly1305`.
+- **SIMD e Ponto Flutuante 2.0:** conversões `int ↔ float` e `f32 ↔ f64` (`cvtsi2ss`/`cvtsi2sd`/`cvttss2si`/`cvttsd2si`/`cvtss2sd`/`cvtsd2ss`, `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu`/`fcvt`), movimentação `GPR ↔ XMM/SIMD`, operações vetoriais (`paddd`/`paddq`/`psubd`/`psubq`, `andps`/`orps`/`add.4s`/`sub.4s`/`and.16b`/`orr.16b`) e preservação de `MXCSR`.
+- **Laboratório de Aplicações Reais & Equivalência:** alvos `lab_c_app` (C11 + `lab_c_lib`) e `lab_cpp_app` (C++20, 120+ funções, `std::thread`, `std::vector`, SIMD e `try/catch` EH) validados via `test-equivalence` (código de saída, stdout e arquivo).
+- **Exception & Unwind 2.0 + Smart Eligibility 5.0:** inspeção `.pdata`/`.xdata`, `.eh_frame`, `__unwind_info`, rejeição de funclets `.pdata` (`crt_or_eh_funclet`), métricas (`is_recursive`, `has_side_effects`, `simd_ops_count`, `decision_explanation`) e orçamento `--max-overhead`.
+- **VM Performance 3.0 & CLI v0.11:** `tls_call_stack`, hot-path dispatch PIC, `test-equivalence`, `report --output`, `benchmark-protection --full`.
 
 ## Recursos da v0.10
 
