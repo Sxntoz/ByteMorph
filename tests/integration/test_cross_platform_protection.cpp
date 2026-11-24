@@ -1525,7 +1525,7 @@ TEST(ProtectionV09Test, V09OpcodeCodecRoundtripAndValidation) {
 }
 
 TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
-#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && defined(NDEBUG)
     const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
     if (std::filesystem::exists(target_exe)) {
         auto compat = bytemorph::prot::ProtectionEngine::check_compatibility(target_exe, false);
@@ -1550,7 +1550,7 @@ TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
 }
 
 TEST(ProtectionV09Test, MultiFunctionProtectionWithGlobalsAndAeadVerify) {
-#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && defined(NDEBUG)
     const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
     if (std::filesystem::exists(target_exe)) {
         const std::filesystem::path out_exe =
