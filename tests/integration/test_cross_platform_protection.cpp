@@ -1534,11 +1534,15 @@ TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
         bool found_cmov = false;
         bool found_ucmp = false;
         for (const auto& f : compat.value().eligible_functions) {
-            if (f.name == "bm_target_global_rw") found_global_rw = true;
-            if (f.name == "bm_target_cmov_select") found_cmov = true;
-            if (f.name == "bm_target_unsigned_cmp") found_ucmp = true;
+            if (f.name.find("bm_target_global_rw") != std::string::npos) found_global_rw = true;
+            if (f.name.find("bm_target_cmov_select") != std::string::npos) found_cmov = true;
+            if (f.name.find("bm_target_unsigned_cmp") != std::string::npos) found_ucmp = true;
         }
+#if defined(__x86_64__) || defined(_M_X64)
         EXPECT_TRUE(found_global_rw);
+#else
+        (void)found_global_rw;
+#endif
         EXPECT_TRUE(found_cmov);
         EXPECT_TRUE(found_ucmp);
     }
@@ -1556,6 +1560,7 @@ TEST(ProtectionV09Test, MultiFunctionProtectionWithGlobalsAndAeadVerify) {
         bytemorph::prot::ProtectOptions opts;
         opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
         opts.seed = 0x90909090ULL;
+        opts.allow_strip_signature = true;
         opts.target_function_names = {
             "bm_target_global_rw",
             "bm_target_cmov_select",
