@@ -5,6 +5,9 @@ target_compile_features(lab_pe_target PRIVATE cxx_std_20)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lab_pe_target PRIVATE -O2 -fomit-frame-pointer -fno-sanitize=all)
 endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(lab_pe_target PRIVATE -fno-ipa-ra)
+endif()
 
 add_executable(bytemorph_tests
     unit/test_diagnostics.cpp
