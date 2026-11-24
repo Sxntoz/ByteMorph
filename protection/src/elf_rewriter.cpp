@@ -134,11 +134,14 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         added_bmrt->content(runtime_bytes);
     }
 
-    // Re-translate with exact stub_base_va if external calls are enabled
+    // Re-translate with exact stub_base_va if external calls are enabled,
+    // then re-add .bmrt on a fresh LIEF::ELF::Binary so PT_LOAD segment content matches .bmrt section.
     std::size_t effective_rt_size = raw_rt_size;
     if (options.allow_external_calls) {
+        const std::uint64_t bmrt_va = added_bmrt->virtual_address();
+        const std::size_t prev_rt_size = static_cast<std::size_t>(added_bmrt->size());
         auto plan2_res = prepare_target_functions(
-            bin, an_res.value(), disasm, options, added_bmrt->virtual_address(), is_arm64);
+            bin, an_res.value(), disasm, options, bmrt_va, is_arm64);
         if (!plan2_res) {
             return diagnostics::Result<ProtectionReport>::err(plan2_res.error().code, plan2_res.error().message, "ElfRewriter::protect_file");
         }
@@ -155,12 +158,29 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         effective_rt_size = rt2.value().size();
         const std::size_t target_rt_size = std::max<std::size_t>(
             static_cast<std::size_t>(align_up(rt2.value().size(), 0x1000)),
-            static_cast<std::size_t>(added_bmrt->size()));
+            prev_rt_size);
         runtime_bytes = std::move(rt2.value());
         runtime_bytes.resize(target_rt_size, 0);
-        added_bmrt->content(runtime_bytes);
+
+        elf = LIEF::ELF::Parser::parse(input.string());
+        if (!elf) {
+            return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "Failed to re-parse ELF64 binary", "ElfRewriter::protect_file");
+        }
+        LIEF::ELF::Section bmrt_sec2(".bmrt", LIEF::ELF::Section::TYPE::PROGBITS);
+        bmrt_sec2.add(LIEF::ELF::Section::FLAGS::ALLOC);
+        bmrt_sec2.add(LIEF::ELF::Section::FLAGS::EXECINSTR);
+        bmrt_sec2.alignment(16);
+        bmrt_sec2.content(runtime_bytes);
+        added_bmrt = elf->add(bmrt_sec2, true);
+        if (!added_bmrt) {
+            return diagnostics::Result<ProtectionReport>::err(ErrorCode::InternalError, "Failed to re-add .bmrt ELF section", "ElfRewriter::protect_file");
+        }
+        if (added_bmrt->size() > runtime_bytes.size()) {
+            runtime_bytes.resize(static_cast<std::size_t>(added_bmrt->size()), 0);
+        }
+    } else {
+        runtime_bytes.assign(added_bmrt->content().begin(), added_bmrt->content().end());
     }
-    runtime_bytes.assign(added_bmrt->content().begin(), added_bmrt->content().end());
 
     LIEF::ELF::Section* text_sec = elf->get_section(".text");
     if (!text_sec) {
