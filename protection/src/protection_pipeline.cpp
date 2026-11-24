@@ -184,6 +184,9 @@ ProtectionEngine::protect(const std::filesystem::path& input,
 
     ProtectOptions effective_opts = options;
     if (effective_opts.auto_select_functions &&
+        !effective_opts.protect_all_eligible &&
+        effective_opts.target_function_rvas.empty() &&
+        effective_opts.target_function_names.empty() &&
         effective_opts.target_function_name.empty() &&
         !effective_opts.target_function_rva.has_value()) {
         auto comp_res = check_compatibility(input, effective_opts.allow_external_calls);
@@ -228,7 +231,7 @@ ProtectionEngine::protect(const std::filesystem::path& input,
         core::diagnostics::ErrorCode::UnsupportedFormat,
         std::string("Unsupported format/architecture for protection: ") +
             std::string(to_string(fmt)) + " / " + std::string(to_string(arch)) +
-            " (v0.6 supports PE32+ x86-64, ELF64 x86-64/ARM64, and Mach-O 64-bit x86-64/ARM64)",
+            " (v0.7 supports PE32+ x86-64/ARM64, ELF64 x86-64/ARM64, and Mach-O 64-bit/Universal x86-64/ARM64)",
         "ProtectionEngine::protect");
 }
 

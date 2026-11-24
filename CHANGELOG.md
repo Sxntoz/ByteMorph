@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0] - 2026-11-23
+
+### Adicionado
+- **Proteção Multifuncional com Runtime Compartilhado:** `prepare_target_functions`, `emit_shared_pic_x64_vm_runtime` e `emit_shared_pic_arm64_vm_runtime` unificam múltiplas funções em um único runtime PIC (`.bmrt`/`__BMRT`) com stubs compactos por função, detecção de sobreposição e validação transacional antes da escrita.
+- **Mach-O Fat/Universal multi-slice:** `MachORewriter` agora reescreve e verifica todas as fatias (x86-64 e ARM64) de binários Universal Mach-O com suporte a `/usr/bin/codesign`.
+- **PE32+ ARM64:** `PeRewriter` agora suporta cross-protection e verificação estrutural/AEAD para binários Windows PE32+ ARM64 (`0xAA64`).
+- **Otimização do Interpretador VM:** pré-validação estática (`validate_program`) fora do loop quente do `VmInterpreter::execute`.
+- **CLI v0.7:** `--functions all-eligible`, `--functions <lista>`, `protection-info <bin> --functions`, `benchmark-protection --detailed` e `--no-rollback`.
+- **Testes:** novos testes `ProtectionV07Test` (49 testes C++ no Windows + 3 testes Rust).
+
 ## [0.6.0] - 2026-11-23
 
 ### Adicionado

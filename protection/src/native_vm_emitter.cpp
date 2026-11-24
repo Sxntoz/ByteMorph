@@ -1,11 +1,18 @@
 #include "bytemorph/prot/native_vm_emitter.hpp"
 
+#include "bytemorph/arch/aarch64/aarch64_lifter.hpp"
+#include "bytemorph/arch/x86_64/x86_64_lifter.hpp"
+#include "bytemorph/obf/obfuscation_engine.hpp"
+#include "bytemorph/virt/ir_to_vm.hpp"
+
 #if defined(BYTEMORPH_HAS_ASMJIT)
 #include <asmjit/a64.h>
 #include <asmjit/x86.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace bytemorph::prot::detail {
 
@@ -167,14 +174,361 @@ std::vector<std::uint8_t> collect_printable_strings(std::span<const std::uint8_t
     return packed;
 }
 
+std::unordered_set<std::uint64_t>
+build_authorized_call_targets(const core::binary::IBinaryFile& bin,
+                              const core::analysis::AnalysisResult& analysis) {
+    std::unordered_set<std::uint64_t> targets;
+    // 1. All discovered internal functions (calls between protected and non-protected functions)
+    for (const auto& fn : analysis.functions) {
+        if (fn.entry_va != 0) {
+            targets.insert(fn.entry_va);
+        }
+    }
+    // 2. Verified imports (Windows IAT slots / Linux PLT-GOT / macOS stubs)
+    for (const auto& imp : bin.imports()) {
+        if (imp.address != 0) {
+            targets.insert(imp.address);
+        }
+    }
+    // 3. Verified symbols and non-forwarded exports
+    for (const auto& sym : bin.symbols()) {
+        if (sym.address != 0 && (sym.is_function || sym.is_imported || sym.is_exported)) {
+            targets.insert(sym.address);
+        }
+    }
+    for (const auto& exp : bin.exports()) {
+        if (!exp.is_forwarded && exp.address != 0) {
+            targets.insert(exp.address);
+        }
+    }
+    return targets;
+}
+
+namespace {
+
+bool is_crt_stub_name(const std::string& name, bool is_ep) noexcept {
+    if (is_ep) return true;
+    static const std::unordered_set<std::string> kSkip = {
+        "_start", "start", "_init", "_fini", "main", "_main",
+        "__libc_csu_init", "__libc_csu_fini", "__do_global_dtors_aux",
+        "frame_dummy", "register_tm_clones", "deregister_tm_clones",
+        "_dl_relocate_static_pie", "__scrt_common_main_seh", "mainCRTStartup"
+    };
+    return kSkip.contains(name);
+}
+
+std::optional<std::uint64_t> resolve_symbol_va_by_name(const core::binary::IBinaryFile& bin,
+                                                       const std::string& name) {
+    for (const auto& exp : bin.exports()) {
+        if (!exp.is_forwarded && exp.address != 0 &&
+            (exp.name == name || exp.name == ("_" + name))) {
+            return exp.address;
+        }
+    }
+    for (const auto& sym : bin.symbols()) {
+        if (sym.address != 0 && !sym.is_imported &&
+            (sym.name == name || sym.name == ("_" + name))) {
+            return sym.address;
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+core::diagnostics::Result<MultiFunctionPlan>
+prepare_target_functions(const core::binary::IBinaryFile& bin,
+                         const core::analysis::AnalysisResult& analysis,
+                         core::analysis::IDisassemblerEngine& disasm,
+                         const ProtectOptions& options,
+                         std::uint64_t stub_base_va,
+                         bool is_arm64) {
+    using core::diagnostics::ErrorCode;
+    using namespace core::analysis;
+    using namespace core::ir;
+    using namespace obf;
+    using namespace virt;
+
+    const std::size_t min_patch = is_arm64 ? 4 : 5;
+    MultiFunctionPlan plan;
+    plan.total_analyzed = static_cast<std::uint32_t>(analysis.functions.size());
+
+    const auto auth_calls = options.allow_external_calls
+        ? build_authorized_call_targets(bin, analysis)
+        : std::unordered_set<std::uint64_t>{};
+
+    auto process_fn = [&](const FunctionInfo& fn) -> core::diagnostics::Result<PreparedFunction> {
+        if (fn.size_bytes < min_patch) {
+            return core::diagnostics::Result<PreparedFunction>::err(
+                ErrorCode::OutOfBounds,
+                "Function smaller than minimum trampoline size (" + std::to_string(min_patch) + " bytes)",
+                "prepare_target_functions");
+        }
+        if (fn.confidence == AnalysisConfidence::Low) {
+            return core::diagnostics::Result<PreparedFunction>::err(
+                ErrorCode::UnsupportedFormat,
+                "Partially unknown CFG or invalid instructions in function body",
+                "prepare_target_functions");
+        }
+
+        IrFunction ir_fn = is_arm64
+            ? arch::aarch64::AArch64Lifter().lift_function(fn)
+            : arch::x86_64::X86_64Lifter().lift_function(fn);
+
+        std::uint32_t orig_ops = 0;
+        for (const auto& bb : ir_fn.blocks) orig_ops += static_cast<std::uint32_t>(bb.instructions.size());
+
+        ObfuscationConfig obf_cfg;
+        obf_cfg.seed = options.seed ^ fn.entry_va;
+        obf_cfg.enable_substitution = true;
+        obf_cfg.enable_mba = (options.profile != ProtectionProfile::Fast);
+        obf_cfg.enable_cfg = (options.profile == ProtectionProfile::Maximum);
+
+        auto obf_res = ObfuscationPipeline::obfuscate_function(ir_fn, obf_cfg);
+        if (!obf_res) {
+            return core::diagnostics::Result<PreparedFunction>::err(
+                obf_res.error().code, obf_res.error().message, "prepare_target_functions");
+        }
+
+        TranslateOptions t_opts;
+        t_opts.build_seed = options.seed ^ fn.entry_va;
+        t_opts.allow_external_calls = options.allow_external_calls;
+        t_opts.stub_base_va = stub_base_va;
+        t_opts.authorized_call_targets = auth_calls;
+
+        auto bvm_res = IrToVmTranslator::translate(ir_fn, t_opts);
+        if (!bvm_res) {
+            return core::diagnostics::Result<PreparedFunction>::err(
+                bvm_res.error().code, bvm_res.error().message, "prepare_target_functions");
+        }
+
+        PreparedFunction pf;
+        pf.name = fn.name;
+        pf.entry_va = fn.entry_va;
+        pf.size_bytes = fn.size_bytes;
+        pf.orig_ir_ops = orig_ops;
+        pf.obf_ir_ops = static_cast<std::uint32_t>(obf_res.value().obfuscated_instructions);
+        pf.program = std::move(bvm_res.value());
+        return pf;
+    };
+
+    const bool explicit_multi = !options.target_function_rvas.empty() || !options.target_function_names.empty();
+
+    if (options.protect_all_eligible) {
+        for (const auto& fn : analysis.functions) {
+            if (is_crt_stub_name(fn.name, fn.from_entry_point)) {
+                FunctionCompatibilityEntry rej;
+                rej.name = fn.name;
+                rej.entry_va = fn.entry_va;
+                rej.size_bytes = fn.size_bytes;
+                rej.rejection_reason = "Entry point or CRT/startup routine excluded";
+                plan.rejected.push_back(std::move(rej));
+                continue;
+            }
+            auto pf = process_fn(fn);
+            if (!pf) {
+                FunctionCompatibilityEntry rej;
+                rej.name = fn.name;
+                rej.entry_va = fn.entry_va;
+                rej.size_bytes = fn.size_bytes;
+                rej.rejection_reason = pf.error().message;
+                plan.rejected.push_back(std::move(rej));
+                continue;
+            }
+            plan.prepared.push_back(std::move(pf.value()));
+        }
+    } else if (explicit_multi) {
+        struct TargetSpec { std::string name; std::uint64_t va; };
+        std::vector<TargetSpec> specs;
+        for (const auto rva : options.target_function_rvas) {
+            const std::uint64_t va = (rva >= bin.info().image_base && bin.info().image_base != 0)
+                ? rva
+                : (bin.info().image_base + rva);
+            specs.push_back({"fn_0x" + std::to_string(va), va});
+        }
+        for (const auto& name : options.target_function_names) {
+            auto va = resolve_symbol_va_by_name(bin, name);
+            if (!va) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    ErrorCode::FileNotFound, "Target function symbol not found: " + name, "prepare_target_functions");
+            }
+            specs.push_back({name, *va});
+        }
+        for (const auto& sp : specs) {
+            const FunctionInfo* found = nullptr;
+            for (const auto& fn : analysis.functions) {
+                if (fn.entry_va == sp.va) { found = &fn; break; }
+            }
+            FunctionInfo adhoc;
+            if (!found) {
+                auto slice = bin.read_virtual(sp.va, 256);
+                if (!slice) {
+                    return core::diagnostics::Result<MultiFunctionPlan>::err(
+                        slice.error().code, slice.error().message, "prepare_target_functions");
+                }
+                auto dis = disasm.disassemble(slice.value(), sp.va, 64);
+                if (!dis || dis.value().empty()) {
+                    return core::diagnostics::Result<MultiFunctionPlan>::err(
+                        ErrorCode::DisassemblyError, "Failed to disassemble target function", "prepare_target_functions");
+                }
+                adhoc.name = sp.name;
+                adhoc.entry_va = sp.va;
+                BasicBlock bb;
+                bb.start_va = sp.va;
+                for (const auto& i : dis.value()) {
+                    bb.instructions.push_back(i);
+                    bb.end_va = i.address + i.bytes.size();
+                    adhoc.size_bytes += i.bytes.size();
+                    if (i.flow == ControlFlowKind::Return) break;
+                }
+                adhoc.blocks.push_back(std::move(bb));
+                found = &adhoc;
+            }
+            auto pf = process_fn(*found);
+            if (!pf) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    pf.error().code,
+                    "Function '" + found->name + "' is not eligible: " + pf.error().message,
+                    "prepare_target_functions");
+            }
+            plan.prepared.push_back(std::move(pf.value()));
+        }
+    } else {
+        // Single target mode (backwards-compatible with v0.4-v0.6)
+        std::uint64_t target_va = 0;
+        std::string target_name;
+        if (options.target_function_rva.has_value()) {
+            target_va = bin.info().image_base + *options.target_function_rva;
+            target_name = options.target_function_name.empty() ? "target_fn" : options.target_function_name;
+        } else if (!options.target_function_name.empty()) {
+            auto va = resolve_symbol_va_by_name(bin, options.target_function_name);
+            if (!va) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    ErrorCode::FileNotFound, "Target function not found: " + options.target_function_name, "prepare_target_functions");
+            }
+            target_va = *va;
+            target_name = options.target_function_name;
+        } else {
+            for (const auto& exp : bin.exports()) {
+                if (!exp.is_forwarded && exp.address != 0) {
+                    target_va = exp.address;
+                    target_name = exp.name;
+                    break;
+                }
+            }
+            if (target_va == 0) {
+                for (const auto& sym : bin.symbols()) {
+                    if (sym.is_function && sym.is_exported && sym.address != 0 && !sym.name.empty()) {
+                        target_va = sym.address;
+                        target_name = sym.name;
+                        break;
+                    }
+                }
+            }
+            if (target_va == 0) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    ErrorCode::UnsupportedFormat, "No exported target function found; specify --func, --func-rva, or --functions all-eligible", "prepare_target_functions");
+            }
+        }
+
+        const FunctionInfo* found = nullptr;
+        for (const auto& fn : analysis.functions) {
+            if (fn.entry_va == target_va) { found = &fn; break; }
+        }
+        FunctionInfo adhoc;
+        if (!found) {
+            auto slice = bin.read_virtual(target_va, 256);
+            if (!slice) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    slice.error().code, slice.error().message, "prepare_target_functions");
+            }
+            auto dis = disasm.disassemble(slice.value(), target_va, 64);
+            if (!dis || dis.value().empty()) {
+                return core::diagnostics::Result<MultiFunctionPlan>::err(
+                    ErrorCode::DisassemblyError, "Failed to disassemble target function", "prepare_target_functions");
+            }
+            adhoc.name = target_name;
+            adhoc.entry_va = target_va;
+            BasicBlock bb;
+            bb.start_va = target_va;
+            for (const auto& i : dis.value()) {
+                bb.instructions.push_back(i);
+                bb.end_va = i.address + i.bytes.size();
+                adhoc.size_bytes += i.bytes.size();
+                if (i.flow == ControlFlowKind::Return) break;
+            }
+            adhoc.blocks.push_back(std::move(bb));
+            found = &adhoc;
+        }
+        auto pf = process_fn(*found);
+        if (!pf) {
+            return core::diagnostics::Result<MultiFunctionPlan>::err(
+                pf.error().code, "Function is not eligible for virtualization: " + pf.error().message, "prepare_target_functions");
+        }
+        plan.prepared.push_back(std::move(pf.value()));
+    }
+
+    // Sort and detect overlapping functions
+    std::sort(plan.prepared.begin(), plan.prepared.end(),
+              [](const PreparedFunction& a, const PreparedFunction& b) { return a.entry_va < b.entry_va; });
+
+    std::vector<PreparedFunction> non_overlapping;
+    non_overlapping.reserve(plan.prepared.size());
+    for (auto& pf : plan.prepared) {
+        if (!non_overlapping.empty()) {
+            const auto& prev = non_overlapping.back();
+            const std::uint64_t prev_end = prev.entry_va + std::max<std::uint64_t>(prev.size_bytes, min_patch);
+            if (pf.entry_va < prev_end) {
+                if (!options.protect_all_eligible) {
+                    return core::diagnostics::Result<MultiFunctionPlan>::err(
+                        ErrorCode::OutOfBounds,
+                        "Overlapping target functions detected at 0x" + std::to_string(pf.entry_va),
+                        "prepare_target_functions");
+                }
+                FunctionCompatibilityEntry rej;
+                rej.name = pf.name;
+                rej.entry_va = pf.entry_va;
+                rej.size_bytes = pf.size_bytes;
+                rej.rejection_reason = "Overlaps previously selected function";
+                plan.rejected.push_back(std::move(rej));
+                continue;
+            }
+        }
+        non_overlapping.push_back(std::move(pf));
+    }
+    plan.prepared = std::move(non_overlapping);
+    plan.eligible_count = static_cast<std::uint32_t>(plan.prepared.size());
+
+    if (plan.prepared.empty()) {
+        return core::diagnostics::Result<MultiFunctionPlan>::err(
+            ErrorCode::UnsupportedFormat, "No eligible functions selected for protection", "prepare_target_functions");
+    }
+
+    return plan;
+}
+
 diagnostics::Result<std::vector<std::uint8_t>>
 emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
+    SharedRuntimeLayout layout;
+    return emit_shared_pic_x64_vm_runtime(std::vector<BvmProgram>{prog}, abi, layout);
+}
+
+diagnostics::Result<std::vector<std::uint8_t>>
+emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
+                               AbiKind abi,
+                               SharedRuntimeLayout& out_layout) {
 #if !defined(BYTEMORPH_HAS_ASMJIT)
-    (void)prog;
+    (void)progs;
     (void)abi;
+    (void)out_layout;
     return diagnostics::Result<std::vector<std::uint8_t>>::err(
-        diagnostics::ErrorCode::NotImplemented, "AsmJit is disabled", "emit_pic_x64_vm_runtime");
+        diagnostics::ErrorCode::NotImplemented, "AsmJit is disabled", "emit_shared_pic_x64_vm_runtime");
 #else
+    if (progs.empty()) {
+        return diagnostics::Result<std::vector<std::uint8_t>>::err(
+            diagnostics::ErrorCode::EmptyInput, "No BvmPrograms provided", "emit_shared_pic_x64_vm_runtime");
+    }
+
     asmjit::Environment env(asmjit::Arch::kX64);
     asmjit::CodeHolder code;
     code.init(env);
@@ -182,7 +536,15 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     using namespace asmjit;
 
     Label l_entry = a.new_label();
-    Label l_bytecode = a.new_label();
+    Label l_core = a.new_label();
+    std::vector<Label> l_stubs;
+    std::vector<Label> l_bytecodes;
+    l_stubs.reserve(progs.size());
+    l_bytecodes.reserve(progs.size());
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        l_stubs.push_back(a.new_label());
+        l_bytecodes.push_back(a.new_label());
+    }
     Label l_vm_loop = a.new_label();
     Label l_vm_done = a.new_label();
     Label l_take_branch = a.new_label();
@@ -213,6 +575,13 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     Label l_op_callext = a.new_label();
 
     a.bind(l_entry);
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        a.bind(l_stubs[i]);
+        a.lea(x86::r10, x86::ptr(l_bytecodes[i]));
+        a.jmp(l_core);
+    }
+
+    a.bind(l_core);
     a.push(x86::rbx);
     a.push(x86::rbp);
     a.push(x86::rdi);
@@ -221,6 +590,10 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.push(x86::r13);
     a.push(x86::r14);
     a.push(x86::r15);
+
+    // Preserve bytecode pointer passed from per-function stub in r10
+    a.mov(x86::r12d, x86::dword_ptr(x86::r10));
+    a.lea(x86::r13, x86::ptr(x86::r10, 4));
 
     // 8 pushes (64B) + retaddr (8B) + 1288B (256B VM regs + 1032B virtual stack frame) = 1360B (16-byte aligned)
     a.sub(x86::rsp, 1288);
@@ -263,9 +636,6 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
         a.mov(x86::qword_ptr(x86::rsp, 9 * 8), x86::r9);
     }
 
-    a.lea(x86::r10, x86::ptr(l_bytecode));
-    a.mov(x86::r12d, x86::dword_ptr(x86::r10));
-    a.lea(x86::r13, x86::ptr(x86::r10, 4));
     a.xor_(x86::r14d, x86::r14d);
     a.xor_(x86::r15d, x86::r15d);
 
@@ -504,21 +874,30 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
     a.ret();
 
     a.align(AlignMode::kData, 8);
-    a.bind(l_bytecode);
-    const std::uint32_t insn_count = static_cast<std::uint32_t>(prog.instructions.size());
-    a.embed(&insn_count, sizeof(insn_count));
-    for (const auto& insn : prog.instructions) {
-        std::uint8_t raw[12]{};
-        raw[0] = static_cast<std::uint8_t>(insn.opcode);
-        raw[1] = insn.dst;
-        raw[2] = insn.src1;
-        raw[3] = insn.src2;
-        const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
-        std::memcpy(raw + 4, &imm_u, 8);
-        a.embed(raw, sizeof(raw));
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        a.align(AlignMode::kData, 8);
+        a.bind(l_bytecodes[i]);
+        const std::uint32_t insn_count = static_cast<std::uint32_t>(progs[i].instructions.size());
+        a.embed(&insn_count, sizeof(insn_count));
+        for (const auto& insn : progs[i].instructions) {
+            std::uint8_t raw[12]{};
+            raw[0] = static_cast<std::uint8_t>(insn.opcode);
+            raw[1] = insn.dst;
+            raw[2] = insn.src1;
+            raw[3] = insn.src2;
+            const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
+            std::memcpy(raw + 4, &imm_u, 8);
+            a.embed(raw, sizeof(raw));
+        }
     }
 
     code.flatten();
+    out_layout.entry_offsets.clear();
+    out_layout.entry_offsets.reserve(progs.size());
+    for (const auto& lbl : l_stubs) {
+        out_layout.entry_offsets.push_back(code.label_offset(lbl));
+    }
+    out_layout.core_offset = code.label_offset(l_core);
     const auto& sec = code.section_by_id(0);
     return std::vector<std::uint8_t>(sec->buffer().data(), sec->buffer().data() + sec->buffer().size());
 #endif
@@ -526,11 +905,24 @@ emit_pic_x64_vm_runtime(const BvmProgram& prog, AbiKind abi) {
 
 diagnostics::Result<std::vector<std::uint8_t>>
 emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
+    SharedRuntimeLayout layout;
+    return emit_shared_pic_arm64_vm_runtime(std::vector<BvmProgram>{prog}, layout);
+}
+
+diagnostics::Result<std::vector<std::uint8_t>>
+emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
+                                 SharedRuntimeLayout& out_layout) {
 #if !defined(BYTEMORPH_HAS_ASMJIT)
-    (void)prog;
+    (void)progs;
+    (void)out_layout;
     return diagnostics::Result<std::vector<std::uint8_t>>::err(
-        diagnostics::ErrorCode::NotImplemented, "AsmJit is disabled", "emit_pic_arm64_vm_runtime");
+        diagnostics::ErrorCode::NotImplemented, "AsmJit is disabled", "emit_shared_pic_arm64_vm_runtime");
 #else
+    if (progs.empty()) {
+        return diagnostics::Result<std::vector<std::uint8_t>>::err(
+            diagnostics::ErrorCode::EmptyInput, "No BvmPrograms provided", "emit_shared_pic_arm64_vm_runtime");
+    }
+
     asmjit::Environment env(asmjit::Arch::kAArch64);
     asmjit::CodeHolder code;
     code.init(env);
@@ -538,7 +930,15 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     using namespace asmjit;
 
     Label l_entry = a.new_label();
-    Label l_bytecode = a.new_label();
+    Label l_core = a.new_label();
+    std::vector<Label> l_stubs;
+    std::vector<Label> l_bytecodes;
+    l_stubs.reserve(progs.size());
+    l_bytecodes.reserve(progs.size());
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        l_stubs.push_back(a.new_label());
+        l_bytecodes.push_back(a.new_label());
+    }
     Label l_vm_loop = a.new_label();
     Label l_vm_done = a.new_label();
     Label l_take_branch = a.new_label();
@@ -568,9 +968,16 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     Label l_op_ret = a.new_label();
     Label l_op_callext = a.new_label();
 
+    a.bind(l_entry);
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        a.bind(l_stubs[i]);
+        a.adr(a64::x16, l_bytecodes[i]);
+        a.b(l_core);
+    }
+
     // AAPCS64 / Apple ARM64 ABI:
     // Save x19-x28, x29, x30 (12 regs = 96B) + 1280B (256B VM regs + 1024B virtual stack frame) = 1376B (16B aligned)
-    a.bind(l_entry);
+    a.bind(l_core);
     a.stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -96));
     a.stp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
     a.stp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
@@ -603,7 +1010,7 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.str(a64::x6, a64::ptr(a64::sp, 8 * 8));
     a.str(a64::x7, a64::ptr(a64::sp, 9 * 8));
 
-    a.adr(a64::x19, l_bytecode);
+    a.mov(a64::x19, a64::x16);                 // bytecode pointer from stub
     a.ldr(a64::w20, a64::ptr(a64::x19));       // insn_count
     a.add(a64::x21, a64::x19, 4);              // insn_base
     a.mov(a64::w22, 0);                        // pc = 0
@@ -796,21 +1203,30 @@ emit_pic_arm64_vm_runtime(const BvmProgram& prog) {
     a.ret(a64::x30);
 
     a.align(AlignMode::kData, 8);
-    a.bind(l_bytecode);
-    const std::uint32_t insn_count = static_cast<std::uint32_t>(prog.instructions.size());
-    a.embed(&insn_count, sizeof(insn_count));
-    for (const auto& insn : prog.instructions) {
-        std::uint8_t raw[12]{};
-        raw[0] = static_cast<std::uint8_t>(insn.opcode);
-        raw[1] = insn.dst;
-        raw[2] = insn.src1;
-        raw[3] = insn.src2;
-        const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
-        std::memcpy(raw + 4, &imm_u, 8);
-        a.embed(raw, sizeof(raw));
+    for (std::size_t i = 0; i < progs.size(); ++i) {
+        a.align(AlignMode::kData, 8);
+        a.bind(l_bytecodes[i]);
+        const std::uint32_t insn_count = static_cast<std::uint32_t>(progs[i].instructions.size());
+        a.embed(&insn_count, sizeof(insn_count));
+        for (const auto& insn : progs[i].instructions) {
+            std::uint8_t raw[12]{};
+            raw[0] = static_cast<std::uint8_t>(insn.opcode);
+            raw[1] = insn.dst;
+            raw[2] = insn.src1;
+            raw[3] = insn.src2;
+            const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
+            std::memcpy(raw + 4, &imm_u, 8);
+            a.embed(raw, sizeof(raw));
+        }
     }
 
     code.flatten();
+    out_layout.entry_offsets.clear();
+    out_layout.entry_offsets.reserve(progs.size());
+    for (const auto& lbl : l_stubs) {
+        out_layout.entry_offsets.push_back(code.label_offset(lbl));
+    }
+    out_layout.core_offset = code.label_offset(l_core);
     const auto& sec = code.section_by_id(0);
     return std::vector<std::uint8_t>(sec->buffer().data(), sec->buffer().data() + sec->buffer().size());
 #endif

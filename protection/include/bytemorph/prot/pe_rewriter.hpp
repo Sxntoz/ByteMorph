@@ -34,10 +34,14 @@ struct ProtectOptions {
     std::uint64_t seed{0x425954453034ULL};
     std::optional<std::uint64_t> target_function_rva;
     std::string target_function_name;
+    std::vector<std::uint64_t> target_function_rvas;
+    std::vector<std::string> target_function_names;
     bool protect_strings{true};
     bool allow_strip_signature{false};
     bool allow_external_calls{false};
     bool auto_select_functions{false};
+    bool protect_all_eligible{false};
+    bool rollback_on_failure{true};
 };
 
 struct FunctionCompatibilityEntry {
@@ -93,6 +97,12 @@ struct ProtectionReport {
     std::uint64_t output_size{0};
     std::vector<ProtectedFunctionRecord> protected_functions;
     std::uint32_t protected_strings_count{0};
+    std::uint32_t total_functions_analyzed{0};
+    std::uint32_t eligible_functions_count{0};
+    std::vector<FunctionCompatibilityEntry> rejected_functions;
+    double transform_time_ms{0.0};
+    bool shared_runtime_used{false};
+    std::uint64_t runtime_bytes_size{0};
     bool aslr_preserved{false};
     bool dep_preserved{false};
 };

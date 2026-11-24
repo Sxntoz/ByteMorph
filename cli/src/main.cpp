@@ -35,7 +35,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.6.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.7.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -52,24 +52,26 @@ void print_usage() {
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
-        << "Protection Commands (v0.4 - v0.6: PE32+ x64, ELF64 x64/ARM64, Mach-O 64-bit):\n"
-        << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--functions auto | --func name | --func-rva hex]\n"
+        << "Protection Commands (v0.4 - v0.7: PE32+ x64/ARM64, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
+        << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--functions all-eligible|auto|list]\n"
         << "  compatibility <in> [--format json]  Report eligible/rejected functions, unsupported instructions & OS requirements\n"
         << "  verify <protected>                  Verify AEAD authentication & section integrity\n"
-        << "  protection-info <protected>         Display protection metadata and virtualized functions\n"
-        << "  benchmark-protection                Run protection pipeline & integrity benchmark\n\n"
+        << "  protection-info <protected> [--functions]  Display protection metadata and virtualized functions\n"
+        << "  benchmark-protection [--detailed]   Run protection pipeline, shared-runtime & integrity benchmark\n\n"
         << "Options:\n"
         << "  --output, -o <path>   Output file path (optional for protect; defaults to <in>.protected)\n"
         << "  --profile <p>         Protection profile: fast | balanced | maximum (default: balanced)\n"
-        << "  --functions <mode>    Function selection mode for protect (auto | <symbol>), or list functions in analyze\n"
+        << "  --functions <mode>    all-eligible | auto | 0xRVA1,0xRVA2 | fn1,fn2 (or list functions in analyze/protection-info)\n"
         << "  --func <name>         Target exported function name to virtualize\n"
         << "  --func-rva <hex>      Target function RVA (hex) to virtualize\n"
         << "  --seed <N>            Deterministic PRNG seed\n"
         << "  --fn <index>          Function index in .ir module for vm-compile (default: 0)\n"
         << "  --format <fmt>        Output format for inspect/compatibility: text | json (default: text)\n"
         << "  --no-strings          Disable string protection in .bmvm\n"
+        << "  --no-rollback         Skip automatic transactional rollback check\n"
         << "  --allow-signed-strip  Allow stripping Authenticode/Mach-O signature if present\n"
         << "  --allow-ext-calls     Allow authorized external calls (vm.callext) in virtualized functions\n"
+        << "  --detailed            Show detailed multi-function scaling in benchmark-protection\n"
         << "  --max <N>             Limit disassembled instructions per section\n"
         << "  --verbose             Enable informational logging\n"
         << "  --help, -h            Show this help message\n"
@@ -509,13 +511,19 @@ int cmd_protect(const std::string& in_path,
         return 1;
     }
     const auto& r = res.value();
-    std::cout << "=== ByteMorph v0.6 Protection Complete ===\n"
+    std::cout << "=== ByteMorph v0.7 Protection Complete ===\n"
               << "  Format / Arch       : " << to_string(r.format) << " / " << to_string(r.architecture) << '\n'
               << "  Profile             : " << bytemorph::prot::to_string(r.profile) << '\n'
               << "  Seed                : 0x" << std::hex << r.seed << std::dec << '\n'
               << "  Input -> Output     : " << r.input_size << " -> " << r.output_size << " bytes (" << out_path << ")\n"
               << "  ASLR / DEP          : " << (r.aslr_preserved ? "Preserved" : "No") << " / "
               << (r.dep_preserved ? "Preserved" : "No") << '\n'
+              << "  Shared VM Runtime   : " << (r.shared_runtime_used ? "Yes" : "No")
+              << " (" << r.runtime_bytes_size << " bytes)\n"
+              << "  Transform Time      : " << std::fixed << std::setprecision(2) << r.transform_time_ms << " ms\n"
+              << "  Functions Analyzed  : " << r.total_functions_analyzed
+              << " (eligible=" << r.eligible_functions_count
+              << ", rejected=" << r.rejected_functions.size() << ")\n"
               << "  Protected Strings   : " << r.protected_strings_count << '\n'
               << "  Virtualized Funcs   : " << r.protected_functions.size() << '\n';
     for (const auto& f : r.protected_functions) {
@@ -610,13 +618,26 @@ int cmd_verify(const std::string& path) {
     return v.valid ? 0 : 2;
 }
 
-int cmd_protection_info(const std::string& path) {
+int cmd_protection_info(const std::string& path, bool functions_only) {
     auto res = bytemorph::prot::ProtectionEngine::verify(path);
     if (!res) {
         std::cerr << "Protection info failed: " << res.error().to_string() << '\n';
         return 1;
     }
     const auto& m = res.value().metadata;
+    if (functions_only) {
+        std::cout << "Protected Functions (" << m.functions.size() << "):\n";
+        for (const auto& f : m.functions) {
+            std::cout << "  " << f.name
+                      << " | orig_rva=0x" << std::hex << f.original_rva
+                      << " | stub_rva=0x" << f.stub_rva << std::dec
+                      << " | patch=" << f.patch_size << "B"
+                      << " | orig_ir=" << f.orig_ir_ops
+                      << " | obf_ir=" << f.obf_ir_ops
+                      << " | vm_ops=" << f.vm_ops << '\n';
+        }
+        return 0;
+    }
     std::cout << "=== ByteMorph Protection Metadata (BMP4 v1) ===\n"
               << "  Profile             : " << bytemorph::prot::to_string(m.profile) << '\n'
               << "  Seed                : 0x" << std::hex << m.seed << std::dec << '\n'
@@ -631,7 +652,7 @@ int cmd_protection_info(const std::string& path) {
     return 0;
 }
 
-int cmd_benchmark_protection() {
+int cmd_benchmark_protection(bool detailed) {
     auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
     if (!cmp_res) {
         std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
@@ -709,7 +730,7 @@ int cmd_benchmark_protection() {
     const double overhead_pct = ((cmp_res.value().vm_ms - native_ms) / native_ms) * 100.0;
     const std::size_t vm_ram_bytes = 4096 * sizeof(std::uint64_t) + 32 * sizeof(std::uint64_t);
 
-    std::cout << "=== ByteMorph v0.6 Protection Benchmark ===\n"
+    std::cout << "=== ByteMorph v0.7 Protection Benchmark ===\n"
               << "  Native Execution (10k iters)   : " << std::fixed << std::setprecision(3) << native_ms << " ms\n"
               << "  VM Interpreter (10k iters)     : " << cmp_res.value().vm_ms << " ms (overhead: " << std::setprecision(1) << overhead_pct << "%)\n"
               << "  VM Stack Load/Store (10k iters): " << std::setprecision(3) << stack_vm_ms << " ms\n"
@@ -717,6 +738,25 @@ int cmd_benchmark_protection() {
               << "  PIC Runtime Emission (avg)     : " << emit_avg_ms << " ms (x86-64=" << x64_rt_bytes << "B, ARM64=" << a64_rt_bytes << "B)\n"
               << "  VM Working Set RAM (per ctx)   : " << vm_ram_bytes << " bytes (native frame=1360B x64 / 1376B ARM64)\n"
               << "  XChaCha20-Poly1305 (1k ops)    : " << aead_ms << " ms\n";
+
+    if (detailed) {
+        std::cout << "  --- Multi-Function Shared Runtime Scaling ---\n";
+        for (const std::size_t n_funcs : {2u, 5u, 10u, 20u}) {
+            std::vector<bytemorph::virt::BvmProgram> progs(n_funcs, stack_prog);
+            bytemorph::prot::detail::SharedRuntimeLayout layout_x64;
+            bytemorph::prot::detail::SharedRuntimeLayout layout_a64;
+            const auto tm0 = std::chrono::steady_clock::now();
+            auto rx = bytemorph::prot::detail::emit_shared_pic_x64_vm_runtime(
+                progs, bytemorph::prot::detail::AbiKind::Win64, layout_x64);
+            auto ra = bytemorph::prot::detail::emit_shared_pic_arm64_vm_runtime(progs, layout_a64);
+            const auto tm1 = std::chrono::steady_clock::now();
+            const double multi_ms = std::chrono::duration<double, std::milli>(tm1 - tm0).count();
+            std::cout << "    " << n_funcs << " funcs -> x64="
+                      << (rx ? rx.value().size() : 0) << "B, ARM64="
+                      << (ra ? ra.value().size() : 0) << "B, emit="
+                      << std::setprecision(3) << multi_ms << " ms\n";
+        }
+    }
     return 0;
 }
 
@@ -732,14 +772,18 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.6.0\n";
+        std::cout << "ByteMorph v0.7.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
         return cmd_benchmark_vm();
     }
     if (cmd == "benchmark-protection") {
-        return cmd_benchmark_protection();
+        bool detailed = false;
+        for (int i = 2; i < argc; ++i) {
+            if (std::string_view(argv[i]) == "--detailed") detailed = true;
+        }
+        return cmd_benchmark_protection(detailed);
     }
 
     if (argc < 3) {
@@ -777,11 +821,36 @@ int main(int argc, char* argv[]) {
             else { std::cerr << "Invalid --profile (expected fast|balanced|maximum)\n"; return 1; }
         } else if (arg == "--functions") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                std::string_view fmode = argv[++i];
+                std::string fmode = argv[++i];
                 if (fmode == "auto") {
                     prot_opts.auto_select_functions = true;
+                } else if (fmode == "all-eligible") {
+                    prot_opts.protect_all_eligible = true;
                 } else {
-                    prot_opts.target_function_name = std::string(fmode);
+                    std::size_t start = 0;
+                    while (start < fmode.size()) {
+                        const std::size_t comma = fmode.find(',', start);
+                        std::string item = (comma == std::string::npos)
+                            ? fmode.substr(start)
+                            : fmode.substr(start, comma - start);
+                        if (!item.empty()) {
+                            if (item.rfind("0x", 0) == 0 || item.rfind("0X", 0) == 0) {
+                                try {
+                                    prot_opts.target_function_rvas.push_back(std::stoull(item, nullptr, 16));
+                                } catch (...) {
+                                    std::cerr << "Invalid RVA in --functions: " << item << '\n';
+                                    return 1;
+                                }
+                            } else {
+                                prot_opts.target_function_names.push_back(item);
+                            }
+                        }
+                        if (comma == std::string::npos) break;
+                        start = comma + 1;
+                    }
+                    if (prot_opts.target_function_names.size() == 1 && prot_opts.target_function_rvas.empty()) {
+                        prot_opts.target_function_name = prot_opts.target_function_names.front();
+                    }
                 }
             } else {
                 analyze_functions_only = true;
@@ -793,6 +862,8 @@ int main(int argc, char* argv[]) {
             try { prot_opts.target_function_rva = std::stoull(argv[++i], nullptr, 16); } catch (...) { return 1; }
         } else if (arg == "--no-strings") {
             prot_opts.protect_strings = false;
+        } else if (arg == "--no-rollback") {
+            prot_opts.rollback_on_failure = false;
         } else if (arg == "--allow-signed-strip") {
             prot_opts.allow_strip_signature = true;
         } else if (arg == "--allow-ext-calls") {
@@ -813,7 +884,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
     if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls);
     if (cmd == "verify") return cmd_verify(file_path);
-    if (cmd == "protection-info") return cmd_protection_info(file_path);
+    if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only);
 
     auto loader = create_default_loader();
     auto load_res = loader.load_file(file_path);

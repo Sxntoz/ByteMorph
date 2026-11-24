@@ -31,6 +31,16 @@ extern "C" BM_EXPORT std::int64_t bm_target_branch_loop(std::int64_t a, std::int
     return acc;
 }
 
+extern "C" BM_EXPORT std::int64_t bm_target_helper(std::int64_t x) {
+    return (x * 5) + 17;
+}
+
+extern "C" BM_EXPORT std::int64_t bm_target_caller(std::int64_t a, std::int64_t b) {
+    const std::int64_t c = bm_target_compute(a, b);
+    const std::int64_t h = bm_target_helper(b);
+    return c + h;
+}
+
 int main(int argc, char* argv[]) {
     std::int64_t a = 42;
     std::int64_t b = 19;
@@ -43,6 +53,14 @@ int main(int argc, char* argv[]) {
         const std::int64_t multi = bm_target_multi_args(a, b, a + 5, b + 3);
         const std::int64_t loop = bm_target_branch_loop(a, b);
         std::cout << "RESULT=" << res << " MULTI=" << multi << " LOOP=" << loop << '\n';
+        return 0;
+    }
+    if (argc >= 4 && std::strcmp(argv[3], "--v07") == 0) {
+        const std::int64_t multi = bm_target_multi_args(a, b, a + 5, b + 3);
+        const std::int64_t loop = bm_target_branch_loop(a, b);
+        const std::int64_t caller = bm_target_caller(a, b);
+        std::cout << "RESULT=" << res << " MULTI=" << multi
+                  << " LOOP=" << loop << " CALLER=" << caller << '\n';
         return 0;
     }
     std::cout << "RESULT=" << res << '\n';

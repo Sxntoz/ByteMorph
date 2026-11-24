@@ -647,3 +647,258 @@ TEST(ProtectionV05Test, ProtectsAndExecutesRealMacOSMachO64LabBinary) {
     std::filesystem::remove(prot_exe, ec);
 }
 #endif
+
+TEST(ProtectionV07Test, SharedRuntimeMultiFunctionScaling2_5_10_20) {
+    BvmProgram prog;
+    prog.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 10},
+        {VmOpcode::MovImm, 2, 0, 0, 32},
+        {VmOpcode::Add, 0, 1, 2, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+
+    std::size_t prev_x64_size = 0;
+    std::size_t prev_a64_size = 0;
+    for (const std::size_t count : {2u, 5u, 10u, 20u}) {
+        std::vector<BvmProgram> progs(count, prog);
+        detail::SharedRuntimeLayout x64_layout;
+        detail::SharedRuntimeLayout a64_layout;
+        auto x64_rt = detail::emit_shared_pic_x64_vm_runtime(progs, detail::AbiKind::Win64, x64_layout);
+        auto a64_rt = detail::emit_shared_pic_arm64_vm_runtime(progs, a64_layout);
+        ASSERT_TRUE(x64_rt.has_value()) << x64_rt.error().to_string();
+        ASSERT_TRUE(a64_rt.has_value()) << a64_rt.error().to_string();
+        EXPECT_EQ(x64_layout.entry_offsets.size(), count);
+        EXPECT_EQ(a64_layout.entry_offsets.size(), count);
+        EXPECT_GT(x64_layout.core_offset, 0ULL);
+        EXPECT_GT(a64_layout.core_offset, 0ULL);
+
+        if (prev_x64_size > 0) {
+            EXPECT_GT(x64_rt.value().size(), prev_x64_size);
+            EXPECT_GT(a64_rt.value().size(), prev_a64_size);
+        }
+        prev_x64_size = x64_rt.value().size();
+        prev_a64_size = a64_rt.value().size();
+    }
+    EXPECT_LT(prev_x64_size, 8192u);
+    EXPECT_LT(prev_a64_size, 8192u);
+}
+
+TEST(ProtectionV07Test, Pe32PlusArm64CrossProtectionAndVerification) {
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto pe_in = tmp_dir / "bytemorph_test_pe_arm64_in.exe";
+    const auto pe_out = tmp_dir / "bytemorph_test_pe_arm64_out.exe";
+
+    const std::vector<std::uint8_t> arm64_fn = {
+        0xFD, 0x7B, 0xBE, 0xA9, // stp x29, x30, [sp, #-32]!
+        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+        0xE0, 0x0F, 0x00, 0xF9, // str x0, [sp, #24]
+        0xE1, 0x0B, 0x00, 0xF9, // str x1, [sp, #16]
+        0xE8, 0x0F, 0x40, 0xF9, // ldr x8, [sp, #24]
+        0xE9, 0x0B, 0x40, 0xF9, // ldr x9, [sp, #16]
+        0x08, 0x05, 0x08, 0x8B, // add x8, x8, x8, lsl #1
+        0x00, 0x01, 0x09, 0x8B, // add x0, x8, x9
+        0xFD, 0x7B, 0xC2, 0xA8, // ldp x29, x30, [sp], #32
+        0xC0, 0x03, 0x5F, 0xD6  // ret
+    };
+
+    auto pe = bytemorph::tests::build_minimal_pe64_x86_64(arm64_fn);
+    pe[0x84] = 0x64;
+    pe[0x85] = 0xAA;
+
+    {
+        std::ofstream ofs(pe_in, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(pe.data()), static_cast<std::streamsize>(pe.size()));
+    }
+
+    auto comp = ProtectionEngine::check_compatibility(pe_in);
+    ASSERT_TRUE(comp.has_value()) << comp.error().to_string();
+    EXPECT_TRUE(comp.value().binary_supported);
+    EXPECT_EQ(comp.value().format, bytemorph::core::binary::BinaryFormat::PE32Plus);
+    EXPECT_EQ(comp.value().architecture, bytemorph::core::binary::Architecture::ARM64);
+
+    ProtectOptions opts;
+    opts.target_function_rva = 0x1000;
+    opts.profile = ProtectionProfile::Balanced;
+    opts.seed = 0xA64FE07ULL;
+
+    auto rep = ProtectionEngine::protect(pe_in, pe_out, opts);
+    ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
+    EXPECT_EQ(rep.value().format, bytemorph::core::binary::BinaryFormat::PE32Plus);
+    EXPECT_EQ(rep.value().architecture, bytemorph::core::binary::Architecture::ARM64);
+    EXPECT_TRUE(rep.value().shared_runtime_used);
+    EXPECT_EQ(rep.value().protected_functions.size(), 1u);
+
+    auto ver = ProtectionEngine::verify(pe_out);
+    ASSERT_TRUE(ver.has_value()) << ver.error().to_string();
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+    EXPECT_TRUE(ver.value().text_integrity_ok);
+    EXPECT_TRUE(ver.value().runtime_integrity_ok);
+
+    std::error_code ec;
+    std::filesystem::remove(pe_in, ec);
+    std::filesystem::remove(pe_out, ec);
+}
+
+TEST(ProtectionV07Test, MachOUniversalMultiSliceProtectionAndVerification) {
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto uni_in = tmp_dir / "bytemorph_test_uni_in.macho";
+    const auto uni_out = tmp_dir / "bytemorph_test_uni_out.macho";
+
+    const std::vector<std::uint8_t> x64_fn = {
+        0x55,                         // push rbp
+        0x48, 0x89, 0xE5,             // mov rbp, rsp
+        0x48, 0x8D, 0x04, 0x37,       // lea rax, [rdi + rsi]
+        0x5D,                         // pop rbp
+        0xC3                          // ret
+    };
+    const std::vector<std::uint8_t> arm64_fn = {
+        0xFD, 0x7B, 0xBE, 0xA9,       // stp x29, x30, [sp, #-32]!
+        0xFD, 0x03, 0x00, 0x91,       // mov x29, sp
+        0x00, 0x00, 0x01, 0x8B,       // add x0, x0, x1
+        0xFD, 0x7B, 0xC2, 0xA8,       // ldp x29, x30, [sp], #32
+        0xC0, 0x03, 0x5F, 0xD6        // ret
+    };
+
+    auto x64_slice = bytemorph::tests::build_minimal_macho64(false, x64_fn);
+    auto arm64_slice = bytemorph::tests::build_minimal_macho64(true, arm64_fn);
+    auto fat = bytemorph::tests::build_minimal_macho_fat(x64_slice, arm64_slice);
+
+    {
+        std::ofstream ofs(uni_in, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(fat.data()), static_cast<std::streamsize>(fat.size()));
+    }
+
+    ProtectOptions opts;
+    opts.target_function_rva = 0x1000;
+    opts.profile = ProtectionProfile::Balanced;
+    opts.seed = 0xFA700007ULL;
+    opts.allow_strip_signature = true;
+
+    auto rep = ProtectionEngine::protect(uni_in, uni_out, opts);
+    ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
+    EXPECT_EQ(rep.value().format, bytemorph::core::binary::BinaryFormat::MachO64);
+    EXPECT_TRUE(rep.value().shared_runtime_used);
+    EXPECT_EQ(rep.value().protected_functions.size(), 2u);
+
+    auto ver = ProtectionEngine::verify(uni_out);
+    ASSERT_TRUE(ver.has_value()) << ver.error().to_string();
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+    EXPECT_TRUE(ver.value().text_integrity_ok);
+    EXPECT_TRUE(ver.value().runtime_integrity_ok);
+    EXPECT_EQ(ver.value().metadata.functions.size(), 2u);
+
+    std::error_code ec;
+    std::filesystem::remove(uni_in, ec);
+    std::filesystem::remove(uni_out, ec);
+}
+
+TEST(ProtectionV07Test, TransactionalRollbackRejectsMissingAndOverlappingTargets) {
+    const std::filesystem::path lab_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    ASSERT_TRUE(std::filesystem::exists(lab_exe));
+
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto bad_out = tmp_dir / "bytemorph_v07_rollback_should_not_exist";
+    std::error_code ec;
+    std::filesystem::remove(bad_out, ec);
+
+    ProtectOptions opts;
+    opts.target_function_names = {"bm_target_compute", "nonexistent_symbol_v07"};
+    opts.rollback_on_failure = true;
+    auto rep1 = ProtectionEngine::protect(lab_exe, bad_out, opts);
+    EXPECT_FALSE(rep1.has_value());
+    EXPECT_FALSE(std::filesystem::exists(bad_out));
+
+    ProtectOptions opts2;
+    opts2.target_function_rvas = {0x1000, 0x1002};
+    auto rep2 = ProtectionEngine::protect(lab_exe, bad_out, opts2);
+    EXPECT_FALSE(rep2.has_value());
+    EXPECT_FALSE(std::filesystem::exists(bad_out));
+}
+
+#if defined(_WIN32)
+TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealWindowsPeX64) {
+    const std::filesystem::path lab_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    ASSERT_TRUE(std::filesystem::exists(lab_exe));
+
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto prot_exe = tmp_dir / "lab_pe_v07_multi_protected.exe";
+
+    ProtectOptions opts;
+    opts.profile = ProtectionProfile::Balanced;
+    opts.seed = 0x571D0707ULL;
+    opts.allow_external_calls = true;
+    opts.target_function_names = {
+        "bm_target_compute",
+        "bm_target_multi_args",
+        "bm_target_branch_loop",
+        "bm_target_helper",
+        "bm_target_caller"
+    };
+
+    auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
+    ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
+    EXPECT_TRUE(rep.value().shared_runtime_used);
+    EXPECT_EQ(rep.value().protected_functions.size(), 5u);
+
+    auto ver = ProtectionEngine::verify(prot_exe);
+    ASSERT_TRUE(ver.has_value() && ver.value().valid);
+    EXPECT_EQ(ver.value().metadata.functions.size(), 5u);
+
+    auto run_win = [](const std::filesystem::path& exe, const std::string& args) -> std::string {
+        const std::string cmd = "\"" + exe.string() + "\" " + args;
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) return {};
+        std::string out;
+        char buf[256];
+        while (std::fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
+        _pclose(pipe);
+        return out;
+    };
+
+    EXPECT_EQ(run_win(lab_exe, "42 19 --v07"), run_win(prot_exe, "42 19 --v07"));
+    EXPECT_EQ(run_win(lab_exe, "100 37 --v07"), run_win(prot_exe, "100 37 --v07"));
+
+    std::error_code ec;
+    std::filesystem::remove(prot_exe, ec);
+}
+#endif
+
+#if !defined(_WIN32)
+TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
+    const std::filesystem::path lab_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    ASSERT_TRUE(std::filesystem::exists(lab_exe));
+
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto prot_exe = tmp_dir / "lab_posix_v07_multi_protected";
+
+    ProtectOptions opts;
+    opts.profile = ProtectionProfile::Balanced;
+    opts.seed = 0x50510707ULL;
+    opts.allow_external_calls = true;
+    opts.allow_strip_signature = true;
+    opts.target_function_names = {
+        "bm_target_compute",
+        "bm_target_multi_args",
+        "bm_target_branch_loop",
+        "bm_target_helper",
+        "bm_target_caller"
+    };
+
+    auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
+    ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
+    EXPECT_TRUE(rep.value().shared_runtime_used);
+    EXPECT_EQ(rep.value().protected_functions.size(), 5u);
+
+    auto ver = ProtectionEngine::verify(prot_exe);
+    ASSERT_TRUE(ver.has_value() && ver.value().valid);
+    EXPECT_EQ(ver.value().metadata.functions.size(), 5u);
+
+    EXPECT_EQ(run_posix_and_capture(lab_exe, "42 19 --v07"), run_posix_and_capture(prot_exe, "42 19 --v07"));
+    EXPECT_EQ(run_posix_and_capture(lab_exe, "100 37 --v07"), run_posix_and_capture(prot_exe, "100 37 --v07"));
+
+    std::error_code ec;
+    std::filesystem::remove(prot_exe, ec);
+}
+#endif
