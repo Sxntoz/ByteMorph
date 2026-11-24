@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -98,7 +99,9 @@ public:
     };
 
     [[nodiscard]] std::optional<CachedBlock> get(std::uint64_t context_id, std::size_t block_start_pc);
+    [[nodiscard]] std::shared_ptr<const CachedBlock> get_shared(std::uint64_t context_id, std::size_t block_start_pc);
     void put(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block);
+    std::shared_ptr<const CachedBlock> put_shared(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block);
     void invalidate_context(std::uint64_t context_id);
     void invalidate_all();
     [[nodiscard]] VmCacheStats stats() const;
@@ -118,7 +121,7 @@ private:
     };
     struct LruNode {
         Key key;
-        CachedBlock block;
+        std::shared_ptr<CachedBlock> block;
     };
 
     static void wipe_block(CachedBlock& blk) noexcept;

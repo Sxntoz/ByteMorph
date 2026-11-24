@@ -1391,8 +1391,8 @@ VmBytecodeCache::~VmBytecodeCache() {
 void VmBytecodeCache::evict_lru_locked() {
     if (lru_.empty()) return;
     auto& back = lru_.back();
-    const std::size_t sz = back.block.byte_size();
-    wipe_block(back.block);
+    const std::size_t sz = back.block->byte_size();
+    wipe_block(*back.block);
     index_.erase(back.key);
     lru_.pop_back();
     stats_.current_bytes = (stats_.current_bytes >= sz) ? (stats_.current_bytes - sz) : 0;
@@ -1400,55 +1400,73 @@ void VmBytecodeCache::evict_lru_locked() {
     ++stats_.evictions;
 }
 
-std::optional<VmBytecodeCache::CachedBlock>
-VmBytecodeCache::get(std::uint64_t context_id, std::size_t block_start_pc) {
+std::shared_ptr<const VmBytecodeCache::CachedBlock>
+VmBytecodeCache::get_shared(std::uint64_t context_id, std::size_t block_start_pc) {
     std::lock_guard<std::mutex> lock(mutex_);
     const Key key{context_id, block_start_pc};
     auto it = index_.find(key);
     if (it == index_.end()) {
         ++stats_.misses;
-        return std::nullopt;
+        return nullptr;
     }
-    lru_.splice(lru_.begin(), lru_, it->second);
+    if (it->second != lru_.begin()) {
+        lru_.splice(lru_.begin(), lru_, it->second);
+    }
     ++stats_.hits;
     return it->second->block;
 }
 
-void VmBytecodeCache::put(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block) {
+std::optional<VmBytecodeCache::CachedBlock>
+VmBytecodeCache::get(std::uint64_t context_id, std::size_t block_start_pc) {
+    auto ptr = get_shared(context_id, block_start_pc);
+    if (!ptr) return std::nullopt;
+    return *ptr;
+}
+
+std::shared_ptr<const VmBytecodeCache::CachedBlock>
+VmBytecodeCache::put_shared(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block) {
+    auto shared_blk = std::make_shared<CachedBlock>(std::move(block));
     std::lock_guard<std::mutex> lock(mutex_);
     const Key key{context_id, block_start_pc};
     auto it = index_.find(key);
     if (it != index_.end()) {
-        const std::size_t old_sz = it->second->block.byte_size();
-        wipe_block(it->second->block);
+        const std::size_t old_sz = it->second->block->byte_size();
+        wipe_block(*it->second->block);
         stats_.current_bytes = (stats_.current_bytes >= old_sz) ? (stats_.current_bytes - old_sz) : 0;
-        it->second->block = std::move(block);
-        stats_.current_bytes += it->second->block.byte_size();
+        it->second->block = shared_blk;
+        stats_.current_bytes += shared_blk->byte_size();
         if (stats_.current_bytes > stats_.peak_bytes) stats_.peak_bytes = stats_.current_bytes;
-        lru_.splice(lru_.begin(), lru_, it->second);
-        return;
+        if (it->second != lru_.begin()) {
+            lru_.splice(lru_.begin(), lru_, it->second);
+        }
+        return shared_blk;
     }
 
-    const std::size_t new_sz = block.byte_size();
+    const std::size_t new_sz = shared_blk->byte_size();
     while (!lru_.empty() &&
            ((max_entries_ > 0 && lru_.size() >= max_entries_) ||
             (max_bytes_ > 0 && stats_.current_bytes + new_sz > max_bytes_))) {
         evict_lru_locked();
     }
 
-    lru_.push_front(LruNode{key, std::move(block)});
+    lru_.push_front(LruNode{key, shared_blk});
     index_[key] = lru_.begin();
     stats_.current_bytes += new_sz;
     if (stats_.current_bytes > stats_.peak_bytes) stats_.peak_bytes = stats_.current_bytes;
     stats_.cached_blocks = lru_.size();
+    return shared_blk;
+}
+
+void VmBytecodeCache::put(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block) {
+    (void)put_shared(context_id, block_start_pc, std::move(block));
 }
 
 void VmBytecodeCache::invalidate_context(std::uint64_t context_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = lru_.begin(); it != lru_.end();) {
         if (it->key.context_id == context_id) {
-            const std::size_t sz = it->block.byte_size();
-            wipe_block(it->block);
+            const std::size_t sz = it->block->byte_size();
+            wipe_block(*it->block);
             index_.erase(it->key);
             it = lru_.erase(it);
             stats_.current_bytes = (stats_.current_bytes >= sz) ? (stats_.current_bytes - sz) : 0;
@@ -1463,7 +1481,7 @@ void VmBytecodeCache::invalidate_context(std::uint64_t context_id) {
 void VmBytecodeCache::invalidate_all() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& node : lru_) {
-        wipe_block(node.block);
+        wipe_block(*node.block);
         ++stats_.invalidations;
     }
     lru_.clear();
@@ -1699,11 +1717,8 @@ VmInterpreter::execute_lazy(std::size_t total_insns,
         }
         const std::size_t blk_start = *(--it);
 
-        auto cached_opt = cache.get(context_id, blk_start);
-        VmBytecodeCache::CachedBlock cur_blk;
-        if (cached_opt.has_value()) {
-            cur_blk = std::move(*cached_opt);
-        } else {
+        auto cur_blk_ptr = cache.get_shared(context_id, blk_start);
+        if (!cur_blk_ptr) {
             auto fetched = fetcher(blk_start);
             if (!fetched) {
                 finalize_state();
@@ -1716,9 +1731,9 @@ VmInterpreter::execute_lazy(std::size_t total_insns,
                 return core::diagnostics::Result<VmExecState>::err(
                     dec.error().code, dec.error().message, dec.error().context);
             }
-            cur_blk = std::move(dec.value());
-            cache.put(context_id, blk_start, cur_blk);
+            cur_blk_ptr = cache.put_shared(context_id, blk_start, std::move(dec.value()));
         }
+        const auto& cur_blk = *cur_blk_ptr;
 
         if (cur_blk.has_mem_ops) ensure_memory();
         const std::size_t blk_end = blk_start + cur_blk.insns.size();

@@ -94,7 +94,8 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     }
 
     detail::SharedRuntimeOptions rt_opts;
-    rt_opts.encrypt_bytecode = options.encrypt_bytecode || (options.profile == ProtectionProfile::Maximum);
+    rt_opts.lazy_bytecode = (options.bytecode_mode == BytecodeMode::Lazy);
+    rt_opts.encrypt_bytecode = options.encrypt_bytecode || (options.profile == ProtectionProfile::Maximum) || rt_opts.lazy_bytecode;
     rt_opts.seed = options.seed;
 
     SharedRuntimeLayout rt_layout;

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0] - 2026-11-24
+
+### Adicionado
+- **Native Lazy VM Runtime (`.bmrt` PIC x86-64 e ARM64):**
+  - Execução lazy por bloco básico diretamente no runtime nativo PIC (`emit_shared_pic_x64_vm_runtime` e `emit_shared_pic_arm64_vm_runtime` com `SharedRuntimeOptions::lazy_bytecode`), sem fallback para modo eager quando `--bytecode-mode lazy` está ativo nos rewriters PE/ELF/Mach-O.
+  - Descritor lazy embutido por função (`[total_insns][num_blocks]` + tabela de blocos com `start_pc`, `insn_count`, `rel_key_off`, `rel_blob_off`), chave por bloco via `CryptoAead::derive_block_key`, blob `BMBC` v2, verificação Poly1305 sob demanda e cache por bitmap na stack com zeragem completa em `l_exit_wipe` / `l_a64_exit_wipe` e sentinela `0xDEADAEADDEADAEAD` em falha de autenticação.
+- **Lazy VM Performance 2.0:**
+  - `CryptoAead::open_into` sem cópia de ciphertext/plaintext, `LazyBytecodeEngine::open_block` com buffers na stack (sem alocações heap para AAD/plaintext em blocos até 4096B), pré-cálculo único de `inv_table` + `std::lower_bound` em `execute_lazy` e `VmBytecodeCache::get_shared`/`put_shared` zero-copy com `std::shared_ptr<const CachedBlock>`.
+- **Call Bridge 2.0 & Windows ARM64:**
+  - `build_authorized_call_targets` expandido para alvos em seções `.plt`/`.plt.got`/`.plt.sec`/`.idata`/`.didat`/`__stubs`/`__stub_helper`/`__la_symbol_ptr`/`__got`.
+- **CLI v0.14 & Testes:**
+  - `protection-info --blocks --cache`, `benchmark-protection --native-lazy`, `report --format json` com `"native_lazy_runtime"`, e 4 novos testes `ProtectionV014Test` (97 testes C++ + 3 testes Rust aprovados).
+
 ## [0.13.0] - 2026-11-24
 
 ### Adicionado

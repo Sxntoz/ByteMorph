@@ -79,6 +79,7 @@ emit_pic_arm64_vm_runtime(const virt::BvmProgram& prog);
 
 struct SharedRuntimeOptions {
     bool encrypt_bytecode{false};
+    bool lazy_bytecode{false};
     std::uint64_t seed{0};
     std::string key_domain{"ByteMorph-v0.10-Runtime"};
 };

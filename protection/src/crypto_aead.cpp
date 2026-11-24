@@ -97,27 +97,50 @@ CryptoAead::seal(std::span<const std::uint8_t> plaintext,
     return box;
 }
 
+core::diagnostics::Result<void>
+CryptoAead::open_into(std::span<const std::uint8_t> ciphertext,
+                      const AeadNonce& nonce,
+                      const std::array<std::uint8_t, 16>& mac,
+                      std::span<const std::uint8_t> associated_data,
+                      const AeadKey& key,
+                      std::span<std::uint8_t> out_plaintext) {
+    if (out_plaintext.size() < ciphertext.size()) {
+        return core::diagnostics::Result<void>::err(
+            core::diagnostics::ErrorCode::OutOfBounds,
+            "Output plaintext buffer smaller than ciphertext",
+            "CryptoAead::open_into");
+    }
+    const int rc = crypto_aead_unlock(
+        out_plaintext.data(),
+        mac.data(),
+        key.bytes.data(),
+        nonce.bytes.data(),
+        associated_data.data(),
+        associated_data.size(),
+        ciphertext.data(),
+        ciphertext.size());
+
+    if (rc != 0) {
+        if (!ciphertext.empty()) {
+            crypto_wipe(out_plaintext.data(), ciphertext.size());
+        }
+        return core::diagnostics::Result<void>::err(
+            core::diagnostics::ErrorCode::ParseError,
+            "AEAD authentication tag verification failed (tampered or wrong key)",
+            "CryptoAead::open_into");
+    }
+    return core::diagnostics::Result<void>::ok();
+}
+
 core::diagnostics::Result<std::vector<std::uint8_t>>
 CryptoAead::open(const AeadSealedBox& box,
                  std::span<const std::uint8_t> associated_data,
                  const AeadKey& key) {
     std::vector<std::uint8_t> plaintext(box.ciphertext.size());
-    const int rc = crypto_aead_unlock(
-        plaintext.data(),
-        box.mac.data(),
-        key.bytes.data(),
-        box.nonce.bytes.data(),
-        associated_data.data(),
-        associated_data.size(),
-        box.ciphertext.data(),
-        box.ciphertext.size());
-
-    if (rc != 0) {
-        crypto_wipe(plaintext.data(), plaintext.size());
+    auto res = open_into(box.ciphertext, box.nonce, box.mac, associated_data, key, plaintext);
+    if (!res) {
         return core::diagnostics::Result<std::vector<std::uint8_t>>::err(
-            core::diagnostics::ErrorCode::ParseError,
-            "AEAD authentication tag verification failed (tampered or wrong key)",
-            "CryptoAead::open");
+            res.error().code, res.error().message, "CryptoAead::open");
     }
     return plaintext;
 }

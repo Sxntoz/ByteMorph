@@ -16,3 +16,12 @@ A v0.13.0 introduz o modo experimental `--bytecode-mode lazy`, dividindo funçõ
 - **LRU com Limites Configuráveis:** `max_bytes` (padrão `64 KiB`) e `max_entries` (padrão `128` blocos), com mutex para segurança multithread e compatibilidade com recursão/loops.
 - **Limpeza Segura:** buffers de instruções despejados por LRU, invalidação (`invalidate_context` / `invalidate_all`) ou destruição são zerados via escrita `volatile`.
 - **Fallback Controlado:** `--bytecode-mode eager` permanece disponível como padrão estável de menor latência.
+
+## Native Lazy VM Runtime (`v0.14.0`)
+
+A partir da **v0.14.0**, `--bytecode-mode lazy` executa de forma **nativa e autenticada dentro do runtime PIC `.bmrt`** (x86-64 e ARM64), sem fallback para descriptografia *eager*:
+
+- **Layout Embutido por Função:** `[total_insns (u32)][num_blocks (u32)]` seguido pela tabela de blocos `{start_pc, insn_count, rel_key_off, rel_blob_off}` e pelos pares `(block_key[32], BMBC v2 blob)` derivados via `CryptoAead::derive_block_key`.
+- **Fast-Path & Bitmap na Stack:** o loop da VM verifica `[cur_blk_start, cur_blk_end)` sem custo criptográfico dentro de loops/blocos; ao trocar de bloco, `l_lazy_resolve` consulta o bitmap na stack e só chama `l_aead_open` (XChaCha20-Poly1305) em *cache miss*.
+- **Falha & Wipe:** qualquer falha de tag Poly1305 salta para `l_aead_fail`, limpa o buffer e o bitmap na stack e retorna `0xDEADAEADDEADAEAD`.
+- **Lazy VM Performance 2.0:** `CryptoAead::open_into` zero-copy, buffers de bloco na stack (`<= 4096 B`) em `LazyBytecodeEngine::open_block`, `std::lower_bound` na tabela de blocos e `VmBytecodeCache::get_shared`/`put_shared` com `std::shared_ptr<const CachedBlock>`.

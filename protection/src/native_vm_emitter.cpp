@@ -50,6 +50,51 @@ std::uint32_t read_u32(std::span<const std::uint8_t> d, std::size_t off) noexcep
     return v;
 }
 
+struct LazyBlockRange {
+    std::uint32_t start_pc{0};
+    std::uint32_t insn_count{0};
+};
+
+std::vector<LazyBlockRange> split_vm_basic_blocks(const BvmProgram& prog) {
+    std::vector<LazyBlockRange> blocks;
+    const std::size_t n = prog.instructions.size();
+    if (n == 0) return blocks;
+
+    std::vector<bool> is_leader(n, false);
+    is_leader[0] = true;
+    for (std::size_t pc = 0; pc < n; ++pc) {
+        const auto& insn = prog.instructions[pc];
+        const bool is_branch = (insn.opcode == VmOpcode::Jmp || insn.opcode == VmOpcode::Jeq ||
+                                insn.opcode == VmOpcode::Jne || insn.opcode == VmOpcode::Jlt ||
+                                insn.opcode == VmOpcode::Jle || insn.opcode == VmOpcode::Jgt ||
+                                insn.opcode == VmOpcode::Jge);
+        if (is_branch) {
+            if (insn.imm >= 0 && static_cast<std::size_t>(insn.imm) < n) {
+                is_leader[static_cast<std::size_t>(insn.imm)] = true;
+            }
+            if (pc + 1 < n) is_leader[pc + 1] = true;
+        } else if (insn.opcode == VmOpcode::Ret) {
+            if (pc + 1 < n) is_leader[pc + 1] = true;
+        }
+    }
+
+    std::size_t cur_start = 0;
+    for (std::size_t pc = 1; pc < n; ++pc) {
+        if (is_leader[pc]) {
+            blocks.push_back(LazyBlockRange{
+                static_cast<std::uint32_t>(cur_start),
+                static_cast<std::uint32_t>(pc - cur_start)
+            });
+            cur_start = pc;
+        }
+    }
+    blocks.push_back(LazyBlockRange{
+        static_cast<std::uint32_t>(cur_start),
+        static_cast<std::uint32_t>(n - cur_start)
+    });
+    return blocks;
+}
+
 std::uint64_t read_u64(std::span<const std::uint8_t> d, std::size_t off) noexcept {
     std::uint64_t v = 0;
     for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(d[off + i]) << (i * 8);
@@ -286,7 +331,7 @@ build_authorized_call_targets(const core::binary::IBinaryFile& bin,
             targets.insert(fn.entry_va);
         }
     }
-    // 2. Verified imports (Windows IAT slots / Linux PLT-GOT / macOS stubs)
+    // 2. Verified imports (Windows IAT/delayed IAT slots, Linux PLT-GOT/versioned, macOS stubs)
     for (const auto& imp : bin.imports()) {
         if (imp.address != 0) {
             targets.insert(imp.address);
@@ -301,6 +346,28 @@ build_authorized_call_targets(const core::binary::IBinaryFile& bin,
     for (const auto& exp : bin.exports()) {
         if (!exp.is_forwarded && exp.address != 0) {
             targets.insert(exp.address);
+        }
+    }
+    // 4. Call Bridge 2.0: direct call targets inside PLT/stub/lazy-pointer sections
+    for (const auto& fn : analysis.functions) {
+        for (const auto& blk : fn.blocks) {
+            for (const auto& insn : blk.instructions) {
+                if (insn.flow == core::analysis::ControlFlowKind::Call && insn.branch_target.has_value()) {
+                    const std::uint64_t dst = *insn.branch_target;
+                    for (const auto& sec : bin.sections()) {
+                        if (sec.virtual_size == 0) continue;
+                        if (dst >= sec.virtual_address && dst < sec.virtual_address + sec.virtual_size) {
+                            if (sec.name == ".plt" || sec.name == ".plt.got" || sec.name == ".plt.sec" ||
+                                sec.name == ".idata" || sec.name == ".didat" ||
+                                sec.name == "__stubs" || sec.name == "__stub_helper" ||
+                                sec.name == "__la_symbol_ptr" || sec.name == "__got") {
+                                targets.insert(dst);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     return targets;
@@ -326,8 +393,9 @@ bool is_in_import_or_plt_section(const core::binary::IBinaryFile& bin, std::uint
         if (sec.virtual_size == 0) continue;
         if (va >= sec.virtual_address && va < sec.virtual_address + sec.virtual_size) {
             if (sec.name == ".plt" || sec.name == ".plt.got" || sec.name == ".plt.sec" ||
-                sec.name == ".idata" || sec.name == "__stubs" || sec.name == "__stub_helper" ||
-                sec.name == "__got") {
+                sec.name == ".idata" || sec.name == ".didat" ||
+                sec.name == "__stubs" || sec.name == "__stub_helper" ||
+                sec.name == "__la_symbol_ptr" || sec.name == "__got") {
                 return true;
             }
         }
@@ -1449,11 +1517,18 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     l_bytecodes.reserve(progs.size());
     std::size_t max_plain_bytes = 0;
     bool has_simd = false;
+    const bool is_lazy = rt_opts.encrypt_bytecode && rt_opts.lazy_bytecode;
+    std::vector<std::vector<LazyBlockRange>> prog_blocks(progs.size());
+    std::size_t max_blocks = 1;
     for (std::size_t i = 0; i < progs.size(); ++i) {
         l_stubs.push_back(a.new_label());
         l_bytecodes.push_back(a.new_label());
         const std::size_t pbytes = 4 + progs[i].instructions.size() * 12;
         if (pbytes > max_plain_bytes) max_plain_bytes = pbytes;
+        if (is_lazy) {
+            prog_blocks[i] = split_vm_basic_blocks(progs[i]);
+            if (prog_blocks[i].size() > max_blocks) max_blocks = prog_blocks[i].size();
+        }
         for (const auto& insn : progs[i].instructions) {
             if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VOr) {
                 has_simd = true;
@@ -1464,7 +1539,10 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     const std::size_t plain_buf_bytes = rt_opts.encrypt_bytecode
         ? static_cast<std::size_t>(align_up(std::max<std::size_t>(max_plain_bytes, 64), 16))
         : 0;
+    const std::size_t lazy_bitmap_bytes = is_lazy ? static_cast<std::size_t>(align_up(max_blocks, 16)) : 0;
     Label l_vm_loop = a.new_label();
+    Label l_vm_loop_fetch = a.new_label();
+    Label l_lazy_resolve = a.new_label();
     Label l_vm_done = a.new_label();
     Label l_take_branch = a.new_label();
 
@@ -1543,9 +1621,12 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.lea(x86::r13, x86::ptr(x86::r10, 4));
     }
 
-    const std::size_t total_frame_bytes = 1288 + vreg_buf_bytes + plain_buf_bytes;
+    const std::size_t lazy_meta_bytes = is_lazy ? 16 : 0;
+    const std::size_t total_frame_bytes = 1288 + vreg_buf_bytes + plain_buf_bytes + lazy_meta_bytes + lazy_bitmap_bytes;
     const std::size_t plain_buf_off = 1288 + vreg_buf_bytes;
-    const std::size_t caller_arg_base = 1288 + vreg_buf_bytes + plain_buf_bytes + saved_xmm_bytes + 64;
+    const std::size_t lazy_meta_off = plain_buf_off + plain_buf_bytes;
+    const std::size_t lazy_bitmap_off = lazy_meta_off + lazy_meta_bytes;
+    const std::size_t caller_arg_base = total_frame_bytes + saved_xmm_bytes + 64;
     // Probe stack guard pages in 4KB steps before touching deep stack on Windows
     if (total_frame_bytes >= 4096) {
         for (std::size_t step = 4096; step <= total_frame_bytes; step += 4096) {
@@ -1564,6 +1645,11 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.mov(x86::rdi, x86::rsp);
     a.mov(x86::ecx, 161);
     a.rep().stosq();
+    if (is_lazy) {
+        a.lea(x86::rdi, x86::ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off)));
+        a.mov(x86::ecx, static_cast<std::uint32_t>((lazy_meta_bytes + lazy_bitmap_bytes) / 8));
+        a.rep().stosq();
+    }
     a.mov(x86::rcx, x86::r11);
 
     // Initialize virtual stack pointer R4 (rsp) and frame pointer R5 (rbp) to [rsp + 896]
@@ -1604,7 +1690,11 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         }
     }
 
-    if (rt_opts.encrypt_bytecode) {
+    if (is_lazy) {
+        a.mov(x86::qword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off + 8)), x86::r13);
+        a.mov(x86::r12d, x86::dword_ptr(x86::r13, 0));
+        a.lea(x86::r13, x86::ptr(x86::rsp, static_cast<std::int32_t>(plain_buf_off)));
+    } else if (rt_opts.encrypt_bytecode) {
         a.lea(x86::r11, x86::ptr(l_crypto_key));
         a.lea(x86::r14, x86::ptr(x86::rsp, static_cast<std::int32_t>(plain_buf_off)));
         a.call(l_aead_open);
@@ -1620,6 +1710,13 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.bind(l_vm_loop);
     a.cmp(x86::r14d, x86::r12d);
     a.jae(l_vm_done);
+    if (is_lazy) {
+        a.cmp(x86::r14d, x86::dword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off)));
+        a.jb(l_lazy_resolve);
+        a.cmp(x86::r14d, x86::dword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off + 4)));
+        a.jae(l_lazy_resolve);
+        a.bind(l_vm_loop_fetch);
+    }
 
     a.imul(x86::rbx, x86::r14, 12);
     a.add(x86::rbx, x86::r13);
@@ -2144,6 +2241,66 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.inc(x86::r14d); a.jmp(l_vm_loop);
     }
 
+    if (is_lazy) {
+        Label l_scan_loop = a.new_label();
+        Label l_scan_next = a.new_label();
+        Label l_scan_found = a.new_label();
+        a.bind(l_lazy_resolve);
+        a.mov(x86::rsi, x86::qword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off + 8)));
+        a.mov(x86::ecx, x86::dword_ptr(x86::rsi, 4));
+        a.test(x86::ecx, x86::ecx);
+        a.jz(l_aead_fail);
+        a.xor_(x86::edx, x86::edx);
+        a.lea(x86::rdi, x86::ptr(x86::rsi, 8));
+        a.bind(l_scan_loop);
+        a.mov(x86::eax, x86::dword_ptr(x86::rdi, 0));
+        a.mov(x86::ebx, x86::dword_ptr(x86::rdi, 4));
+        a.add(x86::ebx, x86::eax);
+        a.cmp(x86::r14d, x86::eax);
+        a.jb(l_scan_next);
+        a.cmp(x86::r14d, x86::ebx);
+        a.jb(l_scan_found);
+        a.bind(l_scan_next);
+        a.add(x86::rdi, 16);
+        a.inc(x86::edx);
+        a.cmp(x86::edx, x86::ecx);
+        a.jb(l_scan_loop);
+        a.jmp(l_aead_fail);
+
+        a.bind(l_scan_found);
+        a.mov(x86::dword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off)), x86::eax);
+        a.mov(x86::dword_ptr(x86::rsp, static_cast<std::int32_t>(lazy_meta_off + 4)), x86::ebx);
+        a.cmp(x86::byte_ptr(x86::rsp, x86::rdx, 0, static_cast<std::int32_t>(lazy_bitmap_off)), 0);
+        a.jne(l_vm_loop_fetch);
+
+        a.mov(x86::r11d, x86::dword_ptr(x86::rdi, 8));
+        a.add(x86::r11, x86::rsi);
+        a.mov(x86::r8d, x86::dword_ptr(x86::rdi, 12));
+        a.add(x86::r8, x86::rsi);
+        a.imul(x86::r9, x86::rax, 12);
+        a.add(x86::r9, x86::r13);
+        a.push(x86::r12);
+        a.push(x86::r13);
+        a.push(x86::r14);
+        a.push(x86::r15);
+        a.push(x86::rdx);
+        a.sub(x86::rsp, 8);
+        a.mov(x86::r13, x86::r8);
+        a.mov(x86::r14, x86::r9);
+        a.call(l_aead_open);
+        a.mov(x86::rcx, x86::rax);
+        a.add(x86::rsp, 8);
+        a.pop(x86::rdx);
+        a.pop(x86::r15);
+        a.pop(x86::r14);
+        a.pop(x86::r13);
+        a.pop(x86::r12);
+        a.test(x86::rcx, x86::rcx);
+        a.jnz(l_aead_fail);
+        a.mov(x86::byte_ptr(x86::rsp, x86::rdx, 0, static_cast<std::int32_t>(lazy_bitmap_off)), 1);
+        a.jmp(l_vm_loop_fetch);
+    }
+
     a.bind(l_op_ret);
     a.bind(l_vm_done);
     if (has_simd) {
@@ -2158,7 +2315,7 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.bind(l_exit_wipe);
         a.xor_(x86::ecx, x86::ecx);
         a.lea(x86::rdi, x86::ptr(x86::rsp, static_cast<std::int32_t>(plain_buf_off)));
-        a.mov(x86::edx, static_cast<std::uint32_t>(plain_buf_bytes / 8));
+        a.mov(x86::edx, static_cast<std::uint32_t>((plain_buf_bytes + lazy_meta_bytes + lazy_bitmap_bytes) / 8));
         Label l_wipe_loop = a.new_label();
         a.bind(l_wipe_loop);
         a.mov(x86::qword_ptr(x86::rdi), x86::rcx);
@@ -2198,8 +2355,68 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     for (std::size_t i = 0; i < progs.size(); ++i) {
         a.align(AlignMode::kData, 8);
         a.bind(l_bytecodes[i]);
-        std::vector<std::uint8_t> plain_bytes;
         const std::uint32_t insn_count = static_cast<std::uint32_t>(progs[i].instructions.size());
+        if (is_lazy) {
+            const auto& blocks = prog_blocks[i];
+            const std::uint32_t num_blocks = static_cast<std::uint32_t>(blocks.size());
+            std::vector<std::uint8_t> hdr_tbl;
+            write_u32(hdr_tbl, insn_count);
+            write_u32(hdr_tbl, num_blocks);
+            std::vector<std::uint8_t> payload;
+            const std::uint32_t payload_base = 8u + num_blocks * 16u;
+            for (std::uint32_t b = 0; b < num_blocks; ++b) {
+                const auto& br = blocks[b];
+                std::vector<std::uint8_t> blk_plain;
+                blk_plain.reserve(static_cast<std::size_t>(br.insn_count) * 12);
+                for (std::uint32_t k = 0; k < br.insn_count; ++k) {
+                    const auto& insn = progs[i].instructions[br.start_pc + k];
+                    std::uint8_t raw[12]{};
+                    raw[0] = static_cast<std::uint8_t>(insn.opcode);
+                    raw[1] = insn.dst;
+                    raw[2] = insn.src1;
+                    raw[3] = insn.src2;
+                    const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
+                    std::memcpy(raw + 4, &imm_u, 8);
+                    blk_plain.insert(blk_plain.end(), raw, raw + sizeof(raw));
+                }
+                auto blk_key = CryptoAead::derive_block_key(rt_key, static_cast<std::uint32_t>(i), b);
+                std::vector<std::uint8_t> aad;
+                write_u32(aad, kBmbcMagic);
+                write_u32(aad, kBmbcVersion);
+                write_u32(aad, b);
+                write_u32(aad, static_cast<std::uint32_t>(blk_plain.size()));
+                const auto nonce = CryptoAead::generate_nonce(
+                    rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)),
+                    (static_cast<std::uint64_t>(i) << 16) | b);
+                auto sealed = CryptoAead::seal(blk_plain, aad, blk_key, nonce);
+                CryptoAead::secure_wipe(blk_plain);
+                if (!sealed) {
+                    CryptoAead::secure_wipe(blk_key.bytes);
+                    CryptoAead::secure_wipe(rt_key.bytes);
+                    return diagnostics::Result<std::vector<std::uint8_t>>::err(
+                        sealed.error().code, sealed.error().message, "emit_shared_pic_x64_vm_runtime");
+                }
+                const std::uint32_t rel_key_off = payload_base + static_cast<std::uint32_t>(payload.size());
+                payload.insert(payload.end(), blk_key.bytes.begin(), blk_key.bytes.end());
+                CryptoAead::secure_wipe(blk_key.bytes);
+                const std::uint32_t rel_blob_off = payload_base + static_cast<std::uint32_t>(payload.size());
+                payload.insert(payload.end(), aad.begin(), aad.end());
+                payload.insert(payload.end(), sealed.value().nonce.bytes.begin(), sealed.value().nonce.bytes.end());
+                payload.insert(payload.end(), sealed.value().mac.begin(), sealed.value().mac.end());
+                payload.insert(payload.end(), sealed.value().ciphertext.begin(), sealed.value().ciphertext.end());
+
+                write_u32(hdr_tbl, br.start_pc);
+                write_u32(hdr_tbl, br.insn_count);
+                write_u32(hdr_tbl, rel_key_off);
+                write_u32(hdr_tbl, rel_blob_off);
+            }
+            a.embed(hdr_tbl.data(), hdr_tbl.size());
+            if (!payload.empty()) {
+                a.embed(payload.data(), payload.size());
+            }
+            continue;
+        }
+        std::vector<std::uint8_t> plain_bytes;
         write_u32(plain_bytes, insn_count);
         for (const auto& insn : progs[i].instructions) {
             std::uint8_t raw[12]{};
@@ -2638,11 +2855,18 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     l_bytecodes.reserve(progs.size());
     std::size_t max_plain_bytes = 0;
     bool has_simd = false;
+    const bool is_lazy = rt_opts.encrypt_bytecode && rt_opts.lazy_bytecode;
+    std::vector<std::vector<LazyBlockRange>> prog_blocks(progs.size());
+    std::size_t max_blocks = 1;
     for (std::size_t i = 0; i < progs.size(); ++i) {
         l_stubs.push_back(a.new_label());
         l_bytecodes.push_back(a.new_label());
         const std::size_t pbytes = 4 + progs[i].instructions.size() * 12;
         if (pbytes > max_plain_bytes) max_plain_bytes = pbytes;
+        if (is_lazy) {
+            prog_blocks[i] = split_vm_basic_blocks(progs[i]);
+            if (prog_blocks[i].size() > max_blocks) max_blocks = prog_blocks[i].size();
+        }
         for (const auto& insn : progs[i].instructions) {
             if (insn.opcode >= VmOpcode::VMovReg && insn.opcode <= VmOpcode::VOr) {
                 has_simd = true;
@@ -2653,7 +2877,10 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     const std::size_t plain_buf_bytes = rt_opts.encrypt_bytecode
         ? static_cast<std::size_t>(align_up(std::max<std::size_t>(max_plain_bytes, 64), 16))
         : 0;
+    const std::size_t lazy_bitmap_bytes = is_lazy ? static_cast<std::size_t>(align_up(max_blocks, 16)) : 0;
     Label l_vm_loop = a.new_label();
+    Label l_vm_loop_fetch = a.new_label();
+    Label l_lazy_resolve = a.new_label();
     Label l_vm_done = a.new_label();
     Label l_take_branch = a.new_label();
 
@@ -2715,8 +2942,9 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.stp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
     a.stp(a64::x25, a64::x26, a64::ptr(a64::sp, 64));
     a.stp(a64::x27, a64::x28, a64::ptr(a64::sp, 80));
-    const std::size_t total_frame_bytes = 1280 + vreg_buf_bytes + plain_buf_bytes;
+    const std::size_t total_frame_bytes = 1280 + vreg_buf_bytes + plain_buf_bytes + (is_lazy ? lazy_bitmap_bytes : 0);
     const std::size_t plain_buf_off = 1280 + vreg_buf_bytes;
+    const std::size_t lazy_bitmap_off = plain_buf_off + plain_buf_bytes;
     if (total_frame_bytes >= 4096) {
         for (std::size_t step = 4096; step <= total_frame_bytes; step += 4096) {
             a.sub(a64::sp, a64::sp, 4096);
@@ -2736,6 +2964,16 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.stp(a64::xzr, a64::xzr, a64::ptr_post(a64::x10, 16));
     a.subs(a64::w11, a64::w11, 1);
     a.b_ne(l_zero);
+    if (is_lazy) {
+        a.mov(a64::w15, static_cast<std::uint32_t>(lazy_bitmap_off));
+        a.add(a64::x10, a64::sp, a64::x15);
+        a.mov(a64::w11, static_cast<std::uint32_t>(lazy_bitmap_bytes / 16));
+        Label l_zero_bmp = a.new_label();
+        a.bind(l_zero_bmp);
+        a.stp(a64::xzr, a64::xzr, a64::ptr_post(a64::x10, 16));
+        a.subs(a64::w11, a64::w11, 1);
+        a.b_ne(l_zero_bmp);
+    }
 
     // Initialize virtual stack pointer R4 (sp) and frame pointer R5 (x29) to sp + 896
     a.add(a64::x10, a64::sp, 896);
@@ -2757,7 +2995,15 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         }
     }
 
-    if (rt_opts.encrypt_bytecode) {
+    if (is_lazy) {
+        a.mov(a64::x26, a64::x16);
+        a.ldr(a64::w20, a64::ptr(a64::x26, 0));
+        a.mov(a64::w15, static_cast<std::uint32_t>(plain_buf_off));
+        a.add(a64::x21, a64::sp, a64::x15);
+        a.mov(a64::x19, a64::x21);
+        a.mov(a64::w24, 0);
+        a.mov(a64::w25, 0);
+    } else if (rt_opts.encrypt_bytecode) {
         a.mov(a64::x0, a64::x16);
         a.adr(a64::x1, l_crypto_key);
         a.add(a64::x2, a64::sp, static_cast<std::uint32_t>(plain_buf_off));
@@ -2777,6 +3023,13 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.bind(l_vm_loop);
     a.cmp(a64::w22, a64::w20);
     a.b_hs(l_vm_done);
+    if (is_lazy) {
+        a.cmp(a64::w22, a64::w24);
+        a.b_lo(l_lazy_resolve);
+        a.cmp(a64::w22, a64::w25);
+        a.b_hs(l_lazy_resolve);
+        a.bind(l_vm_loop_fetch);
+    }
 
     // x9 = x21 + x22 * 12
     a.mov(a64::w10, 12);
@@ -3238,6 +3491,54 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     }
 
+    if (is_lazy) {
+        Label l_a64_scan = a.new_label();
+        Label l_a64_next = a.new_label();
+        Label l_a64_found = a.new_label();
+        a.bind(l_lazy_resolve);
+        a.ldr(a64::w9, a64::ptr(a64::x26, 4));
+        a.cbz(a64::w9, l_aead_fail);
+        a.mov(a64::w27, 0);
+        a.add(a64::x12, a64::x26, 8);
+        a.bind(l_a64_scan);
+        a.ldr(a64::w10, a64::ptr(a64::x12, 0));
+        a.ldr(a64::w11, a64::ptr(a64::x12, 4));
+        a.add(a64::w11, a64::w11, a64::w10);
+        a.cmp(a64::w22, a64::w10);
+        a.b_lo(l_a64_next);
+        a.cmp(a64::w22, a64::w11);
+        a.b_lo(l_a64_found);
+        a.bind(l_a64_next);
+        a.add(a64::x12, a64::x12, 16);
+        a.add(a64::w27, a64::w27, 1);
+        a.cmp(a64::w27, a64::w9);
+        a.b_lo(l_a64_scan);
+        a.b(l_aead_fail);
+
+        a.bind(l_a64_found);
+        a.mov(a64::w24, a64::w10);
+        a.mov(a64::w25, a64::w11);
+        a.mov(a64::w15, static_cast<std::uint32_t>(lazy_bitmap_off));
+        a.add(a64::x14, a64::sp, a64::x15);
+        a.ldrb(a64::w13, a64::ptr(a64::x14, a64::x27));
+        a.cbnz(a64::w13, l_vm_loop_fetch);
+
+        a.ldr(a64::w15, a64::ptr(a64::x12, 8));
+        a.add(a64::x1, a64::x26, a64::x15);
+        a.ldr(a64::w15, a64::ptr(a64::x12, 12));
+        a.add(a64::x0, a64::x26, a64::x15);
+        a.mov(a64::w15, 12);
+        a.umull(a64::x2, a64::w24, a64::w15);
+        a.add(a64::x2, a64::x21, a64::x2);
+        a.bl(l_aead_open);
+        a.cbnz(a64::x0, l_aead_fail);
+        a.mov(a64::w15, static_cast<std::uint32_t>(lazy_bitmap_off));
+        a.add(a64::x14, a64::sp, a64::x15);
+        a.mov(a64::w15, 1);
+        a.strb(a64::w15, a64::ptr(a64::x14, a64::x27));
+        a.b(l_vm_loop_fetch);
+    }
+
     a.bind(l_op_ret);
     a.bind(l_vm_done);
     if (has_simd) {
@@ -3251,15 +3552,21 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
         // Set error sentinel
         a.mov(a64::x0, 0xDEADAEADDEADAEADULL);
         a.bind(l_a64_exit_wipe);
-        a.add(a64::x10, a64::sp, static_cast<std::uint32_t>(plain_buf_off));
-        a.mov(a64::w11, static_cast<std::uint32_t>(plain_buf_bytes / 8));
+        a.mov(a64::w15, static_cast<std::uint32_t>(plain_buf_off));
+        a.add(a64::x10, a64::sp, a64::x15);
+        a.mov(a64::w11, static_cast<std::uint32_t>((plain_buf_bytes + (is_lazy ? lazy_bitmap_bytes : 0)) / 8));
         Label l_a64_wipe = a.new_label();
         a.bind(l_a64_wipe);
         a.str(a64::xzr, a64::ptr_post(a64::x10, 8));
         a.subs(a64::w11, a64::w11, 1);
         a.b_ne(l_a64_wipe);
     }
-    a.add(a64::sp, a64::sp, static_cast<std::uint32_t>(total_frame_bytes));
+    if (total_frame_bytes <= 4095) {
+        a.add(a64::sp, a64::sp, static_cast<std::uint32_t>(total_frame_bytes));
+    } else {
+        a.mov(a64::w15, static_cast<std::uint32_t>(total_frame_bytes));
+        a.add(a64::sp, a64::sp, a64::x15);
+    }
     a.ldp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
     a.ldp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
     a.ldp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
@@ -3282,8 +3589,68 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     for (std::size_t i = 0; i < progs.size(); ++i) {
         a.align(AlignMode::kData, 8);
         a.bind(l_bytecodes[i]);
-        std::vector<std::uint8_t> plain_bytes;
         const std::uint32_t insn_count = static_cast<std::uint32_t>(progs[i].instructions.size());
+        if (is_lazy) {
+            const auto& blocks = prog_blocks[i];
+            const std::uint32_t num_blocks = static_cast<std::uint32_t>(blocks.size());
+            std::vector<std::uint8_t> hdr_tbl;
+            write_u32(hdr_tbl, insn_count);
+            write_u32(hdr_tbl, num_blocks);
+            std::vector<std::uint8_t> payload;
+            const std::uint32_t payload_base = 8u + num_blocks * 16u;
+            for (std::uint32_t b = 0; b < num_blocks; ++b) {
+                const auto& br = blocks[b];
+                std::vector<std::uint8_t> blk_plain;
+                blk_plain.reserve(static_cast<std::size_t>(br.insn_count) * 12);
+                for (std::uint32_t k = 0; k < br.insn_count; ++k) {
+                    const auto& insn = progs[i].instructions[br.start_pc + k];
+                    std::uint8_t raw[12]{};
+                    raw[0] = static_cast<std::uint8_t>(insn.opcode);
+                    raw[1] = insn.dst;
+                    raw[2] = insn.src1;
+                    raw[3] = insn.src2;
+                    const std::uint64_t imm_u = static_cast<std::uint64_t>(insn.imm);
+                    std::memcpy(raw + 4, &imm_u, 8);
+                    blk_plain.insert(blk_plain.end(), raw, raw + sizeof(raw));
+                }
+                auto blk_key = CryptoAead::derive_block_key(rt_key, static_cast<std::uint32_t>(i), b);
+                std::vector<std::uint8_t> aad;
+                write_u32(aad, kBmbcMagic);
+                write_u32(aad, kBmbcVersion);
+                write_u32(aad, b);
+                write_u32(aad, static_cast<std::uint32_t>(blk_plain.size()));
+                const auto nonce = CryptoAead::generate_nonce(
+                    rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)),
+                    (static_cast<std::uint64_t>(i) << 16) | b);
+                auto sealed = CryptoAead::seal(blk_plain, aad, blk_key, nonce);
+                CryptoAead::secure_wipe(blk_plain);
+                if (!sealed) {
+                    CryptoAead::secure_wipe(blk_key.bytes);
+                    CryptoAead::secure_wipe(rt_key.bytes);
+                    return diagnostics::Result<std::vector<std::uint8_t>>::err(
+                        sealed.error().code, sealed.error().message, "emit_shared_pic_x64_vm_runtime");
+                }
+                const std::uint32_t rel_key_off = payload_base + static_cast<std::uint32_t>(payload.size());
+                payload.insert(payload.end(), blk_key.bytes.begin(), blk_key.bytes.end());
+                CryptoAead::secure_wipe(blk_key.bytes);
+                const std::uint32_t rel_blob_off = payload_base + static_cast<std::uint32_t>(payload.size());
+                payload.insert(payload.end(), aad.begin(), aad.end());
+                payload.insert(payload.end(), sealed.value().nonce.bytes.begin(), sealed.value().nonce.bytes.end());
+                payload.insert(payload.end(), sealed.value().mac.begin(), sealed.value().mac.end());
+                payload.insert(payload.end(), sealed.value().ciphertext.begin(), sealed.value().ciphertext.end());
+
+                write_u32(hdr_tbl, br.start_pc);
+                write_u32(hdr_tbl, br.insn_count);
+                write_u32(hdr_tbl, rel_key_off);
+                write_u32(hdr_tbl, rel_blob_off);
+            }
+            a.embed(hdr_tbl.data(), hdr_tbl.size());
+            if (!payload.empty()) {
+                a.embed(payload.data(), payload.size());
+            }
+            continue;
+        }
+        std::vector<std::uint8_t> plain_bytes;
         write_u32(plain_bytes, insn_count);
         for (const auto& insn : progs[i].instructions) {
             std::uint8_t raw[12]{};

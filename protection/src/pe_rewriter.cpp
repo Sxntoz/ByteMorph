@@ -118,7 +118,8 @@ PeRewriter::protect_file(const std::filesystem::path& input,
 
     SharedRuntimeLayout rt_layout;
     detail::SharedRuntimeOptions rt_opts;
-    rt_opts.encrypt_bytecode = options.encrypt_bytecode || (options.profile == ProtectionProfile::Maximum);
+    rt_opts.lazy_bytecode = (options.bytecode_mode == BytecodeMode::Lazy);
+    rt_opts.encrypt_bytecode = options.encrypt_bytecode || (options.profile == ProtectionProfile::Maximum) || rt_opts.lazy_bytecode;
     rt_opts.seed = options.seed;
 
     auto runtime_bytes_res = is_arm64

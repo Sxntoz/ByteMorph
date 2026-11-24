@@ -2790,3 +2790,210 @@ TEST(ProtectionV013Test, DynamicLinkingAuthorizedCallTargetsResolution) {
     }
 #endif
 }
+
+TEST(ProtectionV014Test, NativePicLazyX64ExecutionAndEquivalence) {
+    using namespace bytemorph::virt;
+    using namespace bytemorph::prot::detail;
+
+#ifdef _WIN32
+    constexpr AbiKind abi = AbiKind::Win64;
+    constexpr std::uint8_t arg_reg = 1; // Win64 RCX -> R1
+#else
+    constexpr AbiKind abi = AbiKind::SysV_AMD64;
+    constexpr std::uint8_t arg_reg = 7; // SysV RDI -> R7
+#endif
+
+    BvmProgram prog;
+    prog.build_seed = 0x1401ULL;
+    // sum_{i=0}^{arg0-1} (i * 3 + 1) across 4 basic blocks
+    prog.instructions = {
+        {VmOpcode::MovImm, 3, 0, 0, 0},       // 0: R3 = acc = 0
+        {VmOpcode::MovImm, 2, 0, 0, 0},       // 1: R2 = i = 0
+        {VmOpcode::Cmp,    0, 2, arg_reg, 0}, // 2: cmp R2, arg0
+        {VmOpcode::Jge,    0, 0, 0, 11},      // 3 -> 11
+        {VmOpcode::MovImm, 8, 0, 0, 3},       // 4: R8 = 3
+        {VmOpcode::Mul,    9, 2, 8, 0},       // 5: R9 = i * 3
+        {VmOpcode::Add,    3, 3, 9, 0},       // 6: acc += i * 3
+        {VmOpcode::MovImm, 8, 0, 0, 1},       // 7: R8 = 1
+        {VmOpcode::Add,    3, 3, 8, 0},       // 8: acc += 1
+        {VmOpcode::Add,    2, 2, 8, 0},       // 9: i += 1
+        {VmOpcode::Jmp,    0, 0, 0, 2},       // 10 -> 2
+        {VmOpcode::MovReg, 0, 3, 0, 0},       // 11: R0 = acc
+        {VmOpcode::Ret,    0, 0, 0, 0},       // 12
+    };
+
+    SharedRuntimeOptions eager_opts;
+    eager_opts.encrypt_bytecode = true;
+    eager_opts.lazy_bytecode = false;
+    eager_opts.seed = 0xDEADBEEF14ULL;
+
+    SharedRuntimeOptions lazy_opts = eager_opts;
+    lazy_opts.lazy_bytecode = true;
+
+    SharedRuntimeLayout lay_eager, lay_lazy;
+    auto rt_eager = emit_shared_pic_x64_vm_runtime({prog}, abi, lay_eager, eager_opts);
+    auto rt_lazy = emit_shared_pic_x64_vm_runtime({prog}, abi, lay_lazy, lazy_opts);
+    ASSERT_TRUE(rt_eager.has_value());
+    ASSERT_TRUE(rt_lazy.has_value());
+    ASSERT_EQ(lay_lazy.entry_offsets.size(), 1u);
+
+#if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || (defined(__linux__) && defined(__x86_64__))
+    auto exec_pic = [](const std::vector<std::uint8_t>& code, std::size_t off, std::uint64_t arg) -> std::uint64_t {
+#ifdef _WIN32
+        void* mem = VirtualAlloc(nullptr, code.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        EXPECT_NE(mem, nullptr);
+        std::memcpy(mem, code.data(), code.size());
+        DWORD old_p = 0;
+        EXPECT_TRUE(VirtualProtect(mem, code.size(), PAGE_EXECUTE_READ, &old_p));
+        using Fn = std::uint64_t (*)(std::uint64_t);
+        const std::uint64_t r = reinterpret_cast<Fn>(static_cast<std::uint8_t*>(mem) + off)(arg);
+        VirtualFree(mem, 0, MEM_RELEASE);
+        return r;
+#else
+        void* mem = mmap(nullptr, code.size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        EXPECT_NE(mem, MAP_FAILED);
+        std::memcpy(mem, code.data(), code.size());
+        EXPECT_EQ(mprotect(mem, code.size(), PROT_READ | PROT_EXEC), 0);
+        using Fn = std::uint64_t (*)(std::uint64_t);
+        const std::uint64_t r = reinterpret_cast<Fn>(static_cast<std::uint8_t*>(mem) + off)(arg);
+        munmap(mem, code.size());
+        return r;
+#endif
+    };
+
+    for (const std::uint64_t n : {0ULL, 1ULL, 5ULL, 10ULL, 25ULL}) {
+        VmExecOptions vopts;
+        vopts.initial_regs[arg_reg] = n;
+        auto vm_res = VmInterpreter::execute(prog, vopts);
+        ASSERT_TRUE(vm_res.has_value());
+        const std::uint64_t got_eager = exec_pic(rt_eager.value(), lay_eager.entry_offsets[0], n);
+        const std::uint64_t got_lazy = exec_pic(rt_lazy.value(), lay_lazy.entry_offsets[0], n);
+        EXPECT_EQ(got_eager, vm_res.value().return_value);
+        EXPECT_EQ(got_lazy, vm_res.value().return_value);
+    }
+#endif
+}
+
+TEST(ProtectionV014Test, NativePicLazyTamperDetection) {
+    using namespace bytemorph::virt;
+    using namespace bytemorph::prot::detail;
+
+    BvmProgram prog;
+    prog.build_seed = 0x1402ULL;
+    prog.instructions = {
+        {VmOpcode::MovImm, 0, 0, 0, 777},
+        {VmOpcode::Ret,    0, 0, 0, 0},
+    };
+#ifdef _WIN32
+    constexpr AbiKind abi = AbiKind::Win64;
+#else
+    constexpr AbiKind abi = AbiKind::SysV_AMD64;
+#endif
+    SharedRuntimeOptions opts;
+    opts.encrypt_bytecode = true;
+    opts.lazy_bytecode = true;
+    opts.seed = 0x7A39E2ULL;
+    SharedRuntimeLayout layout;
+    auto rt_res = emit_shared_pic_x64_vm_runtime({prog}, abi, layout, opts);
+    ASSERT_TRUE(rt_res.has_value());
+    auto tampered = rt_res.value();
+    ASSERT_GT(tampered.size(), 16u);
+    tampered[tampered.size() - 4] ^= 0xFFu;
+
+#if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || (defined(__linux__) && defined(__x86_64__))
+#ifdef _WIN32
+    void* mem = VirtualAlloc(nullptr, tampered.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    ASSERT_NE(mem, nullptr);
+    std::memcpy(mem, tampered.data(), tampered.size());
+    DWORD old_p = 0;
+    ASSERT_TRUE(VirtualProtect(mem, tampered.size(), PAGE_EXECUTE_READ, &old_p));
+    using Fn = std::uint64_t (*)();
+    const std::uint64_t r = reinterpret_cast<Fn>(static_cast<std::uint8_t*>(mem) + layout.entry_offsets[0])();
+    VirtualFree(mem, 0, MEM_RELEASE);
+#else
+    void* mem = mmap(nullptr, tampered.size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    std::memcpy(mem, tampered.data(), tampered.size());
+    ASSERT_EQ(mprotect(mem, tampered.size(), PROT_READ | PROT_EXEC), 0);
+    using Fn = std::uint64_t (*)();
+    const std::uint64_t r = reinterpret_cast<Fn>(static_cast<std::uint8_t*>(mem) + layout.entry_offsets[0])();
+    munmap(mem, tampered.size());
+#endif
+    EXPECT_EQ(r, 0xDEADAEADDEADAEADULL);
+#endif
+}
+
+TEST(ProtectionV014Test, NativePicLazyArm64EmissionAndMultiFunction) {
+    using namespace bytemorph::virt;
+    using namespace bytemorph::prot::detail;
+
+    BvmProgram p0, p1, p2;
+    p0.instructions = {{VmOpcode::MovImm, 0, 0, 0, 11}, {VmOpcode::Ret, 0, 0, 0, 0}};
+    p1.instructions = {
+        {VmOpcode::Cmp, 0, 0, 0, 0},
+        {VmOpcode::Jeq, 0, 0, 0, 3},
+        {VmOpcode::MovImm, 0, 0, 0, 22},
+        {VmOpcode::Ret, 0, 0, 0, 0},
+    };
+    p2.instructions = {{VmOpcode::Add, 0, 0, 1, 0}, {VmOpcode::Ret, 0, 0, 0, 0}};
+
+    SharedRuntimeOptions opts;
+    opts.encrypt_bytecode = true;
+    opts.lazy_bytecode = true;
+    opts.seed = 0xA64140ULL;
+
+    SharedRuntimeLayout lay_lazy, lay_plain;
+    auto rt_lazy = emit_shared_pic_arm64_vm_runtime({p0, p1, p2}, lay_lazy, opts);
+    auto rt_plain = emit_shared_pic_arm64_vm_runtime({p0, p1, p2}, lay_plain, SharedRuntimeOptions{});
+    ASSERT_TRUE(rt_lazy.has_value());
+    ASSERT_TRUE(rt_plain.has_value());
+    EXPECT_EQ(lay_lazy.entry_offsets.size(), 3u);
+    EXPECT_EQ(rt_lazy.value().size() % 4, 0u);
+    EXPECT_GT(rt_lazy.value().size(), rt_plain.value().size());
+}
+
+TEST(ProtectionV014Test, RealBinaryLazyExecutionWithProtectedRuntime) {
+#if defined(_WIN32) && defined(BYTEMORPH_LAB_CPP_APP_PATH)
+    const std::filesystem::path app_exe(BYTEMORPH_LAB_CPP_APP_PATH);
+    if (!std::filesystem::exists(app_exe)) {
+        GTEST_SKIP() << "lab_cpp_app not built";
+    }
+    const auto out_exe = std::filesystem::temp_directory_path() / "lab_cpp_app_v014_lazy.exe";
+    bytemorph::prot::ProtectOptions opts;
+    opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+    opts.bytecode_mode = bytemorph::prot::BytecodeMode::Lazy;
+    opts.encrypt_bytecode = true;
+    opts.seed = 0x0140BEEFULL;
+
+    auto prot_res = bytemorph::prot::ProtectionEngine::protect(app_exe, out_exe, opts);
+    ASSERT_TRUE(prot_res.has_value()) << prot_res.error().to_string();
+    EXPECT_EQ(prot_res.value().bytecode_mode, bytemorph::prot::BytecodeMode::Lazy);
+    EXPECT_GT(prot_res.value().encrypted_blocks_count, 0u);
+
+    auto ver_res = bytemorph::prot::ProtectionEngine::verify(out_exe);
+    ASSERT_TRUE(ver_res.has_value()) << ver_res.error().to_string();
+    EXPECT_TRUE(ver_res.value().valid);
+    EXPECT_TRUE(ver_res.value().aead_authenticated);
+    EXPECT_GT(ver_res.value().blocks_verified_count, 0u);
+
+    auto run_capture = [](const std::filesystem::path& exe, int& rc) -> std::string {
+        std::string cmd = "\"\"" + exe.string() + "\"\"";
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) { rc = -1; return {}; }
+        char buf[256];
+        std::string out;
+        while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+        rc = _pclose(pipe);
+        return out;
+    };
+    int rc_orig = -1, rc_prot = -1;
+    const std::string out_orig = run_capture(app_exe, rc_orig);
+    const std::string out_prot = run_capture(out_exe, rc_prot);
+    EXPECT_EQ(rc_orig, 0);
+    EXPECT_EQ(rc_prot, 0);
+    EXPECT_EQ(out_orig, out_prot);
+
+    std::error_code ec;
+    std::filesystem::remove(out_exe, ec);
+#endif
+}

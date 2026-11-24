@@ -50,6 +50,14 @@ public:
          std::span<const std::uint8_t> associated_data,
          const AeadKey& key);
 
+    [[nodiscard]] static core::diagnostics::Result<void>
+    open_into(std::span<const std::uint8_t> ciphertext,
+              const AeadNonce& nonce,
+              const std::array<std::uint8_t, 16>& mac,
+              std::span<const std::uint8_t> associated_data,
+              const AeadKey& key,
+              std::span<std::uint8_t> out_plaintext);
+
     static void secure_wipe(std::span<std::uint8_t> buffer) noexcept;
 };
 

@@ -29,6 +29,99 @@ std::uint64_t read_u64(const std::uint8_t* p) noexcept {
     return v;
 }
 
+void write_u32_buf(std::uint8_t* p, std::uint32_t v) noexcept {
+    p[0] = static_cast<std::uint8_t>(v & 0xFFu);
+    p[1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+    p[2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+    p[3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+}
+
+std::array<std::uint8_t, 26> build_block_aad_array(std::uint32_t fn_index,
+                                                   std::uint32_t block_id,
+                                                   std::uint32_t start_pc,
+                                                   std::uint32_t insn_count,
+                                                   std::uint32_t plain_bytes) noexcept {
+    std::array<std::uint8_t, 26> aad{};
+    write_u32_buf(aad.data() + 0, LazyBlockRecord::kMagic);
+    aad[4] = static_cast<std::uint8_t>(LazyBlockRecord::kVersion & 0xFFu);
+    aad[5] = static_cast<std::uint8_t>((LazyBlockRecord::kVersion >> 8) & 0xFFu);
+    write_u32_buf(aad.data() + 6, fn_index);
+    write_u32_buf(aad.data() + 10, block_id);
+    write_u32_buf(aad.data() + 14, start_pc);
+    write_u32_buf(aad.data() + 18, insn_count);
+    write_u32_buf(aad.data() + 22, plain_bytes);
+    return aad;
+}
+
+core::diagnostics::Result<std::vector<virt::VmInstruction>>
+open_block_with_inv_table(const LazyBlockRecord& rec,
+                          const AeadKey& master_key,
+                          std::uint32_t expected_fn_index,
+                          const std::array<std::uint8_t, virt::BvmProgram::kOpcodeTableSize>& inv_table) {
+    using core::diagnostics::ErrorCode;
+
+    if (rec.fn_index != expected_fn_index) {
+        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
+            ErrorCode::ParseError, "Lazy block fn_index mismatch (possible block substitution)",
+            "LazyBytecodeEngine::open_block");
+    }
+    const std::size_t ct_size = rec.ciphertext.size();
+    if (rec.insn_count == 0 ||
+        ct_size != static_cast<std::size_t>(rec.insn_count) * virt::BvmProgram::kInstructionSize) {
+        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
+            ErrorCode::ParseError, "Lazy block size/instruction count mismatch",
+            "LazyBytecodeEngine::open_block");
+    }
+
+    const auto aad = build_block_aad_array(
+        rec.fn_index, rec.block_id, rec.start_pc, rec.insn_count,
+        static_cast<std::uint32_t>(ct_size));
+    if (CryptoAead::blake2b_256(aad) != rec.aad_hash) {
+        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
+            ErrorCode::ParseError, "Lazy block AAD hash mismatch", "LazyBytecodeEngine::open_block");
+    }
+
+    std::array<std::uint8_t, 4096> stack_plain{};
+    std::vector<std::uint8_t> heap_plain;
+    std::uint8_t* plain_ptr = stack_plain.data();
+    if (ct_size > stack_plain.size()) {
+        heap_plain.resize(ct_size);
+        plain_ptr = heap_plain.data();
+    }
+
+    AeadKey blk_key = CryptoAead::derive_block_key(master_key, rec.fn_index, rec.block_id, "bm.lazy.block.v1");
+    auto open_res = CryptoAead::open_into(
+        rec.ciphertext, rec.nonce, rec.mac, aad, blk_key, std::span<std::uint8_t>(plain_ptr, ct_size));
+    CryptoAead::secure_wipe(blk_key.bytes);
+
+    if (!open_res) {
+        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
+            open_res.error().code, open_res.error().message, "LazyBytecodeEngine::open_block");
+    }
+
+    std::vector<virt::VmInstruction> insns(rec.insn_count);
+    for (std::uint32_t i = 0; i < rec.insn_count; ++i) {
+        const std::uint8_t* p = plain_ptr + static_cast<std::size_t>(i) * virt::BvmProgram::kInstructionSize;
+        const std::uint8_t phys = p[0];
+        const std::uint8_t logical = (phys < virt::BvmProgram::kOpcodeTableSize) ? inv_table[phys] : 0xFFu;
+        if (logical >= static_cast<std::uint8_t>(virt::VmOpcode::MaxOpcode)) {
+            CryptoAead::secure_wipe(std::span<std::uint8_t>(plain_ptr, ct_size));
+            return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
+                ErrorCode::ParseError, "Invalid decoded opcode in lazy block", "LazyBytecodeEngine::open_block");
+        }
+        insns[i].opcode = static_cast<virt::VmOpcode>(logical);
+        insns[i].dst = p[1];
+        insns[i].src1 = p[2];
+        insns[i].src2 = p[3];
+        std::uint64_t imm_u = 0;
+        std::memcpy(&imm_u, p + 4, 8);
+        insns[i].imm = static_cast<std::int64_t>(imm_u);
+    }
+
+    CryptoAead::secure_wipe(std::span<std::uint8_t>(plain_ptr, ct_size));
+    return insns;
+}
+
 } // namespace
 
 std::vector<std::uint8_t>
@@ -119,43 +212,6 @@ LazyBytecodeEngine::open_block(const LazyBlockRecord& rec,
                                const AeadKey& master_key,
                                std::uint32_t expected_fn_index,
                                std::uint64_t build_seed) {
-    using core::diagnostics::ErrorCode;
-
-    if (rec.fn_index != expected_fn_index) {
-        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
-            ErrorCode::ParseError, "Lazy block fn_index mismatch (possible block substitution)",
-            "LazyBytecodeEngine::open_block");
-    }
-    if (rec.insn_count == 0 ||
-        rec.ciphertext.size() != static_cast<std::size_t>(rec.insn_count) * virt::BvmProgram::kInstructionSize) {
-        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
-            ErrorCode::ParseError, "Lazy block size/instruction count mismatch",
-            "LazyBytecodeEngine::open_block");
-    }
-
-    const auto aad = build_block_aad(
-        rec.fn_index, rec.block_id, rec.start_pc, rec.insn_count,
-        static_cast<std::uint32_t>(rec.ciphertext.size()));
-    if (CryptoAead::blake2b_256(aad) != rec.aad_hash) {
-        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
-            ErrorCode::ParseError, "Lazy block AAD hash mismatch", "LazyBytecodeEngine::open_block");
-    }
-
-    AeadSealedBox box;
-    box.nonce = rec.nonce;
-    box.mac = rec.mac;
-    box.ciphertext = rec.ciphertext;
-
-    AeadKey blk_key = CryptoAead::derive_block_key(master_key, rec.fn_index, rec.block_id, "bm.lazy.block.v1");
-    auto plain_res = CryptoAead::open(box, aad, blk_key);
-    CryptoAead::secure_wipe(blk_key.bytes);
-
-    if (!plain_res) {
-        return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
-            plain_res.error().code, plain_res.error().message, "LazyBytecodeEngine::open_block");
-    }
-
-    auto& plain = plain_res.value();
     const auto op_table = virt::BvmCodec::make_opcode_table(build_seed);
     std::array<std::uint8_t, virt::BvmProgram::kOpcodeTableSize> inv_table{};
     inv_table.fill(0xFFu);
@@ -164,29 +220,7 @@ LazyBytecodeEngine::open_block(const LazyBlockRecord& rec,
             inv_table[op_table[i]] = static_cast<std::uint8_t>(i);
         }
     }
-
-    std::vector<virt::VmInstruction> insns;
-    insns.reserve(rec.insn_count);
-    for (std::uint32_t i = 0; i < rec.insn_count; ++i) {
-        const std::uint8_t* p = plain.data() + static_cast<std::size_t>(i) * virt::BvmProgram::kInstructionSize;
-        const std::uint8_t phys = p[0];
-        const std::uint8_t logical = (phys < virt::BvmProgram::kOpcodeTableSize) ? inv_table[phys] : 0xFFu;
-        if (logical >= static_cast<std::uint8_t>(virt::VmOpcode::MaxOpcode)) {
-            CryptoAead::secure_wipe(plain);
-            return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
-                ErrorCode::ParseError, "Invalid decoded opcode in lazy block", "LazyBytecodeEngine::open_block");
-        }
-        virt::VmInstruction vi;
-        vi.opcode = static_cast<virt::VmOpcode>(logical);
-        vi.dst = p[1];
-        vi.src1 = p[2];
-        vi.src2 = p[3];
-        vi.imm = static_cast<std::int64_t>(read_u64(p + 4));
-        insns.push_back(vi);
-    }
-
-    CryptoAead::secure_wipe(plain);
-    return insns;
+    return open_block_with_inv_table(rec, master_key, expected_fn_index, inv_table);
 }
 
 core::diagnostics::Result<bool>
@@ -282,11 +316,21 @@ LazyBytecodeEngine::execute_lazy(const LazyFunctionBlob& blob,
     const std::uint64_t ctx_id =
         (static_cast<std::uint64_t>(blob.fn_index) << 32) ^ blob.build_seed;
 
+    const auto op_table = virt::BvmCodec::make_opcode_table(blob.build_seed);
+    std::array<std::uint8_t, virt::BvmProgram::kOpcodeTableSize> inv_table{};
+    inv_table.fill(0xFFu);
+    for (std::size_t i = 0; i < virt::BvmProgram::kOpcodeTableSize; ++i) {
+        if (op_table[i] < virt::BvmProgram::kOpcodeTableSize) {
+            inv_table[op_table[i]] = static_cast<std::uint8_t>(i);
+        }
+    }
+
     auto fetcher = [&](std::size_t start_pc) -> core::diagnostics::Result<std::vector<virt::VmInstruction>> {
-        for (const auto& blk : blob.blocks) {
-            if (blk.start_pc == start_pc) {
-                return open_block(blk, master_key, blob.fn_index, blob.build_seed);
-            }
+        auto it = std::lower_bound(
+            blob.blocks.begin(), blob.blocks.end(), start_pc,
+            [](const LazyBlockRecord& b, std::size_t pc) { return b.start_pc < pc; });
+        if (it != blob.blocks.end() && it->start_pc == start_pc) {
+            return open_block_with_inv_table(*it, master_key, blob.fn_index, inv_table);
         }
         return core::diagnostics::Result<std::vector<virt::VmInstruction>>::err(
             ErrorCode::OutOfBounds, "Requested lazy block start_pc not found", "LazyBytecodeEngine::execute_lazy");

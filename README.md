@@ -2,11 +2,17 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.13.0):**  
+> **Status atual (v0.14.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
 > - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility` / `test-equivalence` / `report` / `optimize-ir`):**
->   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11/C++20 com 130+ funções, DLLs com `LoadLibraryA`, SDK `.bmprot`, multithreading, alocação dinâmica, structs/globais, `XChaCha20-Poly1305` eager/lazy e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
+>   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11/C++20 com 130+ funções, DLLs com `LoadLibraryA`, SDK `.bmprot`, multithreading, alocação dinâmica, structs/globais, `XChaCha20-Poly1305` eager e **Native Lazy PIC**, e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
 >   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, sem runner nativo Windows ARM64 público no CI) e Mach-O Fat/Universal multi-slice.
+
+## Recursos da v0.14
+
+- **Native Lazy VM Runtime (`.bmrt` PIC x86-64 & ARM64):** execução lazy por bloco básico diretamente no runtime nativo PIC (com tabela de descritores por função, chave `CryptoAead::derive_block_key`, blob `BMBC` v2, bitmap de cache na stack, *fast-path* zero-crypto dentro de loops, wipe seguro ao sair e sentinela `0xDEADAEADDEADAEAD` em adulteração).
+- **Lazy VM Performance 2.0:** `CryptoAead::open_into` zero-copy, `LazyBytecodeEngine` sem alocações heap em blocos <=4KB + `std::lower_bound`, e `VmBytecodeCache::get_shared`/`put_shared` sem cópia de vetores em cache hit.
+- **Call Bridge 2.0 & CLI v0.14:** autorização de alvos em `.didat`/`__la_symbol_ptr`/`.plt*`, `protection-info --blocks --cache`, `benchmark-protection --native-lazy`, e `"native_lazy_runtime"` em `report --format json`.
 
 ## Recursos da v0.13
 
