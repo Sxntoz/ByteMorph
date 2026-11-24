@@ -240,6 +240,14 @@ ElfParser::parse(std::vector<std::uint8_t> buffer) const {
         ri.type_name = LIEF::ELF::to_string(rel.type());
         if (rel.has_symbol() && rel.symbol() != nullptr) {
             ri.symbol_name = rel.symbol()->name();
+            if (rel.address() != 0 && !ri.symbol_name.empty() &&
+                (ri.type_name.find("JUMP_SLOT") != std::string::npos ||
+                 ri.type_name.find("GLOB_DAT") != std::string::npos)) {
+                ImportInfo ii;
+                ii.symbol = ri.symbol_name;
+                ii.address = rel.address();
+                imports.push_back(std::move(ii));
+            }
         }
         relocations.push_back(std::move(ri));
     }

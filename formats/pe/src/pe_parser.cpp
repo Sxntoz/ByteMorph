@@ -185,8 +185,29 @@ PeParser::parse(std::vector<std::uint8_t> buffer) const {
             ii.by_ordinal = entry.is_ordinal();
             if (entry.is_ordinal()) {
                 ii.ordinal = entry.ordinal();
+                if (ii.symbol.empty()) {
+                    ii.symbol = "#" + std::to_string(entry.ordinal());
+                }
             }
             imports.push_back(std::move(ii));
+        }
+    }
+    if (pe->has_delay_imports()) {
+        for (const auto& dimp : pe->delay_imports()) {
+            for (const auto& entry : dimp.entries()) {
+                ImportInfo ii;
+                ii.library = dimp.name();
+                ii.symbol = entry.name();
+                ii.address = info.image_base + entry.iat_value();
+                ii.by_ordinal = entry.is_ordinal();
+                if (entry.is_ordinal()) {
+                    ii.ordinal = entry.ordinal();
+                    if (ii.symbol.empty()) {
+                        ii.symbol = "#" + std::to_string(entry.ordinal());
+                    }
+                }
+                imports.push_back(std::move(ii));
+            }
         }
     }
 

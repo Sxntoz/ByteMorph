@@ -29,7 +29,14 @@ struct AeadSealedBox {
 class CryptoAead {
 public:
     [[nodiscard]] static AeadKey derive_key_from_seed(std::uint64_t seed, std::string_view domain);
+    [[nodiscard]] static AeadKey derive_block_key(const AeadKey& master_key,
+                                                  std::uint32_t fn_index,
+                                                  std::uint32_t block_id,
+                                                  std::string_view domain = "bm.blk.v1");
     [[nodiscard]] static AeadNonce generate_nonce(std::uint64_t seed, std::uint64_t counter);
+    [[nodiscard]] static AeadNonce generate_block_nonce(std::uint64_t seed,
+                                                        std::uint32_t fn_index,
+                                                        std::uint32_t block_id);
     [[nodiscard]] static std::array<std::uint8_t, 32> blake2b_256(std::span<const std::uint8_t> data);
 
     [[nodiscard]] static core::diagnostics::Result<AeadSealedBox>

@@ -9,6 +9,7 @@
 #include "bytemorph/core/ir/ir_interpreter.hpp"
 #include "bytemorph/core/ir/ir_optimizer.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
+#include "bytemorph/prot/lazy_bytecode.hpp"
 #include "bytemorph/prot/native_vm_emitter.hpp"
 #include "bytemorph/prot/pe_rewriter.hpp"
 #include "bytemorph/virt/ir_to_vm.hpp"
@@ -2584,4 +2585,208 @@ TEST(ProtectionV012Test, WindowsArm64Pe32PlusAndLargeStackProbeEmission) {
     ASSERT_TRUE(arm64_rt.has_value()) << arm64_rt.error().to_string();
     EXPECT_GT(arm64_rt.value().size(), 3000u);
     EXPECT_EQ(layout.entry_offsets.size(), 1u);
+}
+
+TEST(ProtectionV013Test, PerBlockKeyDerivationAndNonceUniqueness) {
+    using namespace bytemorph::prot;
+
+    const auto master = CryptoAead::derive_key_from_seed(0xCAFE013ULL, "bm.rt.v10");
+    const auto k00 = CryptoAead::derive_block_key(master, 0, 0, "bm.lazy.block.v1");
+    const auto k01 = CryptoAead::derive_block_key(master, 0, 1, "bm.lazy.block.v1");
+    const auto k10 = CryptoAead::derive_block_key(master, 1, 0, "bm.lazy.block.v1");
+    const auto k00_again = CryptoAead::derive_block_key(master, 0, 0, "bm.lazy.block.v1");
+
+    EXPECT_EQ(k00.bytes, k00_again.bytes);
+    EXPECT_NE(k00.bytes, k01.bytes);
+    EXPECT_NE(k00.bytes, k10.bytes);
+    EXPECT_NE(k01.bytes, k10.bytes);
+
+    const auto n00 = CryptoAead::generate_block_nonce(0xCAFE013ULL, 0, 0);
+    const auto n01 = CryptoAead::generate_block_nonce(0xCAFE013ULL, 0, 1);
+    const auto n10 = CryptoAead::generate_block_nonce(0xCAFE013ULL, 1, 0);
+    EXPECT_NE(n00.bytes, n01.bytes);
+    EXPECT_NE(n00.bytes, n10.bytes);
+    EXPECT_NE(n01.bytes, n10.bytes);
+}
+
+TEST(ProtectionV013Test, LazyBytecodeDecryptionCacheLruAndTamperRejection) {
+    using namespace bytemorph::prot;
+    using namespace bytemorph::virt;
+
+    BvmProgram prog;
+    prog.build_seed = 0x55667788ULL;
+    // Sum 1..R0 in a multi-block loop
+    prog.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 0},   // blk 0: sum = 0
+        {VmOpcode::MovImm, 2, 0, 0, 1},   // blk 0: step = 1
+        {VmOpcode::MovImm, 3, 0, 0, 0},   // blk 0: zero
+        {VmOpcode::Cmp, 0, 0, 3, 0},      // blk 1: while r0 > 0
+        {VmOpcode::Jle, 0, 0, 0, 7},
+        {VmOpcode::Add, 1, 1, 0, 0},      // blk 2: sum += r0
+        {VmOpcode::Sub, 0, 0, 2, 0},      // blk 2: r0 -= 1
+        {VmOpcode::Jmp, 0, 0, 0, 3},      // blk 2: loop back
+        {VmOpcode::MovReg, 0, 1, 0, 0},   // blk 3: r0 = sum (wait pc=8, Jle target should be 8!)
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    prog.instructions[4].imm = 8;
+
+    const auto master = CryptoAead::derive_key_from_seed(0x99887766ULL, "bm.rt.v10");
+    auto sealed = LazyBytecodeEngine::seal_function(prog, master, 0x99887766ULL, 0);
+    ASSERT_TRUE(sealed.has_value()) << sealed.error().to_string();
+    ASSERT_GE(sealed.value().blocks.size(), 4u);
+
+    auto ver_all = LazyBytecodeEngine::verify_all_blocks(sealed.value(), master);
+    ASSERT_TRUE(ver_all.has_value()) << ver_all.error().to_string();
+
+    // Small LRU cache (max 2 blocks) to exercise evictions + secure wipe
+    VmBytecodeCache cache(64 * 1024, 2);
+    for (std::uint64_t n : {0ULL, 5ULL, 10ULL, 25ULL}) {
+        VmExecOptions opts;
+        opts.initial_regs[0] = n;
+        auto eager = VmInterpreter::execute(prog, opts);
+        auto lazy = LazyBytecodeEngine::execute_lazy(sealed.value(), master, cache, opts);
+        ASSERT_TRUE(eager.has_value());
+        ASSERT_TRUE(lazy.has_value()) << lazy.error().to_string();
+        EXPECT_EQ(eager.value().return_value, n * (n + 1) / 2);
+        EXPECT_EQ(eager.value().return_value, lazy.value().return_value);
+    }
+
+    const auto st = cache.stats();
+    EXPECT_GT(st.hits, 0u);
+    EXPECT_GT(st.misses, 0u);
+    EXPECT_GT(st.evictions, 0u);
+    cache.invalidate_all();
+    EXPECT_EQ(cache.stats().current_bytes, 0u);
+
+    // Tamper ciphertext in block 1 -> must fail AEAD before executing
+    auto tampered = sealed.value();
+    tampered.blocks[1].ciphertext[0] ^= 0xFF;
+    VmBytecodeCache clean_cache(64 * 1024, 16);
+    VmExecOptions opts;
+    opts.initial_regs[0] = 5;
+    auto bad_res = LazyBytecodeEngine::execute_lazy(tampered, master, clean_cache, opts);
+    EXPECT_FALSE(bad_res.has_value());
+
+    // Block substitution / reordering -> must fail AAD/key binding
+    auto swapped = sealed.value();
+    std::swap(swapped.blocks[1], swapped.blocks[2]);
+    auto bad_swap = LazyBytecodeEngine::verify_all_blocks(swapped, master);
+    EXPECT_FALSE(bad_swap.has_value());
+}
+
+TEST(ProtectionV013Test, ConcurrentLazyBytecodeExecutionAndCacheIsolation) {
+    using namespace bytemorph::prot;
+    using namespace bytemorph::virt;
+
+    BvmProgram p1, p2;
+    p1.build_seed = 0x1111ULL;
+    p1.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 7},
+        {VmOpcode::Mul, 0, 0, 1, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    p2.build_seed = 0x2222ULL;
+    p2.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 100},
+        {VmOpcode::Add, 0, 0, 1, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+
+    const auto key = CryptoAead::derive_key_from_seed(0xABCDEFULL, "bm.rt.v10");
+    auto b1 = LazyBytecodeEngine::seal_function(p1, key, 0xABCDEFULL, 0);
+    auto b2 = LazyBytecodeEngine::seal_function(p2, key, 0xABCDEFULL, 1);
+    ASSERT_TRUE(b1.has_value() && b2.has_value());
+
+    VmBytecodeCache shared_cache(64 * 1024, 32);
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int iter = 0; iter < 50; ++iter) {
+                VmExecOptions o;
+                o.initial_regs[0] = static_cast<std::uint64_t>(t * 10 + iter);
+                auto r1 = LazyBytecodeEngine::execute_lazy(b1.value(), key, shared_cache, o);
+                auto r2 = LazyBytecodeEngine::execute_lazy(b2.value(), key, shared_cache, o);
+                if (!r1.has_value() || r1.value().return_value != o.initial_regs[0] * 7 ||
+                    !r2.has_value() || r2.value().return_value != o.initial_regs[0] + 100) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(failures.load(), 0);
+}
+
+TEST(ProtectionV013Test, ProtectRealBinaryWithLazyBytecodeModeAndDeepVerify) {
+#ifdef BYTEMORPH_LAB_SDK_APP_PATH
+    const std::filesystem::path sdk_exe(BYTEMORPH_LAB_SDK_APP_PATH);
+    if (!std::filesystem::exists(sdk_exe)) {
+        GTEST_SKIP() << "lab_sdk_app not built";
+    }
+    const auto out_exe = std::filesystem::temp_directory_path() /
+        ("lab_sdk_lazy_v013" + sdk_exe.extension().string());
+
+    bytemorph::prot::ProtectOptions opts;
+    opts.profile = bytemorph::prot::ProtectionProfile::Maximum;
+    opts.bytecode_mode = bytemorph::prot::BytecodeMode::Lazy;
+    opts.auto_select_functions = true;
+    opts.encrypt_bytecode = true;
+    opts.allow_strip_signature = true;
+
+    auto res = bytemorph::prot::ProtectionEngine::protect(sdk_exe, out_exe, opts);
+    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+    EXPECT_EQ(res.value().bytecode_mode, bytemorph::prot::BytecodeMode::Lazy);
+    EXPECT_GT(res.value().encrypted_blocks_count, 0u);
+
+    auto ver = bytemorph::prot::ProtectionEngine::verify(out_exe);
+    ASSERT_TRUE(ver.has_value()) << ver.error().to_string();
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+    EXPECT_EQ(ver.value().metadata.bytecode_mode, bytemorph::prot::BytecodeMode::Lazy);
+    EXPECT_EQ(ver.value().blocks_verified_count, res.value().encrypted_blocks_count);
+
+#ifdef _WIN32
+    auto run_capture = [](const std::filesystem::path& exe, int& rc) -> std::string {
+        std::string cmd = "\"\"" + exe.string() + "\" 42\"";
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) { rc = -1; return {}; }
+        char buf[256];
+        std::string out;
+        while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+        rc = _pclose(pipe);
+        return out;
+    };
+    int rc_orig = -1, rc_prot = -1;
+    const std::string out_orig = run_capture(sdk_exe, rc_orig);
+    const std::string out_prot = run_capture(out_exe, rc_prot);
+    EXPECT_EQ(rc_orig, 0);
+    EXPECT_EQ(rc_prot, 0);
+    EXPECT_EQ(out_orig, out_prot);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(out_exe, ec);
+#endif
+}
+
+TEST(ProtectionV013Test, DynamicLinkingAuthorizedCallTargetsResolution) {
+#ifdef BYTEMORPH_LAB_C_APP_PATH
+    const std::filesystem::path c_app(BYTEMORPH_LAB_C_APP_PATH);
+    if (!std::filesystem::exists(c_app)) {
+        GTEST_SKIP() << "lab_c_app not built";
+    }
+    bytemorph::core::binary::BinaryLoader loader;
+    loader.register_parser(std::make_unique<bytemorph::formats::pe::PeParser>());
+    auto bin_res = loader.load_file(c_app);
+    if (bin_res.has_value()) {
+        EXPECT_FALSE(bin_res.value()->imports().empty());
+        bytemorph::arch::x86_64::X86_64Disassembler disasm;
+        bytemorph::core::analysis::BinaryAnalyzer analyzer;
+        auto an = analyzer.analyze(*bin_res.value(), disasm);
+        ASSERT_TRUE(an.has_value());
+        const auto auth = bytemorph::prot::detail::build_authorized_call_targets(*bin_res.value(), an.value());
+        EXPECT_FALSE(auth.empty());
+        EXPECT_FALSE(auth.contains(0xDEADBEEFCAFEULL));
+    }
+#endif
 }

@@ -2,11 +2,18 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.12.0):**  
+> **Status atual (v0.13.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
 > - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility` / `test-equivalence` / `report` / `optimize-ir`):**
->   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11/C++20 com 130+ funções, DLLs com `LoadLibraryA`, SDK `.bmprot`, multithreading, alocação dinâmica, structs/globais, `XChaCha20-Poly1305` e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
->   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, compilador cruzado `MSVC Hostx64\arm64` disponível localmente, sem runner nativo Windows ARM64) e Mach-O Fat/Universal multi-slice.
+>   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11/C++20 com 130+ funções, DLLs com `LoadLibraryA`, SDK `.bmprot`, multithreading, alocação dinâmica, structs/globais, `XChaCha20-Poly1305` eager/lazy e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
+>   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, sem runner nativo Windows ARM64 público no CI) e Mach-O Fat/Universal multi-slice.
+
+## Recursos da v0.13
+
+- **Lazy Bytecode Decryption & Derivação por Bloco:** divisão de programas BVM em blocos básicos autenticados individualmente (`XChaCha20-Poly1305` + `BMLB` v1), com subchaves derivadas por `(fn_index, block_id)` via `BLAKE2b-256` keyed (`CryptoAead::derive_block_key`), nonces exclusivos e AAD vinculada ([docs/LAZY_CACHE.md](docs/LAZY_CACHE.md)).
+- **Bytecode Cache 2.0 (`VmBytecodeCache`):** cache LRU thread-safe com limites configuráveis (`max_bytes`/`max_entries`), isolamento por `context_id`, contabilização de hits/misses/evictions e limpeza `volatile` ao despejar/invalidar.
+- **Dynamic Linking Expandido:** parsing de **Delayed Imports** e **ordinais `#N`** no `PeParser`, relocations `JUMP_SLOT`/`GLOB_DAT` no `ElfParser`, e binding addresses no `MachORewriter`/`MachOParser`.
+- **CLI v0.13:** `--bytecode-mode <eager|lazy>`, `protection-info --blocks`, `benchmark-protection --lazy-vs-eager` e `report --format json` com contagem de blocos autenticados e versão `BMP4 v3`.
 
 ## Recursos da v0.12
 

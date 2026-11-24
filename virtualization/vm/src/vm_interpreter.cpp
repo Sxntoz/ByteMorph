@@ -1373,4 +1373,509 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     return execute_prepared(slot.prepared, options);
 }
 
+void VmBytecodeCache::wipe_block(CachedBlock& blk) noexcept {
+    if (!blk.insns.empty()) {
+        volatile std::uint8_t* p = reinterpret_cast<volatile std::uint8_t*>(blk.insns.data());
+        const std::size_t bytes = blk.insns.size() * sizeof(FastVmInstruction);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            p[i] = 0;
+        }
+        blk.insns.clear();
+    }
+}
+
+VmBytecodeCache::~VmBytecodeCache() {
+    invalidate_all();
+}
+
+void VmBytecodeCache::evict_lru_locked() {
+    if (lru_.empty()) return;
+    auto& back = lru_.back();
+    const std::size_t sz = back.block.byte_size();
+    wipe_block(back.block);
+    index_.erase(back.key);
+    lru_.pop_back();
+    stats_.current_bytes = (stats_.current_bytes >= sz) ? (stats_.current_bytes - sz) : 0;
+    stats_.cached_blocks = lru_.size();
+    ++stats_.evictions;
+}
+
+std::optional<VmBytecodeCache::CachedBlock>
+VmBytecodeCache::get(std::uint64_t context_id, std::size_t block_start_pc) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const Key key{context_id, block_start_pc};
+    auto it = index_.find(key);
+    if (it == index_.end()) {
+        ++stats_.misses;
+        return std::nullopt;
+    }
+    lru_.splice(lru_.begin(), lru_, it->second);
+    ++stats_.hits;
+    return it->second->block;
+}
+
+void VmBytecodeCache::put(std::uint64_t context_id, std::size_t block_start_pc, CachedBlock block) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const Key key{context_id, block_start_pc};
+    auto it = index_.find(key);
+    if (it != index_.end()) {
+        const std::size_t old_sz = it->second->block.byte_size();
+        wipe_block(it->second->block);
+        stats_.current_bytes = (stats_.current_bytes >= old_sz) ? (stats_.current_bytes - old_sz) : 0;
+        it->second->block = std::move(block);
+        stats_.current_bytes += it->second->block.byte_size();
+        if (stats_.current_bytes > stats_.peak_bytes) stats_.peak_bytes = stats_.current_bytes;
+        lru_.splice(lru_.begin(), lru_, it->second);
+        return;
+    }
+
+    const std::size_t new_sz = block.byte_size();
+    while (!lru_.empty() &&
+           ((max_entries_ > 0 && lru_.size() >= max_entries_) ||
+            (max_bytes_ > 0 && stats_.current_bytes + new_sz > max_bytes_))) {
+        evict_lru_locked();
+    }
+
+    lru_.push_front(LruNode{key, std::move(block)});
+    index_[key] = lru_.begin();
+    stats_.current_bytes += new_sz;
+    if (stats_.current_bytes > stats_.peak_bytes) stats_.peak_bytes = stats_.current_bytes;
+    stats_.cached_blocks = lru_.size();
+}
+
+void VmBytecodeCache::invalidate_context(std::uint64_t context_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        if (it->key.context_id == context_id) {
+            const std::size_t sz = it->block.byte_size();
+            wipe_block(it->block);
+            index_.erase(it->key);
+            it = lru_.erase(it);
+            stats_.current_bytes = (stats_.current_bytes >= sz) ? (stats_.current_bytes - sz) : 0;
+            ++stats_.invalidations;
+        } else {
+            ++it;
+        }
+    }
+    stats_.cached_blocks = lru_.size();
+}
+
+void VmBytecodeCache::invalidate_all() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& node : lru_) {
+        wipe_block(node.block);
+        ++stats_.invalidations;
+    }
+    lru_.clear();
+    index_.clear();
+    stats_.current_bytes = 0;
+    stats_.cached_blocks = 0;
+}
+
+VmCacheStats VmBytecodeCache::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stats_;
+}
+
+std::vector<BvmBasicBlock> VmInterpreter::split_into_basic_blocks(const BvmProgram& program) {
+    std::vector<BvmBasicBlock> blocks;
+    const std::size_t n = program.instructions.size();
+    if (n == 0) return blocks;
+
+    std::vector<bool> is_leader(n, false);
+    is_leader[0] = true;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& insn = program.instructions[i];
+        switch (insn.opcode) {
+            case VmOpcode::Jmp:
+            case VmOpcode::Jeq:
+            case VmOpcode::Jne:
+            case VmOpcode::Jlt:
+            case VmOpcode::Jle:
+            case VmOpcode::Jgt:
+            case VmOpcode::Jge:
+            case VmOpcode::Call:
+                if (insn.imm >= 0 && static_cast<std::size_t>(insn.imm) < n) {
+                    is_leader[static_cast<std::size_t>(insn.imm)] = true;
+                }
+                if (i + 1 < n) is_leader[i + 1] = true;
+                break;
+            case VmOpcode::Ret:
+            case VmOpcode::Halt:
+                if (i + 1 < n) is_leader[i + 1] = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    std::uint32_t blk_id = 0;
+    std::size_t cur_start = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i > 0 && is_leader[i]) {
+            BvmBasicBlock blk;
+            blk.block_id = blk_id++;
+            blk.start_pc = cur_start;
+            blk.instructions.assign(
+                program.instructions.begin() + static_cast<std::ptrdiff_t>(cur_start),
+                program.instructions.begin() + static_cast<std::ptrdiff_t>(i));
+            blocks.push_back(std::move(blk));
+            cur_start = i;
+        }
+    }
+    BvmBasicBlock last;
+    last.block_id = blk_id++;
+    last.start_pc = cur_start;
+    last.instructions.assign(
+        program.instructions.begin() + static_cast<std::ptrdiff_t>(cur_start),
+        program.instructions.end());
+    blocks.push_back(std::move(last));
+    return blocks;
+}
+
+core::diagnostics::Result<VmExecState>
+VmInterpreter::execute_lazy(std::size_t total_insns,
+                            std::uint64_t context_id,
+                            const std::vector<std::size_t>& block_starts,
+                            const LazyBlockFetcher& fetcher,
+                            VmBytecodeCache& cache,
+                            const VmExecOptions& options) {
+    using core::diagnostics::ErrorCode;
+
+    if (total_insns == 0 || block_starts.empty() || !fetcher) {
+        return core::diagnostics::Result<VmExecState>::err(
+            ErrorCode::EmptyInput, "Invalid lazy VM program metadata", "VmInterpreter::execute_lazy");
+    }
+
+    VmExecState state;
+    alignas(64) std::uint64_t regs[BvmProgram::kNumRegisters];
+    std::memcpy(regs, options.initial_regs.data(), sizeof(regs));
+    std::memcpy(state.vregs.data(), options.initial_vregs.data(), sizeof(state.vregs));
+
+    thread_local std::vector<std::uint64_t> tls_memory_pool;
+    thread_local std::size_t tls_dirty_min = 0;
+    thread_local std::size_t tls_dirty_max = 0;
+    thread_local std::vector<std::size_t> tls_call_stack;
+    tls_call_stack.clear();
+
+    bool mem_initialized = false;
+    std::size_t mem_slots = 0;
+    std::uint64_t* mem_data = nullptr;
+    std::size_t total_mem_bytes = 0;
+    std::uint8_t* mem_bytes = nullptr;
+    std::size_t dirty_min = 0;
+    std::size_t dirty_max = 0;
+    bool using_tls_pool = false;
+
+    auto ensure_memory = [&]() noexcept {
+        if (mem_initialized || options.memory_slots == 0) return;
+        mem_initialized = true;
+        mem_slots = options.memory_slots;
+        total_mem_bytes = mem_slots * sizeof(std::uint64_t);
+        if (options.use_memory_pool) {
+            using_tls_pool = true;
+            if (tls_memory_pool.size() < options.memory_slots) {
+                const std::size_t old_size = tls_memory_pool.size();
+                tls_memory_pool.resize(options.memory_slots, 0ULL);
+                if (tls_dirty_max > tls_dirty_min && old_size > 0) {
+                    const std::size_t clamped = std::min(tls_dirty_max, old_size * sizeof(std::uint64_t));
+                    if (clamped > tls_dirty_min) {
+                        std::memset(reinterpret_cast<std::uint8_t*>(tls_memory_pool.data()) + tls_dirty_min,
+                                    0, clamped - tls_dirty_min);
+                    }
+                }
+                state.allocations_count = 1;
+            } else {
+                state.allocations_count = 0;
+                if (tls_dirty_max > tls_dirty_min) {
+                    const std::size_t clamped = std::min(tls_dirty_max, total_mem_bytes);
+                    if (clamped > tls_dirty_min) {
+                        std::memset(reinterpret_cast<std::uint8_t*>(tls_memory_pool.data()) + tls_dirty_min,
+                                    0, clamped - tls_dirty_min);
+                    }
+                }
+            }
+            tls_dirty_min = 0;
+            tls_dirty_max = 0;
+            mem_data = tls_memory_pool.data();
+        } else {
+            state.memory.assign(options.memory_slots, 0ULL);
+            state.allocations_count = 1;
+            mem_data = state.memory.data();
+        }
+        mem_bytes = reinterpret_cast<std::uint8_t*>(mem_data);
+        dirty_min = total_mem_bytes;
+        dirty_max = 0;
+        if (regs[4] == 0 && regs[5] == 0) {
+            const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
+            regs[4] = mid_stack;
+            regs[5] = mid_stack;
+        }
+    };
+
+    std::size_t pc = 0;
+    std::uint64_t steps = 0;
+    const std::uint64_t max_steps = options.max_steps;
+    bool zf = false, sf = false, cf = false, of = false;
+
+    auto finalize_state = [&]() noexcept {
+        if (using_tls_pool && dirty_max > dirty_min) {
+            tls_dirty_min = dirty_min;
+            tls_dirty_max = dirty_max;
+        }
+        std::memcpy(state.regs.data(), regs, sizeof(regs));
+        state.pc = pc;
+        state.steps_executed = steps;
+        state.zf = zf;
+        state.sf = sf;
+        state.cf = cf;
+        state.of = of;
+        state.return_value = regs[0];
+    };
+
+    auto decode_block = [&](const std::vector<VmInstruction>& raw)
+        -> core::diagnostics::Result<VmBytecodeCache::CachedBlock> {
+        VmBytecodeCache::CachedBlock blk;
+        blk.insns.reserve(raw.size());
+        for (const auto& insn : raw) {
+            FastVmInstruction fast{};
+            fast.opcode = insn.opcode;
+            fast.dst = insn.dst;
+            fast.src1 = insn.src1;
+            fast.src2 = insn.src2;
+            fast.imm = insn.imm;
+            if (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF) {
+                blk.insns.push_back(fast);
+                continue;
+            }
+            const bool is_scalar_mem = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
+            const bool is_vec_mem = (insn.opcode == VmOpcode::VLoad || insn.opcode == VmOpcode::VStore);
+            const bool src2_is_width = is_scalar_mem || is_vec_mem;
+            const bool src2_is_cc = (insn.opcode == VmOpcode::SelectCc || insn.opcode == VmOpcode::SetCc);
+            if (src2_is_width) {
+                blk.has_mem_ops = true;
+                fast.aux = is_scalar_mem
+                    ? ((insn.src2 == 0) ? 0u : (insn.src2 == 8) ? 1u : (insn.src2 == 16) ? 2u : (insn.src2 == 32) ? 4u : 8u)
+                    : ((insn.src2 == 32) ? 4u : (insn.src2 == 64) ? 8u : 16u);
+            }
+            if (is_simd_opcode(insn.opcode)) blk.has_simd_ops = true;
+            if (insn.dst >= BvmProgram::kNumRegisters ||
+                insn.src1 >= BvmProgram::kNumRegisters ||
+                (!src2_is_width && !src2_is_cc && insn.src2 >= BvmProgram::kNumRegisters)) {
+                return core::diagnostics::Result<VmBytecodeCache::CachedBlock>::err(
+                    ErrorCode::OutOfBounds, "Register index out of bounds in lazy block", "VmInterpreter::execute_lazy");
+            }
+            if (src2_is_cc && insn.src2 > static_cast<std::uint8_t>(VmCondCode::NotOverflow)) {
+                return core::diagnostics::Result<VmBytecodeCache::CachedBlock>::err(
+                    ErrorCode::ParseError, "Invalid VM condition code in lazy block", "VmInterpreter::execute_lazy");
+            }
+            switch (insn.opcode) {
+                case VmOpcode::Jmp: case VmOpcode::Jeq: case VmOpcode::Jne:
+                case VmOpcode::Jlt: case VmOpcode::Jle: case VmOpcode::Jgt:
+                case VmOpcode::Jge: case VmOpcode::Call:
+                    if (insn.imm < 0 || static_cast<std::size_t>(insn.imm) >= total_insns) {
+                        return core::diagnostics::Result<VmBytecodeCache::CachedBlock>::err(
+                            ErrorCode::OutOfBounds, "Lazy VM branch/call target out of bounds", "VmInterpreter::execute_lazy");
+                    }
+                    break;
+                default:
+                    if (static_cast<std::uint8_t>(insn.opcode) >= static_cast<std::uint8_t>(VmOpcode::MaxOpcode)) {
+                        return core::diagnostics::Result<VmBytecodeCache::CachedBlock>::err(
+                            ErrorCode::ParseError, "Invalid VM opcode in lazy block", "VmInterpreter::execute_lazy");
+                    }
+                    break;
+            }
+            blk.insns.push_back(fast);
+        }
+        return blk;
+    };
+
+    while (pc < total_insns) {
+        auto it = std::upper_bound(block_starts.begin(), block_starts.end(), pc);
+        if (it == block_starts.begin()) {
+            finalize_state();
+            return core::diagnostics::Result<VmExecState>::err(
+                ErrorCode::OutOfBounds, "Lazy VM PC before first basic block", "VmInterpreter::execute_lazy");
+        }
+        const std::size_t blk_start = *(--it);
+
+        auto cached_opt = cache.get(context_id, blk_start);
+        VmBytecodeCache::CachedBlock cur_blk;
+        if (cached_opt.has_value()) {
+            cur_blk = std::move(*cached_opt);
+        } else {
+            auto fetched = fetcher(blk_start);
+            if (!fetched) {
+                finalize_state();
+                return core::diagnostics::Result<VmExecState>::err(
+                    fetched.error().code, fetched.error().message, fetched.error().context);
+            }
+            auto dec = decode_block(fetched.value());
+            if (!dec) {
+                finalize_state();
+                return core::diagnostics::Result<VmExecState>::err(
+                    dec.error().code, dec.error().message, dec.error().context);
+            }
+            cur_blk = std::move(dec.value());
+            cache.put(context_id, blk_start, cur_blk);
+        }
+
+        if (cur_blk.has_mem_ops) ensure_memory();
+        const std::size_t blk_end = blk_start + cur_blk.insns.size();
+        if (pc >= blk_end) {
+            finalize_state();
+            return core::diagnostics::Result<VmExecState>::err(
+                ErrorCode::OutOfBounds, "Lazy VM PC outside authenticated block", "VmInterpreter::execute_lazy");
+        }
+
+        while (pc >= blk_start && pc < blk_end) {
+            if (steps >= max_steps) [[unlikely]] {
+                finalize_state();
+                return core::diagnostics::Result<VmExecState>::err(
+                    ErrorCode::OutOfBounds, "VM execution exceeded max_steps limit", "VmInterpreter::execute_lazy");
+            }
+            ++steps;
+            const auto& insn = cur_blk.insns[pc - blk_start];
+            switch (insn.opcode) {
+                case VmOpcode::Nop: ++pc; break;
+                case VmOpcode::MovReg: regs[insn.dst] = regs[insn.src1]; ++pc; break;
+                case VmOpcode::MovImm: regs[insn.dst] = static_cast<std::uint64_t>(insn.imm); ++pc; break;
+                case VmOpcode::Load: {
+                    if (mem_slots == 0) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute_lazy"); }
+                    if (insn.aux == 0) {
+                        const std::uint64_t addr = regs[insn.src1] + static_cast<std::uint64_t>(insn.imm);
+                        if (addr >= mem_slots) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute_lazy"); }
+                        regs[insn.dst] = mem_data[addr];
+                    } else {
+                        const std::size_t wb = insn.aux;
+                        const std::int64_t ba = static_cast<std::int64_t>(regs[insn.src1]) + insn.imm;
+                        if (ba < 0 || static_cast<std::size_t>(ba) + wb > total_mem_bytes) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute_lazy"); }
+                        std::uint64_t lv = 0; std::memcpy(&lv, mem_bytes + ba, wb); regs[insn.dst] = lv;
+                    }
+                    ++pc; break;
+                }
+                case VmOpcode::Store: {
+                    if (mem_slots == 0) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory is empty", "VmInterpreter::execute_lazy"); }
+                    if (insn.aux == 0) {
+                        const std::uint64_t addr = regs[insn.dst] + static_cast<std::uint64_t>(insn.imm);
+                        if (addr >= mem_slots) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute_lazy"); }
+                        mem_data[addr] = regs[insn.src1];
+                        const std::size_t bs = static_cast<std::size_t>(addr) * 8;
+                        if (bs < dirty_min) dirty_min = bs;
+                        if (bs + 8 > dirty_max) dirty_max = bs + 8;
+                    } else {
+                        const std::size_t wb = insn.aux;
+                        const std::int64_t ba = static_cast<std::int64_t>(regs[insn.dst]) + insn.imm;
+                        if (ba < 0 || static_cast<std::size_t>(ba) + wb > total_mem_bytes) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute_lazy"); }
+                        const std::uint64_t sv = regs[insn.src1];
+                        const std::size_t bs = static_cast<std::size_t>(ba);
+                        std::memcpy(mem_bytes + bs, &sv, wb);
+                        if (bs < dirty_min) dirty_min = bs;
+                        if (bs + wb > dirty_max) dirty_max = bs + wb;
+                    }
+                    ++pc; break;
+                }
+                case VmOpcode::Add: {
+                    const std::uint64_t u1 = regs[insn.src1], u2 = regs[insn.src2], r = u1 + u2;
+                    regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0);
+                    cf = (r < u1); of = (((~(u1 ^ u2) & (u1 ^ r)) >> 63) != 0); ++pc; break;
+                }
+                case VmOpcode::Sub: {
+                    const std::uint64_t u1 = regs[insn.src1], u2 = regs[insn.src2], r = u1 - u2;
+                    regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0);
+                    cf = (u1 < u2); of = ((((u1 ^ u2) & (u1 ^ r)) >> 63) != 0); ++pc; break;
+                }
+                case VmOpcode::Mul: { const auto r = regs[insn.src1] * regs[insn.src2]; regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Div: {
+                    if (regs[insn.src2] == 0) { finalize_state(); return core::diagnostics::Result<VmExecState>::err(ErrorCode::InternalError, "Division by zero in VM", "VmInterpreter::execute_lazy"); }
+                    const auto r = regs[insn.src1] / regs[insn.src2]; regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break;
+                }
+                case VmOpcode::And: { const auto r = regs[insn.src1] & regs[insn.src2]; regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Or:  { const auto r = regs[insn.src1] | regs[insn.src2]; regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Xor: { const auto r = regs[insn.src1] ^ regs[insn.src2]; regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Shl: { const auto r = regs[insn.src1] << (regs[insn.src2] & 63ULL); regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Shr: { const auto r = regs[insn.src1] >> (regs[insn.src2] & 63ULL); regs[insn.dst] = r; zf = (r == 0); sf = (static_cast<std::int64_t>(r) < 0); ++pc; break; }
+                case VmOpcode::Cmp: {
+                    const std::uint64_t u1 = regs[insn.src1], u2 = regs[insn.src2], d = u1 - u2;
+                    zf = (d == 0); sf = (static_cast<std::int64_t>(d) < 0); cf = (u1 < u2);
+                    of = ((((u1 ^ u2) & (u1 ^ d)) >> 63) != 0); ++pc; break;
+                }
+                case VmOpcode::LeaPic: regs[insn.dst] = static_cast<std::uint64_t>(static_cast<std::int64_t>(options.pic_base_va) + insn.imm); ++pc; break;
+                case VmOpcode::SelectCc: if (eval_vm_cc(insn.src2, zf, sf, cf, of)) regs[insn.dst] = regs[insn.src1]; ++pc; break;
+                case VmOpcode::SetCc: regs[insn.dst] = eval_vm_cc(insn.src2, zf, sf, cf, of) ? 1ULL : 0ULL; ++pc; break;
+                case VmOpcode::Jmp: pc = static_cast<std::size_t>(insn.imm); break;
+                case VmOpcode::Jeq: pc = zf ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Jne: pc = !zf ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Jlt: pc = (sf != of) ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Jle: pc = ((sf != of) || zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Jgt: pc = ((sf == of) && !zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Jge: pc = (sf == of) ? static_cast<std::size_t>(insn.imm) : (pc + 1); break;
+                case VmOpcode::Call:
+                    if (tls_call_stack.size() >= options.max_call_depth) {
+                        finalize_state();
+                        state.call_stack = tls_call_stack;
+                        return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "VM call stack overflow", "VmInterpreter::execute_lazy");
+                    }
+                    tls_call_stack.push_back(pc + 1);
+                    pc = static_cast<std::size_t>(insn.imm);
+                    break;
+                case VmOpcode::Ret:
+                    if (tls_call_stack.empty()) { finalize_state(); return state; }
+                    pc = tls_call_stack.back();
+                    tls_call_stack.pop_back();
+                    break;
+                case VmOpcode::Halt:
+                    finalize_state();
+                    if (insn.dst == 0xFF) {
+                        return core::diagnostics::Result<VmExecState>::err(ErrorCode::OutOfBounds, "Unauthorized indirect control-flow target at runtime", "VmInterpreter::execute_lazy");
+                    }
+                    return state;
+                case VmOpcode::CallExt: {
+                    if (!options.external_call_handler) {
+                        finalize_state();
+                        return core::diagnostics::Result<VmExecState>::err(ErrorCode::UnsupportedFormat, "External call requires external_call_handler", "VmInterpreter::execute_lazy");
+                    }
+                    std::memcpy(state.regs.data(), regs, sizeof(regs));
+                    auto res = options.external_call_handler(insn.imm, state.regs);
+                    if (!res.has_value()) {
+                        finalize_state();
+                        return core::diagnostics::Result<VmExecState>::err(ErrorCode::UnsupportedFormat, "Unauthorized or failed external call target", "VmInterpreter::execute_lazy");
+                    }
+                    regs[0] = *res;
+                    ++pc;
+                    break;
+                }
+                default:
+                    // SIMD/FP fallthrough: execute via prepared block semantics
+                    if (insn.opcode == VmOpcode::VAddF64 || insn.opcode == VmOpcode::VSubF64 ||
+                        insn.opcode == VmOpcode::VMulF64 || insn.opcode == VmOpcode::VDivF64) {
+                        double a = 0.0, b = 0.0;
+                        std::memcpy(&a, &state.vregs[insn.src1][0], 8);
+                        std::memcpy(&b, &state.vregs[insn.src2][0], 8);
+                        const double r = (insn.opcode == VmOpcode::VAddF64) ? (a + b) :
+                                         (insn.opcode == VmOpcode::VSubF64) ? (a - b) :
+                                         (insn.opcode == VmOpcode::VMulF64) ? (a * b) : (a / b);
+                        std::memcpy(&state.vregs[insn.dst][0], &r, 8);
+                    } else if (insn.opcode == VmOpcode::VMovReg) {
+                        state.vregs[insn.dst] = state.vregs[insn.src1];
+                    } else if (insn.opcode == VmOpcode::VXor) {
+                        state.vregs[insn.dst][0] = state.vregs[insn.src1][0] ^ state.vregs[insn.src2][0];
+                        state.vregs[insn.dst][1] = state.vregs[insn.src1][1] ^ state.vregs[insn.src2][1];
+                    } else if (insn.opcode == VmOpcode::VAnd) {
+                        state.vregs[insn.dst][0] = state.vregs[insn.src1][0] & state.vregs[insn.src2][0];
+                        state.vregs[insn.dst][1] = state.vregs[insn.src1][1] & state.vregs[insn.src2][1];
+                    } else if (insn.opcode == VmOpcode::VOr) {
+                        state.vregs[insn.dst][0] = state.vregs[insn.src1][0] | state.vregs[insn.src2][0];
+                        state.vregs[insn.dst][1] = state.vregs[insn.src1][1] | state.vregs[insn.src2][1];
+                    }
+                    ++pc;
+                    break;
+            }
+        }
+    }
+
+    finalize_state();
+    return state;
+}
+
 } // namespace bytemorph::virt

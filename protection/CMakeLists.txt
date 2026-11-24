@@ -1,6 +1,7 @@
 add_library(bytemorph_prot STATIC
     ${monocypher_SOURCE_DIR}/src/monocypher.c
     src/crypto_aead.cpp
+    src/lazy_bytecode.cpp
     src/native_vm_emitter.cpp
     src/pe_rewriter.cpp
     src/elf_rewriter.cpp

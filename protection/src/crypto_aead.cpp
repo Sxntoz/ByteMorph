@@ -17,6 +17,42 @@ AeadKey CryptoAead::derive_key_from_seed(std::uint64_t seed, std::string_view do
     return key;
 }
 
+AeadKey CryptoAead::derive_block_key(const AeadKey& master_key,
+                                     std::uint32_t fn_index,
+                                     std::uint32_t block_id,
+                                     std::string_view domain) {
+    AeadKey subkey;
+    crypto_blake2b_ctx ctx;
+    crypto_blake2b_keyed_init(&ctx, subkey.bytes.size(), master_key.bytes.data(), master_key.bytes.size());
+    const char kdf_tag[] = "BM_BLK_KDF_v1";
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(kdf_tag), sizeof(kdf_tag) - 1);
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(domain.data()), domain.size());
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&fn_index), sizeof(fn_index));
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&block_id), sizeof(block_id));
+    crypto_blake2b_final(&ctx, subkey.bytes.data());
+    crypto_wipe(&ctx, sizeof(ctx));
+    return subkey;
+}
+
+AeadNonce CryptoAead::generate_block_nonce(std::uint64_t seed,
+                                           std::uint32_t fn_index,
+                                           std::uint32_t block_id) {
+    AeadNonce nonce;
+    std::array<std::uint8_t, 32> digest{};
+    crypto_blake2b_ctx ctx;
+    crypto_blake2b_init(&ctx, digest.size());
+    const char tag[] = "BM_BLK_NONCE_v1";
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(tag), sizeof(tag) - 1);
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&seed), sizeof(seed));
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&fn_index), sizeof(fn_index));
+    crypto_blake2b_update(&ctx, reinterpret_cast<const std::uint8_t*>(&block_id), sizeof(block_id));
+    crypto_blake2b_final(&ctx, digest.data());
+    std::memcpy(nonce.bytes.data(), digest.data(), nonce.bytes.size());
+    crypto_wipe(digest.data(), digest.size());
+    crypto_wipe(&ctx, sizeof(ctx));
+    return nonce;
+}
+
 AeadNonce CryptoAead::generate_nonce(std::uint64_t seed, std::uint64_t counter) {
     AeadNonce nonce;
     std::array<std::uint8_t, 32> digest{};

@@ -270,6 +270,9 @@ MachOParser::parse(std::vector<std::uint8_t> buffer) const {
             ImportInfo ii;
             ii.symbol = si.name;
             ii.address = si.address;
+            if (ii.address == 0 && sym.has_binding_info() && sym.binding_info() != nullptr) {
+                ii.address = sym.binding_info()->address();
+            }
             if (sym.has_binding_info() && sym.binding_info() != nullptr && sym.binding_info()->has_library()) {
                 ii.library = sym.binding_info()->library()->name();
             }

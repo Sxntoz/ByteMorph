@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0] - 2026-11-24
+
+### Adicionado
+- **Lazy Bytecode Decryption & Derivação por Bloco:**
+  - `CryptoAead::derive_block_key` (`BLAKE2b-256` keyed) e `CryptoAead::generate_block_nonce` com separação de domínios (`bm.lazy.block.v1`, `BM_BLK_KDF_v1`, `BM_BLK_NONCE_v1`).
+  - `LazyBytecodeEngine` (`seal_function`, `open_block`, `verify_block_aead`, `verify_all_blocks`, `execute_lazy`) com AAD `BMLB` v1 vinculada a `(fn_index, block_id, start_pc, insn_count, plain_bytes)` e formato `BMP4` v3 retrocompatível com v1/v2.
+- **Bytecode Cache 2.0:**
+  - `VmInterpreter::split_into_basic_blocks`, `VmInterpreter::execute_lazy` e `VmBytecodeCache` (LRU thread-safe, `max_bytes`/`max_entries`, isolamento por `context_id`, métricas de hits/misses/evictions e wipe `volatile` ao despejar/invalidar).
+- **Dynamic Linking Compatibility:**
+  - Suporte a **Delayed Imports** e **imports por ordinal (`#N`)** no `PeParser`, relocations `JUMP_SLOT`/`GLOB_DAT` no `ElfParser`, e `binding_info()->address()` no `MachOParser`.
+- **CLI v0.13 & Documentação:**
+  - `--bytecode-mode <eager|lazy>`, `protection-info --blocks`, `benchmark-protection --lazy-vs-eager`, `report --format json` com `encrypted_blocks_count`/`blocks_verified_count`, e [docs/LAZY_CACHE.md](docs/LAZY_CACHE.md).
+- **Testes:** 5 novos testes `ProtectionV013Test` (93 testes C++ + 3 testes Rust aprovados).
+
 ## [0.12.0] - 2026-11-24
 
 ### Adicionado

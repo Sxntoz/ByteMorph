@@ -269,10 +269,27 @@ MachORewriter::protect_file(const std::filesystem::path& input,
 
         ProtectionMetadata meta;
         meta.profile = options.profile;
+        meta.bytecode_mode = options.bytecode_mode;
         meta.seed = options.seed;
         meta.bytecode_encrypted = rt_opts.encrypt_bytecode;
         meta.text_blake2b = CryptoAead::blake2b_256(text_content);
         meta.runtime_blake2b = CryptoAead::blake2b_256(runtime_bytes);
+        if (options.bytecode_mode == BytecodeMode::Lazy) {
+            auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
+            for (std::size_t i = 0; i < progs.size(); ++i) {
+                auto sealed_fn = LazyBytecodeEngine::seal_function(
+                    progs[i], rt_key, options.seed, static_cast<std::uint32_t>(i));
+                if (!sealed_fn) {
+                    CryptoAead::secure_wipe(rt_key.bytes);
+                    return diagnostics::Result<ProtectionReport>::err(
+                        sealed_fn.error().code, sealed_fn.error().message, "MachORewriter::protect_file");
+                }
+                for (auto& blk : sealed_fn.value().blocks) {
+                    meta.lazy_blocks.push_back(std::move(blk));
+                }
+            }
+            CryptoAead::secure_wipe(rt_key.bytes);
+        }
         meta.protected_strings_count = str_cnt;
         if (rt_opts.encrypt_bytecode) {
             for (std::size_t i = 0; i < progs.size(); ++i) {
@@ -420,10 +437,22 @@ MachORewriter::verify_file(const std::filesystem::path& path) const {
         aad.insert(aad.end(), cur_text.begin(), cur_text.end());
         aad.insert(aad.end(), cur_rt.begin(), cur_rt.end());
         const bool slice_aead_ok = CryptoAead::open(meta_res.value().sealed_payload, aad, key).has_value();
+        bool slice_blocks_ok = true;
+        if (slice_aead_ok && meta_res.value().bytecode_mode == BytecodeMode::Lazy) {
+            auto rt_key = CryptoAead::derive_key_from_seed(meta_res.value().seed, "ByteMorph-v0.10-Runtime");
+            for (const auto& lb : meta_res.value().lazy_blocks) {
+                if (!LazyBytecodeEngine::verify_block_aead(lb, rt_key)) {
+                    slice_blocks_ok = false;
+                    break;
+                }
+                ++rep.blocks_verified_count;
+            }
+            CryptoAead::secure_wipe(rt_key.bytes);
+        }
 
         rep.text_integrity_ok = rep.text_integrity_ok && slice_text_ok;
         rep.runtime_integrity_ok = rep.runtime_integrity_ok && slice_rt_ok;
-        rep.aead_authenticated = rep.aead_authenticated && slice_aead_ok;
+        rep.aead_authenticated = rep.aead_authenticated && slice_aead_ok && slice_blocks_ok;
 
         if (s == 0) {
             rep.metadata = std::move(meta_res.value());

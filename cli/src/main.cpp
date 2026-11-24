@@ -11,6 +11,8 @@
 #include "bytemorph/formats/macho/macho_parser.hpp"
 #include "bytemorph/formats/pe/pe_parser.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
+#include "bytemorph/prot/crypto_aead.hpp"
+#include "bytemorph/prot/lazy_bytecode.hpp"
 #include "bytemorph/prot/native_vm_emitter.hpp"
 #include "bytemorph/prot/pe_rewriter.hpp"
 #include "bytemorph/virt/asmjit_prototype.hpp"
@@ -38,7 +40,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.12.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.13.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -802,7 +804,7 @@ int cmd_verify(const std::string& path, bool deep = false) {
     return (v.valid && deep_ok) ? 0 : 2;
 }
 
-int cmd_protection_info(const std::string& path, bool functions_only, const std::string& format) {
+int cmd_protection_info(const std::string& path, bool functions_only, bool blocks_only, const std::string& format) {
     auto res = bytemorph::prot::ProtectionEngine::verify(path);
     if (!res) {
         std::cerr << "Protection info failed: " << res.error().to_string() << '\n';
@@ -812,8 +814,11 @@ int cmd_protection_info(const std::string& path, bool functions_only, const std:
     if (format == "json") {
         std::cout << "{\n"
                   << "  \"format\": \"BMP4\",\n"
-                  << "  \"version\": 1,\n"
+                  << "  \"version\": " << bytemorph::prot::ProtectionMetadata::kVersion << ",\n"
                   << "  \"profile\": \"" << json_escape(bytemorph::prot::to_string(m.profile)) << "\",\n"
+                  << "  \"bytecode_mode\": \"" << json_escape(bytemorph::prot::to_string(m.bytecode_mode)) << "\",\n"
+                  << "  \"encrypted_blocks_count\": " << m.lazy_blocks.size() << ",\n"
+                  << "  \"blocks_verified_count\": " << res.value().blocks_verified_count << ",\n"
                   << "  \"seed\": \"" << hex_u64(m.seed) << "\",\n"
                   << "  \"protected_strings_count\": " << m.protected_strings_count << ",\n"
                   << "  \"integrity_valid\": " << (res.value().valid ? "true" : "false") << ",\n"
@@ -830,6 +835,18 @@ int cmd_protection_info(const std::string& path, bool functions_only, const std:
                       << (i + 1 < m.functions.size() ? "," : "") << '\n';
         }
         std::cout << "  ]\n}\n";
+        return 0;
+    }
+    if (blocks_only) {
+        std::cout << "Encrypted Lazy Blocks (" << m.lazy_blocks.size()
+                  << ", verified=" << res.value().blocks_verified_count << "):\n";
+        for (const auto& lb : m.lazy_blocks) {
+            std::cout << "  fn=" << lb.fn_index
+                      << " | blk=" << lb.block_id
+                      << " | start_pc=" << lb.start_pc
+                      << " | insns=" << lb.insn_count
+                      << " | ct_bytes=" << lb.ciphertext.size() << '\n';
+        }
         return 0;
     }
     if (functions_only) {
@@ -859,7 +876,7 @@ int cmd_protection_info(const std::string& path, bool functions_only, const std:
     return 0;
 }
 
-int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_bench = false, bool crypto_bench = false) {
+int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_bench = false, bool crypto_bench = false, bool lazy_vs_eager = false) {
     auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
     if (!cmp_res) {
         std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
@@ -1040,19 +1057,76 @@ int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_b
         }
 
         if (compare_baseline) {
-            constexpr double kV011Interpreter10kMs = 0.760;
-            constexpr double kV011ExtBridge10kMs = 0.550;
-            constexpr double kV011Memory10kMs = 2.393;
-            const double interp_delta_pct = ((arith_10k - kV011Interpreter10kMs) / kV011Interpreter10kMs) * 100.0;
-            const double ext_delta_pct = ((ext_10k - kV011ExtBridge10kMs) / kV011ExtBridge10kMs) * 100.0;
-            const double mem_delta_pct = ((mem_pooled_10k - kV011Memory10kMs) / kV011Memory10kMs) * 100.0;
-            std::cout << "  --- Baseline Comparison (v0.11 -> v0.12) ---\n"
-                      << "    VM Interpreter (10k eq.)  : v0.11=" << std::setprecision(3) << kV011Interpreter10kMs
-                      << " ms -> v0.12=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
-                      << "    Memory Load/Store (10k)   : v0.11=" << std::setprecision(3) << kV011Memory10kMs
-                      << " ms -> v0.12=" << mem_pooled_10k << " ms (" << std::setprecision(1) << mem_delta_pct << "%)\n"
-                      << "    External Call Bridge (10k): v0.11=" << std::setprecision(3) << kV011ExtBridge10kMs
-                      << " ms -> v0.12=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
+            constexpr double kV012Interpreter10kMs = 0.533;
+            constexpr double kV012ExtBridge10kMs = 0.494;
+            constexpr double kV012Memory10kMs = 0.724;
+            const double interp_delta_pct = ((arith_10k - kV012Interpreter10kMs) / kV012Interpreter10kMs) * 100.0;
+            const double ext_delta_pct = ((ext_10k - kV012ExtBridge10kMs) / kV012ExtBridge10kMs) * 100.0;
+            const double mem_delta_pct = ((mem_pooled_10k - kV012Memory10kMs) / kV012Memory10kMs) * 100.0;
+            std::cout << "  --- Baseline Comparison (v0.12 -> v0.13) ---\n"
+                      << "    VM Interpreter (10k eq.)  : v0.12=" << std::setprecision(3) << kV012Interpreter10kMs
+                      << " ms -> v0.13=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
+                      << "    Memory Load/Store (10k)   : v0.12=" << std::setprecision(3) << kV012Memory10kMs
+                      << " ms -> v0.13=" << mem_pooled_10k << " ms (" << std::setprecision(1) << mem_delta_pct << "%)\n"
+                      << "    External Call Bridge (10k): v0.12=" << std::setprecision(3) << kV012ExtBridge10kMs
+                      << " ms -> v0.13=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
+        }
+    }
+
+    if (lazy_vs_eager) {
+        bytemorph::virt::BvmProgram loop_prog;
+        loop_prog.build_seed = 0x1337BEEFULL;
+        loop_prog.instructions = {
+            {bytemorph::virt::VmOpcode::MovImm, 1, 0, 0, 10},
+            {bytemorph::virt::VmOpcode::MovImm, 2, 0, 0, 0},
+            {bytemorph::virt::VmOpcode::MovImm, 3, 0, 0, 1},
+            {bytemorph::virt::VmOpcode::Add, 2, 2, 1, 0},
+            {bytemorph::virt::VmOpcode::Sub, 1, 1, 3, 0},
+            {bytemorph::virt::VmOpcode::Cmp, 1, 1, 0, 0},
+            {bytemorph::virt::VmOpcode::Jgt, 0, 0, 0, 3},
+            {bytemorph::virt::VmOpcode::MovReg, 0, 2, 0, 0},
+            {bytemorph::virt::VmOpcode::Ret, 0, 0, 0, 0}
+        };
+        const auto mkey = bytemorph::prot::CryptoAead::derive_key_from_seed(0x1337ULL, "bm.rt.v10");
+        auto sealed_blob = bytemorph::prot::LazyBytecodeEngine::seal_function(loop_prog, mkey, 0x1337ULL, 0);
+        if (sealed_blob) {
+            bytemorph::virt::VmExecOptions lopts;
+            lopts.initial_regs[0] = 0;
+
+            const auto te0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 1000; ++i) {
+                auto er = bytemorph::virt::VmInterpreter::execute(loop_prog, lopts);
+                if (!er) return 1;
+            }
+            const auto te1 = std::chrono::steady_clock::now();
+            const double eager_ms = std::chrono::duration<double, std::milli>(te1 - te0).count();
+
+            bytemorph::virt::VmBytecodeCache warm_cache(64 * 1024, 128);
+            const auto tl0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 1000; ++i) {
+                auto lr = bytemorph::prot::LazyBytecodeEngine::execute_lazy(sealed_blob.value(), mkey, warm_cache, lopts);
+                if (!lr) return 1;
+            }
+            const auto tl1 = std::chrono::steady_clock::now();
+            const double lazy_warm_ms = std::chrono::duration<double, std::milli>(tl1 - tl0).count();
+
+            bytemorph::virt::VmBytecodeCache cold_cache(64 * 1024, 128);
+            const auto tc0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 200; ++i) {
+                cold_cache.invalidate_all();
+                auto lr = bytemorph::prot::LazyBytecodeEngine::execute_lazy(sealed_blob.value(), mkey, cold_cache, lopts);
+                if (!lr) return 1;
+            }
+            const auto tc1 = std::chrono::steady_clock::now();
+            const double lazy_cold_1k_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count() * 5.0;
+            const auto ws = warm_cache.stats();
+            std::cout << "  --- Lazy vs Eager Decryption (v0.13) ---\n"
+                      << "    Blocks Sealed             : " << sealed_blob.value().blocks.size() << '\n'
+                      << "    Eager Execution (1k)      : " << std::setprecision(3) << eager_ms << " ms\n"
+                      << "    Lazy Warm Cache (1k)      : " << std::setprecision(3) << lazy_warm_ms
+                      << " ms (hits=" << ws.hits << ", misses=" << ws.misses
+                      << ", cache_ram=" << ws.peak_bytes << "B)\n"
+                      << "    Lazy Cold Auth (1k eq.)   : " << std::setprecision(3) << lazy_cold_1k_ms << " ms\n";
         }
     }
 
@@ -1158,6 +1232,11 @@ int cmd_report(const std::string& path, const std::string& output_path) {
             << "    \"runtime_integrity_ok\": " << (v.runtime_integrity_ok ? "true" : "false") << ",\n"
             << "    \"aead_authenticated\": " << (v.aead_authenticated ? "true" : "false") << ",\n"
             << "    \"bytecode_encrypted\": " << (v.metadata.bytecode_encrypted ? "true" : "false") << ",\n"
+            << "    \"bytecode_mode\": \"" << json_escape(bytemorph::prot::to_string(v.metadata.bytecode_mode)) << "\",\n"
+            << "    \"encrypted_blocks_count\": " << v.metadata.lazy_blocks.size() << ",\n"
+            << "    \"blocks_verified_count\": " << v.blocks_verified_count << ",\n"
+            << "    \"algorithm\": \"XChaCha20-Poly1305 + BLAKE2b-256\",\n"
+            << "    \"format_version\": " << bytemorph::prot::ProtectionMetadata::kVersion << ",\n"
             << "    \"profile\": \"" << json_escape(bytemorph::prot::to_string(v.metadata.profile)) << "\"\n"
             << "  },\n  \"protected_functions\": [\n";
         for (std::size_t i = 0; i < v.metadata.functions.size(); ++i) {
@@ -1214,7 +1293,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.12.0\n";
+        std::cout << "ByteMorph v0.13.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -1225,20 +1304,23 @@ int main(int argc, char* argv[]) {
         bool compare_baseline = false;
         bool memory_bench = false;
         bool crypto_bench = false;
+        bool lazy_vs_eager = false;
         for (int i = 2; i < argc; ++i) {
             const std::string_view a = argv[i];
             if (a == "--detailed") detailed = true;
             else if (a == "--compare-baseline") compare_baseline = true;
             else if (a == "--memory") memory_bench = true;
             else if (a == "--crypto") crypto_bench = true;
+            else if (a == "--lazy-vs-eager") lazy_vs_eager = true;
             else if (a == "--full") {
                 detailed = true;
                 compare_baseline = true;
                 memory_bench = true;
                 crypto_bench = true;
+                lazy_vs_eager = true;
             }
         }
-        return cmd_benchmark_protection(detailed, compare_baseline, memory_bench, crypto_bench);
+        return cmd_benchmark_protection(detailed, compare_baseline, memory_bench, crypto_bench, lazy_vs_eager);
     }
     if (cmd == "test-equivalence") {
         if (argc < 4) {
@@ -1282,6 +1364,7 @@ int main(int argc, char* argv[]) {
     bool exceptions_only = false;
     bool deep_verify = false;
     bool detailed_flag = false;
+    bool blocks_only = false;
     bytemorph::prot::ProtectOptions prot_opts;
 
     for (int i = arg_start; i < argc; ++i) {
@@ -1363,6 +1446,18 @@ int main(int argc, char* argv[]) {
             exceptions_only = true;
         } else if (arg == "--encrypt-bytecode") {
             prot_opts.encrypt_bytecode = true;
+        } else if (arg == "--bytecode-mode" && i + 1 < argc) {
+            std::string_view m = argv[++i];
+            if (m == "eager") prot_opts.bytecode_mode = bytemorph::prot::BytecodeMode::Eager;
+            else if (m == "lazy") {
+                prot_opts.bytecode_mode = bytemorph::prot::BytecodeMode::Lazy;
+                prot_opts.encrypt_bytecode = true;
+            } else {
+                std::cerr << "Invalid --bytecode-mode (expected eager|lazy)\n";
+                return 1;
+            }
+        } else if (arg == "--blocks") {
+            blocks_only = true;
         } else if (arg == "--max-overhead" && i + 1 < argc) {
             try {
                 prot_opts.max_overhead_budget_pct = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -1436,7 +1531,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls, detailed_flag);
     if (cmd == "verify") return cmd_verify(file_path, deep_verify);
     if (cmd == "report") return cmd_report(file_path, output_path);
-    if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only, output_format);
+    if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only, blocks_only, output_format);
     if (cmd == "analyze" && exceptions_only) return cmd_analyze_exceptions(file_path);
     if (cmd == "analyze" && !eligibility_report_path.empty()) {
         return cmd_eligibility_report(file_path, eligibility_report_path, prot_opts.allow_external_calls);

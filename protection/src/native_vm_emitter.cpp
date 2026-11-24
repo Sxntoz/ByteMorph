@@ -68,7 +68,10 @@ std::vector<std::uint8_t> serialize_metadata(const ProtectionMetadata& m) {
     write_u32(out, ProtectionMetadata::kMagic);
     write_u16(out, ProtectionMetadata::kVersion);
     out.push_back(static_cast<std::uint8_t>(m.profile));
-    out.push_back(m.bytecode_encrypted ? 1 : 0);
+    const std::uint8_t flags =
+        static_cast<std::uint8_t>((m.bytecode_encrypted ? 1u : 0u) |
+                                  ((m.bytecode_mode == BytecodeMode::Lazy) ? 2u : 0u));
+    out.push_back(flags);
     write_u64(out, m.seed);
     out.insert(out.end(), m.text_blake2b.begin(), m.text_blake2b.end());
     out.insert(out.end(), m.runtime_blake2b.begin(), m.runtime_blake2b.end());
@@ -97,6 +100,20 @@ std::vector<std::uint8_t> serialize_metadata(const ProtectionMetadata& m) {
             out.insert(out.end(), ef.aad_hash.begin(), ef.aad_hash.end());
         }
     }
+    if (m.bytecode_mode == BytecodeMode::Lazy) {
+        write_u32(out, static_cast<std::uint32_t>(m.lazy_blocks.size()));
+        for (const auto& lb : m.lazy_blocks) {
+            write_u32(out, lb.fn_index);
+            write_u32(out, lb.block_id);
+            write_u32(out, lb.start_pc);
+            write_u32(out, lb.insn_count);
+            out.insert(out.end(), lb.nonce.bytes.begin(), lb.nonce.bytes.end());
+            out.insert(out.end(), lb.mac.begin(), lb.mac.end());
+            out.insert(out.end(), lb.aad_hash.begin(), lb.aad_hash.end());
+            write_u32(out, static_cast<std::uint32_t>(lb.ciphertext.size()));
+            out.insert(out.end(), lb.ciphertext.begin(), lb.ciphertext.end());
+        }
+    }
     return out;
 }
 
@@ -113,7 +130,7 @@ diagnostics::Result<ProtectionMetadata> deserialize_metadata(std::span<const std
             ErrorCode::InvalidMagic, "Invalid .bmvm protection magic (expected BMP4)", "deserialize_metadata");
     }
     const std::uint16_t meta_ver = read_u16(data, 4);
-    if (meta_ver != 1 && meta_ver != ProtectionMetadata::kVersion) {
+    if (meta_ver != 1 && meta_ver != 2 && meta_ver != ProtectionMetadata::kVersion) {
         return diagnostics::Result<ProtectionMetadata>::err(
             ErrorCode::UnsupportedFormat, "Unsupported BMP4 metadata version", "deserialize_metadata");
     }
@@ -125,6 +142,7 @@ diagnostics::Result<ProtectionMetadata> deserialize_metadata(std::span<const std
     }
     m.profile = static_cast<ProtectionProfile>(prof);
     m.bytecode_encrypted = (meta_ver >= 2 && (data[7] & 1) != 0);
+    m.bytecode_mode = (meta_ver >= 3 && (data[7] & 2) != 0) ? BytecodeMode::Lazy : BytecodeMode::Eager;
     m.seed = read_u64(data, 8);
 
     std::size_t pos = 16;
@@ -195,6 +213,46 @@ diagnostics::Result<ProtectionMetadata> deserialize_metadata(std::span<const std
                 }
             }
             m.encrypted_functions.push_back(ef);
+        }
+    }
+    if (m.bytecode_mode == BytecodeMode::Lazy) {
+        if (pos + 4 > data.size()) {
+            return diagnostics::Result<ProtectionMetadata>::err(ErrorCode::TruncatedData, "Missing lazy block count", "deserialize_metadata");
+        }
+        const std::uint32_t lb_cnt = read_u32(data, pos); pos += 4;
+        if (lb_cnt > 16384) {
+            return diagnostics::Result<ProtectionMetadata>::err(ErrorCode::OutOfBounds, "Excessive lazy block count in BMP4", "deserialize_metadata");
+        }
+        m.lazy_blocks.reserve(lb_cnt);
+        for (std::uint32_t i = 0; i < lb_cnt; ++i) {
+            if (pos + 16 + 24 + 16 + 32 + 4 > data.size()) {
+                return diagnostics::Result<ProtectionMetadata>::err(ErrorCode::TruncatedData, "Truncated lazy block header", "deserialize_metadata");
+            }
+            LazyBlockRecord lb;
+            lb.fn_index = read_u32(data, pos); pos += 4;
+            lb.block_id = read_u32(data, pos); pos += 4;
+            lb.start_pc = read_u32(data, pos); pos += 4;
+            lb.insn_count = read_u32(data, pos); pos += 4;
+            std::memcpy(lb.nonce.bytes.data(), data.data() + pos, 24); pos += 24;
+            std::memcpy(lb.mac.data(), data.data() + pos, 16); pos += 16;
+            std::memcpy(lb.aad_hash.data(), data.data() + pos, 32); pos += 32;
+            const std::uint32_t ct_len = read_u32(data, pos); pos += 4;
+            if (pos + ct_len > data.size() || lb.insn_count == 0 ||
+                ct_len != static_cast<std::uint32_t>(lb.insn_count) * virt::BvmProgram::kInstructionSize) {
+                return diagnostics::Result<ProtectionMetadata>::err(
+                    ErrorCode::ParseError, "Invalid lazy block size or truncated ciphertext in BMP4", "deserialize_metadata");
+            }
+            lb.ciphertext.assign(data.begin() + static_cast<std::ptrdiff_t>(pos),
+                                 data.begin() + static_cast<std::ptrdiff_t>(pos + ct_len));
+            pos += ct_len;
+            for (const auto& prev : m.lazy_blocks) {
+                if ((prev.fn_index == lb.fn_index && prev.block_id == lb.block_id) ||
+                    prev.nonce.bytes == lb.nonce.bytes) {
+                    return diagnostics::Result<ProtectionMetadata>::err(
+                        ErrorCode::ParseError, "Duplicate lazy block id or nonce in BMP4", "deserialize_metadata");
+                }
+            }
+            m.lazy_blocks.push_back(std::move(lb));
         }
     }
     return m;

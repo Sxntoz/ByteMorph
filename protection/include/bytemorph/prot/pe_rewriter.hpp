@@ -3,6 +3,7 @@
 #include "bytemorph/core/binary/types.hpp"
 #include "bytemorph/core/diagnostics/error.hpp"
 #include "bytemorph/prot/crypto_aead.hpp"
+#include "bytemorph/prot/lazy_bytecode.hpp"
 
 #include <array>
 #include <cstdint>
@@ -29,8 +30,22 @@ enum class ProtectionProfile : std::uint8_t {
     return "balanced";
 }
 
+enum class BytecodeMode : std::uint8_t {
+    Eager = 0,
+    Lazy = 1
+};
+
+[[nodiscard]] inline std::string_view to_string(BytecodeMode m) noexcept {
+    switch (m) {
+        case BytecodeMode::Eager: return "eager";
+        case BytecodeMode::Lazy: return "lazy";
+    }
+    return "eager";
+}
+
 struct ProtectOptions {
     ProtectionProfile profile{ProtectionProfile::Balanced};
+    BytecodeMode bytecode_mode{BytecodeMode::Eager};
     std::uint64_t seed{0x425954453034ULL};
     std::optional<std::uint64_t> target_function_rva;
     std::string target_function_name;
@@ -108,9 +123,10 @@ struct EncryptedBytecodeRecord {
 
 struct ProtectionMetadata {
     static constexpr std::uint32_t kMagic = 0x34504D42u; // "BMP4" LE
-    static constexpr std::uint16_t kVersion = 2;
+    static constexpr std::uint16_t kVersion = 3;
 
     ProtectionProfile profile{ProtectionProfile::Balanced};
+    BytecodeMode bytecode_mode{BytecodeMode::Eager};
     std::uint64_t seed{0};
     bool bytecode_encrypted{false};
     std::array<std::uint8_t, 32> text_blake2b{};
@@ -119,17 +135,20 @@ struct ProtectionMetadata {
     std::vector<ProtectedFunctionRecord> functions;
     std::uint32_t protected_strings_count{0};
     std::vector<EncryptedBytecodeRecord> encrypted_functions;
+    std::vector<LazyBlockRecord> lazy_blocks;
 };
 
 struct ProtectionReport {
     core::binary::BinaryFormat format{core::binary::BinaryFormat::Unknown};
     core::binary::Architecture architecture{core::binary::Architecture::Unknown};
     ProtectionProfile profile{ProtectionProfile::Balanced};
+    BytecodeMode bytecode_mode{BytecodeMode::Eager};
     std::uint64_t seed{0};
     std::uint64_t input_size{0};
     std::uint64_t output_size{0};
     std::vector<ProtectedFunctionRecord> protected_functions;
     std::uint32_t protected_strings_count{0};
+    std::uint32_t encrypted_blocks_count{0};
     std::uint32_t total_functions_analyzed{0};
     std::uint32_t eligible_functions_count{0};
     std::vector<FunctionCompatibilityEntry> rejected_functions;
@@ -145,6 +164,7 @@ struct VerifyReport {
     bool aead_authenticated{false};
     bool text_integrity_ok{false};
     bool runtime_integrity_ok{false};
+    std::uint32_t blocks_verified_count{0};
     ProtectionMetadata metadata;
     std::string summary;
 };

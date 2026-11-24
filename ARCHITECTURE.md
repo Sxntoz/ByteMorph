@@ -1,4 +1,4 @@
-# Arquitetura do ByteMorph (v0.12)
+# Arquitetura do ByteMorph (v0.13)
 
 ## Camadas
 

@@ -218,27 +218,44 @@ PeRewriter::protect_file(const std::filesystem::path& input,
 
     ProtectionMetadata meta;
     meta.profile = options.profile;
+    meta.bytecode_mode = options.bytecode_mode;
     meta.seed = options.seed;
     meta.bytecode_encrypted = rt_opts.encrypt_bytecode;
     meta.text_blake2b = CryptoAead::blake2b_256(text_sec->content());
     meta.runtime_blake2b = CryptoAead::blake2b_256(runtime_bytes);
     meta.protected_strings_count = str_cnt;
-    if (rt_opts.encrypt_bytecode) {
-        const auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
-        for (std::size_t i = 0; i < progs.size(); ++i) {
-            const std::uint32_t plain_sz = static_cast<std::uint32_t>(4 + progs[i].instructions.size() * 12);
-            const auto nonce = CryptoAead::generate_nonce(rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)), i + 100);
-            std::array<std::uint8_t, 16> aad{};
-            const std::uint32_t words[4] = {0x43424D42u, 2u, static_cast<std::uint32_t>(i), plain_sz};
-            std::memcpy(aad.data(), words, sizeof(words));
-            EncryptedBytecodeRecord ef;
-            ef.fn_index = static_cast<std::uint32_t>(i);
-            ef.nonce = nonce;
-            ef.plaintext_size = plain_sz;
-            ef.aad_hash = CryptoAead::blake2b_256(aad);
-            (void)rt_key;
-            meta.encrypted_functions.push_back(ef);
+    if (rt_opts.encrypt_bytecode || options.bytecode_mode == BytecodeMode::Lazy) {
+        auto rt_key = CryptoAead::derive_key_from_seed(rt_opts.seed, rt_opts.key_domain);
+        if (rt_opts.encrypt_bytecode) {
+            for (std::size_t i = 0; i < progs.size(); ++i) {
+                const std::uint32_t plain_sz = static_cast<std::uint32_t>(4 + progs[i].instructions.size() * 12);
+                const auto nonce = CryptoAead::generate_nonce(rt_opts.seed ^ (0x9E3779B97F4A7C15ULL * (i + 1)), i + 100);
+                std::array<std::uint8_t, 16> aad{};
+                const std::uint32_t words[4] = {0x43424D42u, 2u, static_cast<std::uint32_t>(i), plain_sz};
+                std::memcpy(aad.data(), words, sizeof(words));
+                EncryptedBytecodeRecord ef;
+                ef.fn_index = static_cast<std::uint32_t>(i);
+                ef.nonce = nonce;
+                ef.plaintext_size = plain_sz;
+                ef.aad_hash = CryptoAead::blake2b_256(aad);
+                meta.encrypted_functions.push_back(ef);
+            }
         }
+        if (options.bytecode_mode == BytecodeMode::Lazy) {
+            for (std::size_t i = 0; i < progs.size(); ++i) {
+                auto sealed_fn = LazyBytecodeEngine::seal_function(
+                    progs[i], rt_key, options.seed, static_cast<std::uint32_t>(i));
+                if (!sealed_fn) {
+                    CryptoAead::secure_wipe(rt_key.bytes);
+                    return diagnostics::Result<ProtectionReport>::err(
+                        sealed_fn.error().code, sealed_fn.error().message, "PeRewriter::protect_file");
+                }
+                for (auto& blk : sealed_fn.value().blocks) {
+                    meta.lazy_blocks.push_back(std::move(blk));
+                }
+            }
+        }
+        CryptoAead::secure_wipe(rt_key.bytes);
     }
     for (std::size_t i = 0; i < plan.prepared.size(); ++i) {
         const auto& pf = plan.prepared[i];
@@ -307,11 +324,13 @@ PeRewriter::protect_file(const std::filesystem::path& input,
     rep.format = BinaryFormat::PE32Plus;
     rep.architecture = bin.info().architecture;
     rep.profile = options.profile;
+    rep.bytecode_mode = options.bytecode_mode;
     rep.seed = options.seed;
     rep.input_size = bin.info().file_size;
     rep.output_size = std::filesystem::file_size(output, ec);
     rep.protected_functions = meta.functions;
     rep.protected_strings_count = meta.protected_strings_count;
+    rep.encrypted_blocks_count = static_cast<std::uint32_t>(meta.lazy_blocks.size());
     rep.aslr_preserved = bin.info().is_pie;
     rep.dep_preserved = bin.info().has_nx;
     rep.total_functions_analyzed = plan.total_analyzed;
@@ -365,6 +384,18 @@ PeRewriter::verify_file(const std::filesystem::path& path) const {
 
     auto open_res = CryptoAead::open(rep.metadata.sealed_payload, aad, key);
     rep.aead_authenticated = open_res.has_value();
+    if (rep.aead_authenticated && rep.metadata.bytecode_mode == BytecodeMode::Lazy) {
+        auto rt_key = CryptoAead::derive_key_from_seed(rep.metadata.seed, "ByteMorph-v0.10-Runtime");
+        for (const auto& lb : rep.metadata.lazy_blocks) {
+            auto blk_ok = LazyBytecodeEngine::verify_block_aead(lb, rt_key);
+            if (!blk_ok) {
+                rep.aead_authenticated = false;
+                break;
+            }
+            ++rep.blocks_verified_count;
+        }
+        CryptoAead::secure_wipe(rt_key.bytes);
+    }
     rep.valid = rep.text_integrity_ok && rep.runtime_integrity_ok && rep.aead_authenticated;
     rep.summary = rep.valid ? "Integrity and AEAD authentication verified" : "Tampering detected";
     return rep;
