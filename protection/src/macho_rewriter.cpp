@@ -353,6 +353,8 @@ MachORewriter::protect_file(const std::filesystem::path& input,
         rep.protected_functions.insert(rep.protected_functions.end(),
                                        meta.functions.begin(),
                                        meta.functions.end());
+        rep.bytecode_mode = options.bytecode_mode;
+        rep.encrypted_blocks_count += static_cast<std::uint32_t>(meta.lazy_blocks.size());
         rep.protected_strings_count += meta.protected_strings_count;
         rep.runtime_bytes_size += effective_rt_size;
     }
