@@ -1,4 +1,5 @@
 #include "bytemorph/prot/pe_rewriter.hpp"
+#include "bytemorph/prot/native_vm_emitter.hpp"
 
 #include "bytemorph/arch/aarch64/aarch64_disasm.hpp"
 #include "bytemorph/arch/aarch64/aarch64_lifter.hpp"
@@ -86,7 +87,6 @@ ProtectionEngine::check_compatibility(const std::filesystem::path& path,
     }
 
     const bool is_arm64 = (arch == Architecture::ARM64);
-    const std::size_t min_patch = is_arm64 ? 4 : 5;
 
     arch::x86_64::X86_64Disassembler x64_dis;
     arch::aarch64::AArch64Disassembler a64_dis;
@@ -100,65 +100,18 @@ ProtectionEngine::check_compatibility(const std::filesystem::path& path,
             an_res.error().code, an_res.error().message, "ProtectionEngine::check_compatibility");
     }
 
-    arch::x86_64::X86_64Lifter x64_lifter;
-    arch::aarch64::AArch64Lifter a64_lifter;
+    const auto auth_calls = allow_external_calls
+        ? detail::build_authorized_call_targets(bin, an_res.value())
+        : std::unordered_set<std::uint64_t>{};
 
     for (const auto& fn : an_res.value().functions) {
-        FunctionCompatibilityEntry entry;
-        entry.name = fn.name;
-        entry.entry_va = fn.entry_va;
-        entry.size_bytes = fn.size_bytes;
-
-        if (is_crt_or_entrypoint_stub(fn.name, fn.from_entry_point)) {
-            entry.eligible = false;
-            entry.rejection_reason = "Entry point or CRT/startup routine excluded from automatic virtualization";
+        auto entry = detail::evaluate_function_eligibility(
+            bin, an_res.value(), fn, auth_calls, allow_external_calls, is_arm64);
+        if (entry.eligible) {
+            rep.eligible_functions.push_back(std::move(entry));
+        } else {
             rep.rejected_functions.push_back(std::move(entry));
-            continue;
         }
-        if (fn.size_bytes < min_patch) {
-            entry.eligible = false;
-            entry.rejection_reason = "Function smaller than minimum trampoline patch size (" + std::to_string(min_patch) + " bytes)";
-            rep.rejected_functions.push_back(std::move(entry));
-            continue;
-        }
-        if (fn.confidence == AnalysisConfidence::Low) {
-            entry.eligible = false;
-            entry.rejection_reason = "Partially unknown CFG or invalid instructions in function body";
-            rep.rejected_functions.push_back(std::move(entry));
-            continue;
-        }
-
-        IrFunction ir_fn = is_arm64 ? a64_lifter.lift_function(fn) : x64_lifter.lift_function(fn);
-        for (const auto& bb : ir_fn.blocks) {
-            entry.ir_ops += static_cast<std::uint32_t>(bb.instructions.size());
-            for (const auto& insn : bb.instructions) {
-                if (insn.opcode == IrOpcode::Unknown || insn.opcode == IrOpcode::Syscall) {
-                    entry.unsupported_instructions.push_back(
-                        insn.comment.empty() ? std::string(ir::to_string(insn.opcode)) : insn.comment);
-                }
-            }
-        }
-
-        if (!entry.unsupported_instructions.empty()) {
-            entry.eligible = false;
-            entry.rejection_reason = "Contains unsupported instruction(s): " + entry.unsupported_instructions.front();
-            rep.rejected_functions.push_back(std::move(entry));
-            continue;
-        }
-
-        TranslateOptions t_opts;
-        t_opts.allow_external_calls = allow_external_calls;
-        auto bvm_res = IrToVmTranslator::translate(ir_fn, t_opts);
-        if (!bvm_res) {
-            entry.eligible = false;
-            entry.rejection_reason = bvm_res.error().message;
-            rep.rejected_functions.push_back(std::move(entry));
-            continue;
-        }
-
-        entry.eligible = true;
-        entry.vm_ops = static_cast<std::uint32_t>(bvm_res.value().instructions.size());
-        rep.eligible_functions.push_back(std::move(entry));
     }
 
     return rep;

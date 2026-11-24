@@ -137,13 +137,42 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
         insn.mnemonic == "paciasp" || insn.mnemonic == "autiasp") {
         ir.opcode = IrOpcode::Nop;
     } else if ((insn.mnemonic == "mov" || insn.mnemonic == "movz" || insn.mnemonic == "sxtw" ||
-                insn.mnemonic == "uxtw" || insn.mnemonic == "uxtb" || insn.mnemonic == "uxth" ||
                 insn.mnemonic == "sxtb" || insn.mnemonic == "sxth" ||
                 insn.mnemonic == "adr" || insn.mnemonic == "adrp") && ops.size() >= 2) {
         ir.opcode = IrOpcode::Mov;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
-    } else if (insn.mnemonic == "neg" && ops.size() >= 2) {
+    } else if (insn.mnemonic == "uxtb" && ops.size() >= 2) {
+        ir.opcode = IrOpcode::And;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(IrOperand::immediate(0xFF, 64));
+    } else if (insn.mnemonic == "uxth" && ops.size() >= 2) {
+        ir.opcode = IrOpcode::And;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(IrOperand::immediate(0xFFFF, 64));
+    } else if (insn.mnemonic == "uxtw" && ops.size() >= 2) {
+        ir.opcode = IrOpcode::And;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(IrOperand::immediate(0xFFFFFFFFLL, 64));
+    } else if (insn.mnemonic == "mvn" && ops.size() >= 2) {
+        ir.opcode = IrOpcode::Xor;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+        ir.srcs.push_back(IrOperand::immediate(-1, 64));
+    } else if (insn.mnemonic == "movn" && ops.size() >= 2) {
+        std::int64_t imm_v = 0;
+        if (try_parse_arm_imm(ops[1], imm_v)) {
+            ir.opcode = IrOpcode::Mov;
+            ir.dsts.push_back(parse_operand_text(ops[0]));
+            ir.srcs.push_back(IrOperand::immediate(~imm_v, 64));
+        } else {
+            ir.opcode = IrOpcode::Unknown;
+            ir.comment = insn.full_text;
+        }
+    } else if ((insn.mnemonic == "neg" || insn.mnemonic == "negs") && ops.size() >= 2) {
         ir.opcode = IrOpcode::Sub;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(IrOperand::immediate(0, 64));
@@ -311,6 +340,14 @@ IrFunction AArch64Lifter::lift_function(const FunctionInfo& fn) const {
                 jc.cond = (insn.mnemonic == "cbz") ? "b.eq" : "b.ne";
                 jc.comment = jc.cond;
                 ir_bb.instructions.push_back(std::move(jc));
+                continue;
+            }
+            if (insn.mnemonic == "mneg" && ops.size() >= 3) {
+                const auto mneg_tmp = IrOperand::reg("__bm_mneg_tmp", 64);
+                ir_bb.instructions.push_back(IrInstruction{
+                    insn.address, IrOpcode::Mul, {mneg_tmp}, {parse_operand_text(ops[1]), parse_operand_text(ops[2])}, {}, "mneg_mul"});
+                ir_bb.instructions.push_back(IrInstruction{
+                    insn.address, IrOpcode::Sub, {parse_operand_text(ops[0])}, {IrOperand::immediate(0, 64), mneg_tmp}, {}, "mneg_sub"});
                 continue;
             }
 

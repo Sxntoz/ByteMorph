@@ -288,6 +288,12 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(IrOperand::immediate(0, 64));
         ir.srcs.push_back(parse_operand_text(ops[0]));
+    } else if (insn.mnemonic == "not" && ops.size() == 1) {
+        ir.opcode = IrOpcode::Xor;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(IrOperand::immediate(-1, 64));
+        ir.comment = "not";
     } else if (insn.mnemonic == "xor" && ops.size() == 2) {
         ir.opcode = IrOpcode::Xor;
         ir.dsts.push_back(parse_operand_text(ops[0]));
@@ -454,6 +460,18 @@ IrFunction X86_64Lifter::lift_function(const FunctionInfo& fn) const {
                 ir_bb.instructions.push_back(std::move(ld));
                 ir_bb.instructions.push_back(std::move(add_sp));
                 continue;
+            }
+            if (insn.mnemonic == "xchg" && ops.size() == 2) {
+                const auto op0 = parse_operand_text(ops[0]);
+                const auto op1 = parse_operand_text(ops[1]);
+                if (op0.kind != IrOperand::Kind::Memory && op1.kind != IrOperand::Kind::Memory &&
+                    op0.kind != IrOperand::Kind::None && op1.kind != IrOperand::Kind::None) {
+                    const auto xchg_tmp = IrOperand::reg("__bm_xchg_tmp", 64);
+                    ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {xchg_tmp}, {op0}, {}, "xchg_0"});
+                    ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {op0}, {op1}, {}, "xchg_1"});
+                    ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {op1}, {xchg_tmp}, {}, "xchg_2"});
+                    continue;
+                }
             }
             if (insn.mnemonic == "leave") {
                 IrInstruction mov_sp{insn.address, IrOpcode::Mov, {rsp_op}, {rbp_op}, {}, "leave_mov"};

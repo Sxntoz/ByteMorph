@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -35,12 +36,12 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.7.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.8.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
         << "  info <file>                         Display binary headers, sections, segments, imports, exports\n"
-        << "  analyze <file> [--functions]        Perform disassembly, CFG 2.0, function discovery, and IR lifting\n"
+        << "  analyze <file> [--functions] [--eligibility-report report.json]\n"
         << "  disasm <file>                       Disassemble executable sections (x86-64 / ARM64)\n"
         << "  functions <file>                    List discovered functions with metadata and confidence\n"
         << "  cfg <file>                          Display Control Flow Graph (basic blocks, edges, loops)\n"
@@ -52,29 +53,31 @@ void print_usage() {
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
-        << "Protection Commands (v0.4 - v0.7: PE32+ x64/ARM64, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
+        << "Protection Commands (v0.4 - v0.8: PE32+ x64/ARM64*, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
         << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--functions all-eligible|auto|list]\n"
-        << "  compatibility <in> [--format json]  Report eligible/rejected functions, unsupported instructions & OS requirements\n"
+        << "  compatibility <in> [--detailed] [--format json]  Report eligible/rejected functions & cost estimates\n"
         << "  verify <protected>                  Verify AEAD authentication & section integrity\n"
-        << "  protection-info <protected> [--functions]  Display protection metadata and virtualized functions\n"
-        << "  benchmark-protection [--detailed]   Run protection pipeline, shared-runtime & integrity benchmark\n\n"
+        << "  protection-info <protected> [--functions] [--format json]  Display protection metadata\n"
+        << "  benchmark-protection [--detailed] [--compare-baseline]     Run professional VM & protection benchmark\n\n"
         << "Options:\n"
-        << "  --output, -o <path>   Output file path (optional for protect; defaults to <in>.protected)\n"
-        << "  --profile <p>         Protection profile: fast | balanced | maximum (default: balanced)\n"
-        << "  --functions <mode>    all-eligible | auto | 0xRVA1,0xRVA2 | fn1,fn2 (or list functions in analyze/protection-info)\n"
-        << "  --func <name>         Target exported function name to virtualize\n"
-        << "  --func-rva <hex>      Target function RVA (hex) to virtualize\n"
-        << "  --seed <N>            Deterministic PRNG seed\n"
-        << "  --fn <index>          Function index in .ir module for vm-compile (default: 0)\n"
-        << "  --format <fmt>        Output format for inspect/compatibility: text | json (default: text)\n"
-        << "  --no-strings          Disable string protection in .bmvm\n"
-        << "  --no-rollback         Skip automatic transactional rollback check\n"
-        << "  --allow-signed-strip  Allow stripping Authenticode/Mach-O signature if present\n"
-        << "  --allow-ext-calls     Allow authorized external calls (vm.callext) in virtualized functions\n"
-        << "  --detailed            Show detailed multi-function scaling in benchmark-protection\n"
-        << "  --max <N>             Limit disassembled instructions per section\n"
-        << "  --verbose             Enable informational logging\n"
-        << "  --help, -h            Show this help message\n"
+        << "  --output, -o <path>        Output file path (optional for protect; defaults to <in>.protected)\n"
+        << "  --profile <p>              Protection profile: fast | balanced | maximum (default: balanced)\n"
+        << "  --functions <mode>         all-eligible | auto | 0xRVA1,0xRVA2 | fn1,fn2 (or list functions)\n"
+        << "  --eligibility-report <p>   Write detailed JSON eligibility report during analyze\n"
+        << "  --func <name>              Target exported function name to virtualize\n"
+        << "  --func-rva <hex>           Target function RVA (hex) to virtualize\n"
+        << "  --seed <N>                 Deterministic PRNG seed\n"
+        << "  --fn <index>               Function index in .ir module for vm-compile (default: 0)\n"
+        << "  --format <fmt>             Output format for inspect/compatibility/protection-info: text | json\n"
+        << "  --no-strings               Disable string protection in .bmvm\n"
+        << "  --no-rollback              Skip automatic transactional rollback check\n"
+        << "  --allow-signed-strip       Allow stripping Authenticode/Mach-O signature if present\n"
+        << "  --allow-ext-calls          Allow authorized external calls (vm.callext) in virtualized functions\n"
+        << "  --detailed                 Show per-function category/cost or multi-function scaling\n"
+        << "  --compare-baseline         Compare VM benchmark metrics against v0.7 baseline\n"
+        << "  --max <N>                  Limit disassembled instructions per section\n"
+        << "  --verbose                  Enable informational logging\n"
+        << "  --help, -h                 Show this help message\n"
         << "  --version, -v         Show version information\n";
 }
 
@@ -536,7 +539,54 @@ int cmd_protect(const std::string& in_path,
     return 0;
 }
 
-int cmd_compatibility(const std::string& path, const std::string& format, bool allow_ext_calls) {
+std::string build_compatibility_json(const bytemorph::prot::CompatibilityReport& c) {
+    std::ostringstream oss;
+    oss << "{\n"
+        << "  \"format\": \"" << json_escape(to_string(c.format)) << "\",\n"
+        << "  \"architecture\": \"" << json_escape(to_string(c.architecture)) << "\",\n"
+        << "  \"binary_supported\": " << (c.binary_supported ? "true" : "false") << ",\n"
+        << "  \"functions_analyzed\": " << (c.eligible_functions.size() + c.rejected_functions.size()) << ",\n"
+        << "  \"eligible_count\": " << c.eligible_functions.size() << ",\n"
+        << "  \"rejected_count\": " << c.rejected_functions.size() << ",\n"
+        << "  \"eligible_functions\": [\n";
+    for (std::size_t i = 0; i < c.eligible_functions.size(); ++i) {
+        const auto& f = c.eligible_functions[i];
+        oss << "    {\"name\": \"" << json_escape(f.name) << "\", \"entry_va\": \""
+            << hex_u64(f.entry_va) << "\", \"size_bytes\": " << f.size_bytes
+            << ", \"category\": \"" << json_escape(f.category) << "\""
+            << ", \"ir_ops\": " << f.ir_ops << ", \"vm_ops\": " << f.vm_ops
+            << ", \"estimated_overhead_pct\": " << f.estimated_overhead_pct
+            << ", \"estimated_runtime_bytes\": " << f.estimated_runtime_bytes << "}"
+            << (i + 1 < c.eligible_functions.size() ? "," : "") << '\n';
+    }
+    oss << "  ],\n  \"rejected_functions\": [\n";
+    for (std::size_t i = 0; i < c.rejected_functions.size(); ++i) {
+        const auto& f = c.rejected_functions[i];
+        oss << "    {\"name\": \"" << json_escape(f.name) << "\", \"entry_va\": \""
+            << hex_u64(f.entry_va) << "\", \"size_bytes\": " << f.size_bytes
+            << ", \"category\": \"" << json_escape(f.category) << "\""
+            << ", \"reason\": \"" << json_escape(f.rejection_reason) << "\", \"unsupported_instructions\": [";
+        for (std::size_t j = 0; j < f.unsupported_instructions.size(); ++j) {
+            if (j > 0) oss << ", ";
+            oss << "\"" << json_escape(f.unsupported_instructions[j]) << "\"";
+        }
+        oss << "]}" << (i + 1 < c.rejected_functions.size() ? "," : "") << '\n';
+    }
+    oss << "  ],\n  \"os_requirements\": [";
+    for (std::size_t i = 0; i < c.os_requirements.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << "\"" << json_escape(c.os_requirements[i]) << "\"";
+    }
+    oss << "],\n  \"known_limitations\": [";
+    for (std::size_t i = 0; i < c.known_limitations.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << "\"" << json_escape(c.known_limitations[i]) << "\"";
+    }
+    oss << "]\n}\n";
+    return oss.str();
+}
+
+int cmd_compatibility(const std::string& path, const std::string& format, bool allow_ext_calls, bool detailed) {
     auto res = bytemorph::prot::ProtectionEngine::check_compatibility(path, allow_ext_calls);
     if (!res) {
         std::cerr << "Compatibility check failed: " << res.error().to_string() << '\n';
@@ -544,61 +594,55 @@ int cmd_compatibility(const std::string& path, const std::string& format, bool a
     }
     const auto& c = res.value();
     if (format == "json") {
-        std::cout << "{\n"
-                  << "  \"format\": \"" << json_escape(to_string(c.format)) << "\",\n"
-                  << "  \"architecture\": \"" << json_escape(to_string(c.architecture)) << "\",\n"
-                  << "  \"binary_supported\": " << (c.binary_supported ? "true" : "false") << ",\n"
-                  << "  \"eligible_functions\": [\n";
-        for (std::size_t i = 0; i < c.eligible_functions.size(); ++i) {
-            const auto& f = c.eligible_functions[i];
-            std::cout << "    {\"name\": \"" << json_escape(f.name) << "\", \"entry_va\": \""
-                      << hex_u64(f.entry_va) << "\", \"size_bytes\": " << f.size_bytes
-                      << ", \"ir_ops\": " << f.ir_ops << ", \"vm_ops\": " << f.vm_ops << "}"
-                      << (i + 1 < c.eligible_functions.size() ? "," : "") << '\n';
-        }
-        std::cout << "  ],\n  \"rejected_functions\": [\n";
-        for (std::size_t i = 0; i < c.rejected_functions.size(); ++i) {
-            const auto& f = c.rejected_functions[i];
-            std::cout << "    {\"name\": \"" << json_escape(f.name) << "\", \"entry_va\": \""
-                      << hex_u64(f.entry_va) << "\", \"size_bytes\": " << f.size_bytes
-                      << ", \"reason\": \"" << json_escape(f.rejection_reason) << "\", \"unsupported_instructions\": [";
-            for (std::size_t j = 0; j < f.unsupported_instructions.size(); ++j) {
-                if (j > 0) std::cout << ", ";
-                std::cout << "\"" << json_escape(f.unsupported_instructions[j]) << "\"";
-            }
-            std::cout << "]}" << (i + 1 < c.rejected_functions.size() ? "," : "") << '\n';
-        }
-        std::cout << "  ],\n  \"os_requirements\": [";
-        for (std::size_t i = 0; i < c.os_requirements.size(); ++i) {
-            if (i > 0) std::cout << ", ";
-            std::cout << "\"" << json_escape(c.os_requirements[i]) << "\"";
-        }
-        std::cout << "],\n  \"known_limitations\": [";
-        for (std::size_t i = 0; i < c.known_limitations.size(); ++i) {
-            if (i > 0) std::cout << ", ";
-            std::cout << "\"" << json_escape(c.known_limitations[i]) << "\"";
-        }
-        std::cout << "]\n}\n";
+        std::cout << build_compatibility_json(c);
         return 0;
     }
 
-    std::cout << "=== ByteMorph v0.6 Compatibility Report ===\n"
+    std::cout << "=== ByteMorph v0.8 Compatibility Report ===\n"
               << "  Format              : " << to_string(c.format) << '\n'
               << "  Architecture        : " << to_string(c.architecture) << '\n'
               << "  Binary Supported    : " << (c.binary_supported ? "Yes" : "No") << '\n'
               << "  Eligible Functions  : " << c.eligible_functions.size() << '\n';
     for (const auto& f : c.eligible_functions) {
         std::cout << "    + " << f.name << " (VA=" << hex_u64(f.entry_va)
-                  << ", size=" << f.size_bytes << "B, vm_ops=" << f.vm_ops << ")\n";
+                  << ", size=" << f.size_bytes << "B, vm_ops=" << f.vm_ops;
+        if (detailed) {
+            std::cout << ", cat=" << f.category
+                      << ", est_overhead=" << f.estimated_overhead_pct << "%"
+                      << ", est_rt=" << f.estimated_runtime_bytes << "B";
+        }
+        std::cout << ")\n";
     }
     std::cout << "  Rejected Functions  : " << c.rejected_functions.size() << '\n';
     for (const auto& f : c.rejected_functions) {
-        std::cout << "    - " << f.name << " (VA=" << hex_u64(f.entry_va) << "): " << f.rejection_reason << '\n';
+        std::cout << "    - " << f.name << " (VA=" << hex_u64(f.entry_va);
+        if (detailed && !f.category.empty()) {
+            std::cout << ", cat=" << f.category;
+        }
+        std::cout << "): " << f.rejection_reason << '\n';
     }
     std::cout << "  OS Requirements     :\n";
     for (const auto& r : c.os_requirements) std::cout << "    * " << r << '\n';
     std::cout << "  Known Limitations   :\n";
     for (const auto& l : c.known_limitations) std::cout << "    * " << l << '\n';
+    return 0;
+}
+
+int cmd_eligibility_report(const std::string& bin_path, const std::string& report_path, bool allow_ext_calls) {
+    auto res = bytemorph::prot::ProtectionEngine::check_compatibility(bin_path, allow_ext_calls);
+    if (!res) {
+        std::cerr << "Eligibility report failed: " << res.error().to_string() << '\n';
+        return 1;
+    }
+    std::ofstream ofs(report_path, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Failed to write eligibility report to: " << report_path << '\n';
+        return 1;
+    }
+    ofs << build_compatibility_json(res.value());
+    std::cout << "Eligibility report written to: " << report_path
+              << " (eligible=" << res.value().eligible_functions.size()
+              << ", rejected=" << res.value().rejected_functions.size() << ")\n";
     return 0;
 }
 
@@ -618,13 +662,36 @@ int cmd_verify(const std::string& path) {
     return v.valid ? 0 : 2;
 }
 
-int cmd_protection_info(const std::string& path, bool functions_only) {
+int cmd_protection_info(const std::string& path, bool functions_only, const std::string& format) {
     auto res = bytemorph::prot::ProtectionEngine::verify(path);
     if (!res) {
         std::cerr << "Protection info failed: " << res.error().to_string() << '\n';
         return 1;
     }
     const auto& m = res.value().metadata;
+    if (format == "json") {
+        std::cout << "{\n"
+                  << "  \"format\": \"BMP4\",\n"
+                  << "  \"version\": 1,\n"
+                  << "  \"profile\": \"" << json_escape(bytemorph::prot::to_string(m.profile)) << "\",\n"
+                  << "  \"seed\": \"" << hex_u64(m.seed) << "\",\n"
+                  << "  \"protected_strings_count\": " << m.protected_strings_count << ",\n"
+                  << "  \"integrity_valid\": " << (res.value().valid ? "true" : "false") << ",\n"
+                  << "  \"aead_authenticated\": " << (res.value().aead_authenticated ? "true" : "false") << ",\n"
+                  << "  \"protected_functions\": [\n";
+        for (std::size_t i = 0; i < m.functions.size(); ++i) {
+            const auto& f = m.functions[i];
+            std::cout << "    {\"name\": \"" << json_escape(f.name) << "\", \"original_rva\": \""
+                      << hex_u64(f.original_rva) << "\", \"stub_rva\": \"" << hex_u64(f.stub_rva)
+                      << "\", \"patch_size\": " << f.patch_size
+                      << ", \"orig_ir_ops\": " << f.orig_ir_ops
+                      << ", \"obf_ir_ops\": " << f.obf_ir_ops
+                      << ", \"vm_ops\": " << f.vm_ops << "}"
+                      << (i + 1 < m.functions.size() ? "," : "") << '\n';
+        }
+        std::cout << "  ]\n}\n";
+        return 0;
+    }
     if (functions_only) {
         std::cout << "Protected Functions (" << m.functions.size() << "):\n";
         for (const auto& f : m.functions) {
@@ -652,7 +719,7 @@ int cmd_protection_info(const std::string& path, bool functions_only) {
     return 0;
 }
 
-int cmd_benchmark_protection(bool detailed) {
+int cmd_benchmark_protection(bool detailed, bool compare_baseline) {
     auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
     if (!cmp_res) {
         std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
@@ -730,7 +797,7 @@ int cmd_benchmark_protection(bool detailed) {
     const double overhead_pct = ((cmp_res.value().vm_ms - native_ms) / native_ms) * 100.0;
     const std::size_t vm_ram_bytes = 4096 * sizeof(std::uint64_t) + 32 * sizeof(std::uint64_t);
 
-    std::cout << "=== ByteMorph v0.7 Protection Benchmark ===\n"
+    std::cout << "=== ByteMorph v0.8 Protection Benchmark ===\n"
               << "  Native Execution (10k iters)   : " << std::fixed << std::setprecision(3) << native_ms << " ms\n"
               << "  VM Interpreter (10k iters)     : " << cmp_res.value().vm_ms << " ms (overhead: " << std::setprecision(1) << overhead_pct << "%)\n"
               << "  VM Stack Load/Store (10k iters): " << std::setprecision(3) << stack_vm_ms << " ms\n"
@@ -738,6 +805,78 @@ int cmd_benchmark_protection(bool detailed) {
               << "  PIC Runtime Emission (avg)     : " << emit_avg_ms << " ms (x86-64=" << x64_rt_bytes << "B, ARM64=" << a64_rt_bytes << "B)\n"
               << "  VM Working Set RAM (per ctx)   : " << vm_ram_bytes << " bytes (native frame=1360B x64 / 1376B ARM64)\n"
               << "  XChaCha20-Poly1305 (1k ops)    : " << aead_ms << " ms\n";
+
+    // Professional multi-sample statistics (warm-up + 15 samples x 2,000 iters)
+    if (detailed || compare_baseline) {
+        auto run_bench_stats = [](const char* label, const bytemorph::virt::BvmProgram& prog, const bytemorph::virt::VmExecOptions& opts) {
+            volatile std::uint64_t sink = 0;
+            for (int w = 0; w < 200; ++w) {
+                auto r = bytemorph::virt::VmInterpreter::execute(prog, opts);
+                if (r) sink ^= r.value().return_value;
+            }
+            constexpr int kSamples = 15;
+            constexpr int kIters = 2000;
+            std::vector<double> times_ms;
+            times_ms.reserve(kSamples);
+            for (int s = 0; s < kSamples; ++s) {
+                const auto b0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < kIters; ++i) {
+                    auto r = bytemorph::virt::VmInterpreter::execute(prog, opts);
+                    if (r) sink ^= r.value().return_value;
+                }
+                const auto b1 = std::chrono::steady_clock::now();
+                times_ms.push_back(std::chrono::duration<double, std::milli>(b1 - b0).count());
+            }
+            (void)sink;
+            std::sort(times_ms.begin(), times_ms.end());
+            const double median = times_ms[kSamples / 2];
+            const double p95 = times_ms[static_cast<std::size_t>(kSamples * 0.95)];
+            const double p99 = times_ms.back();
+            const double throughput_k = (median > 0.0001) ? (static_cast<double>(kIters) / (median / 1000.0)) : 0.0;
+            std::cout << "    " << label << " (2k iters/sample): median=" << std::setprecision(3) << median
+                      << " ms, p95=" << p95 << " ms, p99=" << p99
+                      << " ms, throughput=" << std::setprecision(0) << throughput_k << " execs/s\n";
+            return median * 5.0; // normalized to 10k iters
+        };
+
+        bytemorph::virt::BvmProgram arith_prog;
+        arith_prog.instructions = {
+            {bytemorph::virt::VmOpcode::MovImm, 1, 0, 0, 42},
+            {bytemorph::virt::VmOpcode::MovImm, 2, 0, 0, 19},
+            {bytemorph::virt::VmOpcode::Add, 3, 1, 2, 0},
+            {bytemorph::virt::VmOpcode::Xor, 0, 3, 1, 0},
+            {bytemorph::virt::VmOpcode::Ret, 0, 0, 0, 0}
+        };
+        bytemorph::virt::BvmProgram loop_prog;
+        loop_prog.instructions = {
+            {bytemorph::virt::VmOpcode::MovImm, 0, 0, 0, 0},
+            {bytemorph::virt::VmOpcode::MovImm, 1, 0, 0, 1},
+            {bytemorph::virt::VmOpcode::MovImm, 2, 0, 0, 16},
+            {bytemorph::virt::VmOpcode::Add, 0, 0, 1, 0},
+            {bytemorph::virt::VmOpcode::Add, 1, 1, 1, 0},
+            {bytemorph::virt::VmOpcode::Cmp, 0, 1, 2, 0},
+            {bytemorph::virt::VmOpcode::Jlt, 0, 0, 0, 3},
+            {bytemorph::virt::VmOpcode::Ret, 0, 0, 0, 0}
+        };
+
+        std::cout << "  --- Professional Multi-Sample VM Suite (15 samples, warm-up=200) ---\n";
+        const double arith_10k = run_bench_stats("Arithmetic", arith_prog, {});
+        (void)run_bench_stats("Memory Load/Store", stack_prog, {});
+        (void)run_bench_stats("Loop/Branch", loop_prog, {});
+        const double ext_10k = run_bench_stats("External Call Bridge", ext_prog, ext_opts);
+
+        if (compare_baseline) {
+            constexpr double kV07Interpreter10kMs = 2.987;
+            constexpr double kV07ExtBridge10kMs = 2.405;
+            const double interp_delta_pct = ((arith_10k - kV07Interpreter10kMs) / kV07Interpreter10kMs) * 100.0;
+            const double ext_delta_pct = ((ext_10k - kV07ExtBridge10kMs) / kV07ExtBridge10kMs) * 100.0;
+            std::cout << "  --- Baseline Comparison (v0.7 -> v0.8) ---\n"
+                      << "    VM Interpreter (10k eq.)  : v0.7=" << std::setprecision(3) << kV07Interpreter10kMs
+                      << " ms -> v0.8=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
+                      << "    External Call Bridge (10k): v0.7=" << std::setprecision(3) << kV07ExtBridge10kMs
+                      << " ms -> v0.8=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
+        }
+    }
 
     if (detailed) {
         std::cout << "  --- Multi-Function Shared Runtime Scaling ---\n";
@@ -772,7 +911,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.7.0\n";
+        std::cout << "ByteMorph v0.8.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -780,10 +919,12 @@ int main(int argc, char* argv[]) {
     }
     if (cmd == "benchmark-protection") {
         bool detailed = false;
+        bool compare_baseline = false;
         for (int i = 2; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--detailed") detailed = true;
+            else if (std::string_view(argv[i]) == "--compare-baseline") compare_baseline = true;
         }
-        return cmd_benchmark_protection(detailed);
+        return cmd_benchmark_protection(detailed, compare_baseline);
     }
 
     if (argc < 3) {
@@ -798,7 +939,9 @@ int main(int argc, char* argv[]) {
     std::size_t fn_idx = 0;
     std::uint64_t seed = 0x42595445ULL;
     std::string output_format = "text";
+    std::string eligibility_report_path;
     bool analyze_functions_only = false;
+    bool detailed_flag = false;
     bytemorph::prot::ProtectOptions prot_opts;
 
     for (int i = 3; i < argc; ++i) {
@@ -868,6 +1011,10 @@ int main(int argc, char* argv[]) {
             prot_opts.allow_strip_signature = true;
         } else if (arg == "--allow-ext-calls") {
             prot_opts.allow_external_calls = true;
+        } else if (arg == "--detailed") {
+            detailed_flag = true;
+        } else if (arg == "--eligibility-report" && i + 1 < argc) {
+            eligibility_report_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
             output_format = argv[++i];
             if (output_format != "text" && output_format != "json") return 1;
@@ -882,9 +1029,12 @@ int main(int argc, char* argv[]) {
     if (cmd == "vm-run") return cmd_vm_run(file_path);
     if (cmd == "vm-inspect") return cmd_vm_inspect(file_path);
     if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
-    if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls);
+    if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls, detailed_flag);
     if (cmd == "verify") return cmd_verify(file_path);
-    if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only);
+    if (cmd == "protection-info") return cmd_protection_info(file_path, analyze_functions_only, output_format);
+    if (cmd == "analyze" && !eligibility_report_path.empty()) {
+        return cmd_eligibility_report(file_path, eligibility_report_path, prot_opts.allow_external_calls);
+    }
 
     auto loader = create_default_loader();
     auto load_res = loader.load_file(file_path);

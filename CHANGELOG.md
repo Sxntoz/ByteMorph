@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.0] - 2026-11-23
+
+### Adicionado
+- **Seleção Inteligente de Funções:** `evaluate_function_eligibility` compartilhada entre `check_compatibility` e `prepare_target_functions`, rejeitando thunks IAT/PLT/GOT, jump stubs, trampolins `ADRP+BR`, regiões de padding/dados, funções sobrepostas, fluxos sem retorno, operandos RIP-relative não resolvidos e chamadas indiretas não autorizadas, com categoria e estimativa de custo.
+- **Otimização da VM:** alocação lazy de memória em `VmInterpreter::execute` e flags `zf`/`sf` em registradores locais, reduzindo o tempo do interpretador de `2.987 ms` para `0.463 ms` (normalizado multi-amostra) / `0.734 ms` (-75% a -84%).
+- **IR e Lifters:** suporte a `not`/`xchg` (`X86_64Lifter`) e `mvn`/`uxtb`/`uxth`/`uxtw`/`movn`/`mneg`/`negs` (`AArch64Lifter`), preservando `IrOpcode::Unknown` para instruções desconhecidas.
+- **CLI v0.8 & Benchmarks:** `compatibility --detailed`, `analyze --eligibility-report <path>`, `protection-info --format json` e `benchmark-protection --compare-baseline` (mediana, p95, p99 e throughput).
+- **Testes:** 5 novos testes `ProtectionV08Test` (54 testes C++ + 3 testes Rust aprovados).
+
 ## [0.7.0] - 2026-11-23
 
 ### Adicionado

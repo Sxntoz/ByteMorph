@@ -3,6 +3,8 @@
 #include "bytemorph/arch/x86_64/x86_64_disasm.hpp"
 #include "bytemorph/arch/x86_64/x86_64_lifter.hpp"
 #include "bytemorph/core/analysis/analyzer.hpp"
+#include "bytemorph/core/binary/loader.hpp"
+#include "bytemorph/formats/pe/pe_parser.hpp"
 #include "bytemorph/core/ir/ir.hpp"
 #include "bytemorph/core/ir/ir_interpreter.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
@@ -907,3 +909,224 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
     std::filesystem::remove(prot_exe, ec);
 }
 #endif
+
+// ============================================================================
+// ByteMorph v0.8 Tests: Smart Eligibility, Thunk Filter, Lifters & Fuzzing
+// ============================================================================
+
+TEST(ProtectionV08Test, RejectsIatPltThunksAndRipRelativeGlobalAccess) {
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto pe_thunk = tmp_dir / "bytemorph_v08_iat_thunk.exe";
+
+    // x86-64 IAT thunk: jmp qword ptr [rip + 0x1000] (FF 25 00 10 00 00)
+    const std::vector<std::uint8_t> iat_thunk_code = {
+        0xFF, 0x25, 0x00, 0x10, 0x00, 0x00
+    };
+    auto pe = bytemorph::tests::build_minimal_pe64_x86_64(iat_thunk_code);
+    {
+        std::ofstream ofs(pe_thunk, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(pe.data()), static_cast<std::streamsize>(pe.size()));
+    }
+
+    auto comp = ProtectionEngine::check_compatibility(pe_thunk);
+    ASSERT_TRUE(comp.has_value()) << comp.error().to_string();
+    EXPECT_TRUE(comp.value().eligible_functions.empty());
+    ASSERT_FALSE(comp.value().rejected_functions.empty());
+    // Rejected either as crt_entrypoint (entry point) or iat_plt_thunk
+    const auto& cat = comp.value().rejected_functions.front().category;
+    EXPECT_TRUE(cat == "crt_entrypoint" || cat == "iat_plt_thunk");
+
+    // Direct test of detect_thunk via non-entry FunctionInfo
+    bytemorph::core::binary::BinaryLoader loader;
+    loader.register_parser(std::make_unique<bytemorph::formats::pe::PeParser>());
+    auto bin_res = loader.load_file(pe_thunk);
+    ASSERT_TRUE(bin_res.has_value());
+
+    FunctionInfo non_ep_thunk;
+    non_ep_thunk.name = "sub_iat_stub";
+    non_ep_thunk.entry_va = 0x140001000ULL;
+    non_ep_thunk.size_bytes = 6;
+    non_ep_thunk.from_entry_point = false;
+    non_ep_thunk.confidence = AnalysisConfidence::High;
+    BasicBlock bb;
+    bb.start_va = non_ep_thunk.entry_va;
+    bb.end_va = non_ep_thunk.entry_va + 6;
+    bb.instructions.push_back(DisassembledInstruction{
+        non_ep_thunk.entry_va, iat_thunk_code, "jmp", "qword ptr [rip+0x1000]",
+        "jmp qword ptr [rip+0x1000]", ControlFlowKind::UnconditionalJump, std::nullopt
+    });
+    non_ep_thunk.blocks.push_back(std::move(bb));
+
+    AnalysisResult dummy_an;
+    dummy_an.functions.push_back(non_ep_thunk);
+    auto elig = detail::evaluate_function_eligibility(
+        *bin_res.value(), dummy_an, non_ep_thunk, {}, false, false);
+    EXPECT_FALSE(elig.eligible);
+    EXPECT_EQ(elig.category, "iat_plt_thunk");
+
+    std::error_code ec;
+    std::filesystem::remove(pe_thunk, ec);
+}
+
+#if defined(_WIN32)
+TEST(ProtectionV08Test, AllEligibleProtectsAndExecutesRealWindowsBinary) {
+    const std::filesystem::path lab_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    ASSERT_TRUE(std::filesystem::exists(lab_exe));
+
+    const auto tmp_dir = std::filesystem::temp_directory_path();
+    const auto prot_exe = tmp_dir / "lab_pe_v08_all_eligible.exe";
+
+    ProtectOptions opts;
+    opts.profile = ProtectionProfile::Balanced;
+    opts.seed = 0xA11E0808ULL;
+    opts.protect_all_eligible = true;
+    opts.allow_external_calls = true;
+
+    auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
+    ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
+    EXPECT_TRUE(rep.value().shared_runtime_used);
+    EXPECT_GE(rep.value().protected_functions.size(), 4u);
+    EXPECT_GT(rep.value().rejected_functions.size(), 0u);
+
+    auto ver = ProtectionEngine::verify(prot_exe);
+    ASSERT_TRUE(ver.has_value() && ver.value().valid);
+
+    auto run_win = [](const std::filesystem::path& exe, const std::string& args) -> std::string {
+        const std::string cmd = "\"" + exe.string() + "\" " + args;
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) return {};
+        std::string out;
+        char buf[256];
+        while (std::fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
+        _pclose(pipe);
+        return out;
+    };
+
+    EXPECT_EQ(run_win(lab_exe, "42 19 --v07"), run_win(prot_exe, "42 19 --v07"));
+    EXPECT_EQ(run_win(lab_exe, "100 37 --v07"), run_win(prot_exe, "100 37 --v07"));
+
+    std::error_code ec;
+    std::filesystem::remove(prot_exe, ec);
+}
+#endif
+
+TEST(ProtectionV08Test, DifferentialAndPropertyBasedIrObfuscationAndVmEquivalence) {
+    IrFunction fn;
+    fn.name = "prop_fn";
+    fn.entry_va = 0x1000;
+    fn.blocks = {{0, 0x1000, {
+        {0x1000, IrOpcode::Add, {IrOperand::reg("r10")}, {IrOperand::reg("rdi"), IrOperand::reg("rsi")}, {}, ""},
+        {0x1004, IrOpcode::Sub, {IrOperand::reg("r11")}, {IrOperand::reg("rdi"), IrOperand::reg("rsi")}, {}, ""},
+        {0x1008, IrOpcode::Xor, {IrOperand::reg("r12")}, {IrOperand::reg("r10"), IrOperand::reg("r11")}, {}, ""},
+        {0x100C, IrOpcode::Mul, {IrOperand::reg("r13")}, {IrOperand::reg("rdi"), IrOperand::immediate(5)}, {}, ""},
+        {0x1010, IrOpcode::Add, {IrOperand::reg("rax")}, {IrOperand::reg("r12"), IrOperand::reg("r13")}, {}, ""},
+        {0x1014, IrOpcode::Ret, {}, {}, {}, ""}
+    }, {}}};
+
+    IrFunction obf_fn = fn;
+    ObfuscationConfig cfg;
+    cfg.seed = 0xBEEF0808ULL;
+    cfg.enable_substitution = true;
+    cfg.enable_mba = true;
+    auto obf_res = ObfuscationPipeline::obfuscate_function(obf_fn, cfg);
+    ASSERT_TRUE(obf_res.has_value());
+
+    auto bvm_res = IrToVmTranslator::translate(obf_fn, 0xBEEF0808ULL);
+    ASSERT_TRUE(bvm_res.has_value()) << bvm_res.error().to_string();
+
+    for (std::int64_t i = -25; i < 25; ++i) {
+        const std::int64_t a = i * 17 + 3;
+        const std::int64_t b = (i % 7) * 11 - 5;
+        const std::uint64_t expected = static_cast<std::uint64_t>(((a + b) ^ (a - b)) + (a * 5));
+
+        IrExecOptions ir_in;
+        ir_in.initial_regs["rdi"] = static_cast<std::uint64_t>(a);
+        ir_in.initial_regs["rsi"] = static_cast<std::uint64_t>(b);
+        auto orig_out = IrInterpreter::execute(fn, ir_in);
+        auto obf_out = IrInterpreter::execute(obf_fn, ir_in);
+        ASSERT_TRUE(orig_out.has_value() && obf_out.has_value());
+        EXPECT_EQ(orig_out.value().return_value, expected);
+        EXPECT_EQ(obf_out.value().return_value, expected);
+
+        VmExecOptions vm_opts;
+        vm_opts.initial_regs[7] = static_cast<std::uint64_t>(a); // rdi -> R7
+        vm_opts.initial_regs[6] = static_cast<std::uint64_t>(b); // rsi -> R6
+        auto vm_out = VmInterpreter::execute(bvm_res.value(), vm_opts);
+        ASSERT_TRUE(vm_out.has_value()) << vm_out.error().to_string();
+        EXPECT_EQ(vm_out.value().return_value, expected);
+    }
+}
+
+TEST(ProtectionV08Test, LiftersExpandNotXchgMvnUxtbMnegAndRejectUnknownWithoutNop) {
+    bytemorph::arch::x86_64::X86_64Lifter x64_lifter;
+    FunctionInfo x64_fn;
+    x64_fn.name = "x64_ext";
+    x64_fn.entry_va = 0x1000;
+    x64_fn.blocks.push_back(BasicBlock{0x1000, 0x1010, {
+        {0x1000, {0x48, 0xF7, 0xD0}, "not", "rax", "not rax", ControlFlowKind::Sequential, std::nullopt},
+        {0x1003, {0x48, 0x91}, "xchg", "rax, rcx", "xchg rax, rcx", ControlFlowKind::Sequential, std::nullopt},
+        {0x1005, {0x0F, 0xA2}, "cpuid", "", "cpuid", ControlFlowKind::Sequential, std::nullopt},
+        {0x1007, {0xC3}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    }, {}});
+    auto lifted_x64 = x64_lifter.lift_function(x64_fn);
+    ASSERT_EQ(lifted_x64.blocks.size(), 1u);
+    const auto& x64_insns = lifted_x64.blocks[0].instructions;
+    EXPECT_EQ(x64_insns[0].opcode, IrOpcode::Xor);     // not -> xor -1
+    EXPECT_EQ(x64_insns[1].opcode, IrOpcode::Mov);     // xchg step 0
+    EXPECT_EQ(x64_insns[4].opcode, IrOpcode::Unknown); // cpuid must NOT become Nop
+
+    bytemorph::arch::aarch64::AArch64Lifter a64_lifter;
+    FunctionInfo a64_fn;
+    a64_fn.name = "a64_ext";
+    a64_fn.entry_va = 0x2000;
+    a64_fn.blocks.push_back(BasicBlock{0x2000, 0x2014, {
+        {0x2000, {0,0,0,0}, "mvn", "x0, x1", "mvn x0, x1", ControlFlowKind::Sequential, std::nullopt},
+        {0x2004, {0,0,0,0}, "uxtb", "w0, w0", "uxtb w0, w0", ControlFlowKind::Sequential, std::nullopt},
+        {0x2008, {0,0,0,0}, "mneg", "x0, x1, x2", "mneg x0, x1, x2", ControlFlowKind::Sequential, std::nullopt},
+        {0x200C, {0,0,0,0}, "mrs", "x0, nzcv", "mrs x0, nzcv", ControlFlowKind::Sequential, std::nullopt},
+        {0x2010, {0,0,0,0}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    }, {}});
+    auto lifted_a64 = a64_lifter.lift_function(a64_fn);
+    ASSERT_EQ(lifted_a64.blocks.size(), 1u);
+    const auto& a64_insns = lifted_a64.blocks[0].instructions;
+    EXPECT_EQ(a64_insns[0].opcode, IrOpcode::Xor);     // mvn -> xor -1
+    EXPECT_EQ(a64_insns[1].opcode, IrOpcode::And);     // uxtb -> and 0xFF
+    EXPECT_EQ(a64_insns[2].opcode, IrOpcode::Mul);     // mneg mul
+    EXPECT_EQ(a64_insns[3].opcode, IrOpcode::Sub);     // mneg sub
+    EXPECT_EQ(a64_insns[4].opcode, IrOpcode::Unknown); // mrs must NOT become Nop
+}
+
+TEST(ProtectionV08Test, BytecodeFuzzAndMemoryBoundsSafety) {
+    std::uint64_t rng = 0x88881234ULL;
+    auto next_u64 = [&]() -> std::uint64_t {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+
+    for (int iter = 0; iter < 200; ++iter) {
+        std::vector<std::uint8_t> raw(static_cast<std::size_t>(next_u64() % 128));
+        for (auto& b : raw) b = static_cast<std::uint8_t>(next_u64() & 0xFF);
+        auto dec = BvmCodec::decode(raw);
+        if (dec.has_value()) {
+            VmExecOptions opts;
+            opts.max_steps = 256;
+            (void)VmInterpreter::execute(dec.value(), opts);
+        }
+
+        // Also fuzz direct BvmProgram with out-of-bounds registers/targets/memory
+        BvmProgram p;
+        p.instructions.push_back({
+            static_cast<VmOpcode>(next_u64() % 28),
+            static_cast<std::uint8_t>(next_u64() & 0x3F),
+            static_cast<std::uint8_t>(next_u64() & 0x3F),
+            static_cast<std::uint8_t>(next_u64() & 0xFF),
+            static_cast<std::int64_t>(next_u64())
+        });
+        VmExecOptions opts;
+        opts.max_steps = 64;
+        (void)VmInterpreter::execute(p, opts);
+    }
+    SUCCEED();
+}

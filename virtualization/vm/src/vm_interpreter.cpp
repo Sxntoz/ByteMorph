@@ -6,18 +6,22 @@ namespace bytemorph::virt {
 
 namespace {
 
-core::diagnostics::Result<void> validate_program(const BvmProgram& program) {
+core::diagnostics::Result<bool> validate_program(const BvmProgram& program) {
     using core::diagnostics::ErrorCode;
     const std::size_t code_len = program.instructions.size();
+    bool has_mem_ops = false;
     for (const auto& insn : program.instructions) {
         if (insn.opcode == VmOpcode::Halt && insn.dst == 0xFF) {
             continue; // Runtime trap sentinel
         }
         const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
+        if (src2_is_width) {
+            has_mem_ops = true;
+        }
         if (insn.dst >= BvmProgram::kNumRegisters ||
             insn.src1 >= BvmProgram::kNumRegisters ||
             (!src2_is_width && insn.src2 >= BvmProgram::kNumRegisters)) {
-            return core::diagnostics::Result<void>::err(
+            return core::diagnostics::Result<bool>::err(
                 ErrorCode::OutOfBounds, "Register index out of bounds", "VmInterpreter::execute");
         }
         switch (insn.opcode) {
@@ -30,18 +34,18 @@ core::diagnostics::Result<void> validate_program(const BvmProgram& program) {
             case VmOpcode::Jge:
             case VmOpcode::Call:
                 if (insn.imm < 0 || static_cast<std::size_t>(insn.imm) >= code_len) {
-                    return core::diagnostics::Result<void>::err(
+                    return core::diagnostics::Result<bool>::err(
                         ErrorCode::OutOfBounds, "VM branch/call target out of bounds", "VmInterpreter::execute");
                 }
                 break;
             case VmOpcode::MaxOpcode:
-                return core::diagnostics::Result<void>::err(
+                return core::diagnostics::Result<bool>::err(
                     ErrorCode::ParseError, "Invalid VM opcode during execution", "VmInterpreter::execute");
             default:
                 break;
         }
     }
-    return core::diagnostics::Result<void>::ok();
+    return has_mem_ops;
 }
 
 } // namespace
@@ -55,18 +59,22 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
             ErrorCode::EmptyInput, "BvmProgram has no instructions", "VmInterpreter::execute");
     }
 
-    if (auto val = validate_program(program); !val) {
+    auto val = validate_program(program);
+    if (!val) {
         return core::diagnostics::Result<VmExecState>::err(
             val.error().code, val.error().message, val.error().context);
     }
+    const bool has_mem_ops = val.value();
 
     VmExecState state;
     state.regs = options.initial_regs;
-    state.memory.assign(options.memory_slots, 0ULL);
-    if (options.memory_slots > 0 && state.regs[4] == 0 && state.regs[5] == 0) {
-        const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
-        state.regs[4] = mid_stack;
-        state.regs[5] = mid_stack;
+    if (has_mem_ops && options.memory_slots > 0) {
+        state.memory.assign(options.memory_slots, 0ULL);
+        if (state.regs[4] == 0 && state.regs[5] == 0) {
+            const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
+            state.regs[4] = mid_stack;
+            state.regs[5] = mid_stack;
+        }
     }
 
     const std::size_t code_len = program.instructions.size();
@@ -80,6 +88,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     std::size_t pc = state.pc;
     std::uint64_t steps = 0;
     const std::uint64_t max_steps = options.max_steps;
+    bool zf = state.zf;
+    bool sf = state.sf;
 
     while (pc < code_len) {
         if (steps >= max_steps) {
@@ -123,9 +133,9 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                         return core::diagnostics::Result<VmExecState>::err(
                             ErrorCode::OutOfBounds, "VM memory load out of bounds", "VmInterpreter::execute");
                     }
-                    std::uint64_t val = 0;
-                    std::memcpy(&val, mem_bytes + byte_addr, width_bytes);
-                    regs[insn.dst] = val;
+                    std::uint64_t loaded_val = 0;
+                    std::memcpy(&loaded_val, mem_bytes + byte_addr, width_bytes);
+                    regs[insn.dst] = loaded_val;
                 }
                 ++pc;
                 break;
@@ -149,8 +159,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                         return core::diagnostics::Result<VmExecState>::err(
                             ErrorCode::OutOfBounds, "VM memory store out of bounds", "VmInterpreter::execute");
                     }
-                    const std::uint64_t val = regs[insn.src1];
-                    std::memcpy(mem_bytes + byte_addr, &val, width_bytes);
+                    const std::uint64_t store_val = regs[insn.src1];
+                    std::memcpy(mem_bytes + byte_addr, &store_val, width_bytes);
                 }
                 ++pc;
                 break;
@@ -158,24 +168,24 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
             case VmOpcode::Add: {
                 const auto res = regs[insn.src1] + regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Sub: {
                 const auto res = regs[insn.src1] - regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Mul: {
                 const auto res = regs[insn.src1] * regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
@@ -183,37 +193,39 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 if (regs[insn.src2] == 0) {
                     state.pc = pc;
                     state.steps_executed = steps;
+                    state.zf = zf;
+                    state.sf = sf;
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::InternalError, "Division by zero in VM", "VmInterpreter::execute");
                 }
                 const auto res = regs[insn.src1] / regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::And: {
                 const auto res = regs[insn.src1] & regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Or: {
                 const auto res = regs[insn.src1] | regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Xor: {
                 const auto res = regs[insn.src1] ^ regs[insn.src2];
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
@@ -221,8 +233,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 const auto sh = regs[insn.src2] & 63ULL;
                 const auto res = regs[insn.src1] << sh;
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
@@ -230,16 +242,16 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 const auto sh = regs[insn.src2] & 63ULL;
                 const auto res = regs[insn.src1] >> sh;
                 regs[insn.dst] = res;
-                state.zf = (res == 0);
-                state.sf = (static_cast<std::int64_t>(res) < 0);
+                zf = (res == 0);
+                sf = (static_cast<std::int64_t>(res) < 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Cmp: {
                 const auto lhs = static_cast<std::int64_t>(regs[insn.src1]);
                 const auto rhs = static_cast<std::int64_t>(regs[insn.src2]);
-                state.zf = (lhs == rhs);
-                state.sf = (lhs < rhs);
+                zf = (lhs == rhs);
+                sf = (lhs < rhs);
                 ++pc;
                 break;
             }
@@ -247,27 +259,29 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 pc = static_cast<std::size_t>(insn.imm);
                 break;
             case VmOpcode::Jeq:
-                pc = state.zf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = zf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jne:
-                pc = !state.zf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = !zf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jlt:
-                pc = state.sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jle:
-                pc = (state.sf || state.zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = (sf || zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jgt:
-                pc = (!state.sf && !state.zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = (!sf && !zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jge:
-                pc = !state.sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = !sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Call:
                 if (state.call_stack.size() >= options.max_call_depth) {
                     state.pc = pc;
                     state.steps_executed = steps;
+                    state.zf = zf;
+                    state.sf = sf;
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "VM call stack overflow", "VmInterpreter::execute");
                 }
@@ -278,6 +292,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 if (state.call_stack.empty()) {
                     state.pc = pc;
                     state.steps_executed = steps;
+                    state.zf = zf;
+                    state.sf = sf;
                     state.return_value = regs[0];
                     return state;
                 }
@@ -287,6 +303,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
             case VmOpcode::Halt:
                 state.pc = pc;
                 state.steps_executed = steps;
+                state.zf = zf;
+                state.sf = sf;
                 if (insn.dst == 0xFF) {
                     return core::diagnostics::Result<VmExecState>::err(
                         ErrorCode::OutOfBounds, "Unauthorized indirect control-flow target at runtime", "VmInterpreter::execute");
@@ -325,6 +343,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
 
     state.pc = pc;
     state.steps_executed = steps;
+    state.zf = zf;
+    state.sf = sf;
     state.return_value = regs[0];
     return state;
 }

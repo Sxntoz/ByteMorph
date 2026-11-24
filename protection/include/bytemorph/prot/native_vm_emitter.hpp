@@ -39,6 +39,16 @@ struct MultiFunctionPlan {
     std::vector<FunctionCompatibilityEntry> rejected;
 };
 
+[[nodiscard]] FunctionCompatibilityEntry
+evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
+                              const core::analysis::AnalysisResult& analysis,
+                              const core::analysis::FunctionInfo& fn,
+                              const std::unordered_set<std::uint64_t>& auth_calls,
+                              bool allow_external_calls,
+                              bool is_arm64,
+                              virt::BvmProgram* out_program = nullptr,
+                              std::uint32_t* out_orig_ir_ops = nullptr);
+
 [[nodiscard]] core::diagnostics::Result<MultiFunctionPlan>
 prepare_target_functions(const core::binary::IBinaryFile& bin,
                          const core::analysis::AnalysisResult& analysis,

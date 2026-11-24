@@ -212,9 +212,104 @@ bool is_crt_stub_name(const std::string& name, bool is_ep) noexcept {
         "_start", "start", "_init", "_fini", "main", "_main",
         "__libc_csu_init", "__libc_csu_fini", "__do_global_dtors_aux",
         "frame_dummy", "register_tm_clones", "deregister_tm_clones",
-        "_dl_relocate_static_pie", "__scrt_common_main_seh", "mainCRTStartup"
+        "_dl_relocate_static_pie", "__scrt_common_main_seh", "mainCRTStartup",
+        "__security_init_cookie", "__security_check_cookie", "__GSHandlerCheck"
     };
-    return kSkip.contains(name);
+    if (kSkip.contains(name)) return true;
+    return name.rfind("__scrt_", 0) == 0 || name.rfind("_RTC_", 0) == 0;
+}
+
+bool is_in_import_or_plt_section(const core::binary::IBinaryFile& bin, std::uint64_t va) noexcept {
+    for (const auto& sec : bin.sections()) {
+        if (sec.virtual_size == 0) continue;
+        if (va >= sec.virtual_address && va < sec.virtual_address + sec.virtual_size) {
+            if (sec.name == ".plt" || sec.name == ".plt.got" || sec.name == ".plt.sec" ||
+                sec.name == ".idata" || sec.name == "__stubs" || sec.name == "__stub_helper" ||
+                sec.name == "__got") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::optional<std::string> detect_thunk_or_stub(const core::binary::IBinaryFile& bin,
+                                                const core::analysis::FunctionInfo& fn) {
+    if (is_in_import_or_plt_section(bin, fn.entry_va)) {
+        return "Located inside IAT/PLT/GOT or stub section";
+    }
+    if (fn.name.rfind("__imp_", 0) == 0 || fn.name.rfind("imp.", 0) == 0 ||
+        fn.name.rfind("j_", 0) == 0 || fn.name.rfind("plt_", 0) == 0) {
+        return "Import thunk or jump-stub symbol prefix";
+    }
+    if (fn.blocks.empty()) {
+        return "Function contains no decoded basic blocks";
+    }
+
+    // Collect flat instruction stream from entry block (up to 4 instructions)
+    const auto& insns = fn.blocks.front().instructions;
+    if (insns.empty()) {
+        return "Entry basic block is empty";
+    }
+
+    std::size_t idx = 0;
+    if (insns[idx].mnemonic == "endbr64" || insns[idx].mnemonic == "endbr32" ||
+        insns[idx].mnemonic == "bti" || insns[idx].mnemonic == "nop") {
+        ++idx;
+    }
+    if (idx < insns.size()) {
+        const auto& first_real = insns[idx];
+        // Direct or indirect jump thunk at entry (e.g. FF 25 jmp [rip+disp], jmp imm, b target)
+        if (fn.blocks.size() == 1 && insns.size() <= idx + 1 &&
+            first_real.flow == core::analysis::ControlFlowKind::UnconditionalJump) {
+            return "Unconditional jump stub / IAT-PLT trampoline (" + first_real.full_text + ")";
+        }
+        // ARM64 PLT/GOT stub pattern: adrp + ldr/add + br
+        if (fn.blocks.size() == 1 && insns.size() <= idx + 3 &&
+            first_real.mnemonic == "adrp" &&
+            insns.back().flow == core::analysis::ControlFlowKind::UnconditionalJump) {
+            return "ARM64 ADRP+BR import/PLT trampoline";
+        }
+        // Single-instruction return stub (e.g., stubbed out / empty void helper)
+        if (fn.blocks.size() == 1 && insns.size() <= idx + 1 &&
+            first_real.flow == core::analysis::ControlFlowKind::Return) {
+            return "Trivial single-instruction return stub";
+        }
+    }
+    return std::nullopt;
+}
+
+bool has_mixed_data_or_padding(const core::analysis::FunctionInfo& fn) noexcept {
+    if (fn.blocks.empty()) return true;
+    std::size_t total_insns = 0;
+    std::size_t padding_or_trap = 0;
+    for (const auto& bb : fn.blocks) {
+        for (const auto& insn : bb.instructions) {
+            ++total_insns;
+            if (insn.mnemonic == "int3" || insn.mnemonic == "nop" ||
+                insn.mnemonic == "brk" || insn.mnemonic == "ud2" ||
+                insn.mnemonic == "hlt") {
+                ++padding_or_trap;
+            }
+        }
+    }
+    if (total_insns == 0) return true;
+    // If all instructions are traps/padding or invalid instructions exist, reject
+    return padding_or_trap == total_insns;
+}
+
+bool overlaps_another_function(const core::analysis::AnalysisResult& analysis,
+                               const core::analysis::FunctionInfo& fn) noexcept {
+    if (fn.size_bytes == 0) return false;
+    const std::uint64_t end_va = fn.entry_va + fn.size_bytes;
+    for (const auto& other : analysis.functions) {
+        if (other.entry_va == fn.entry_va || other.size_bytes == 0) continue;
+        const std::uint64_t other_end = other.entry_va + other.size_bytes;
+        if (fn.entry_va < other_end && other.entry_va < end_va) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::optional<std::uint64_t> resolve_symbol_va_by_name(const core::binary::IBinaryFile& bin,
@@ -235,6 +330,128 @@ std::optional<std::uint64_t> resolve_symbol_va_by_name(const core::binary::IBina
 }
 
 } // namespace
+
+FunctionCompatibilityEntry
+evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
+                              const core::analysis::AnalysisResult& analysis,
+                              const core::analysis::FunctionInfo& fn,
+                              const std::unordered_set<std::uint64_t>& auth_calls,
+                              bool allow_external_calls,
+                              bool is_arm64,
+                              virt::BvmProgram* out_program,
+                              std::uint32_t* out_orig_ir_ops) {
+    using namespace core::ir;
+    using namespace virt;
+
+    FunctionCompatibilityEntry entry;
+    entry.name = fn.name;
+    entry.entry_va = fn.entry_va;
+    entry.size_bytes = fn.size_bytes;
+
+    const std::size_t min_patch = is_arm64 ? 4 : 5;
+
+    if (is_crt_stub_name(fn.name, fn.from_entry_point)) {
+        entry.category = "crt_entrypoint";
+        entry.rejection_reason = "Entry point or CRT/startup routine excluded from automatic virtualization";
+        return entry;
+    }
+    if (auto thunk_reason = detect_thunk_or_stub(bin, fn)) {
+        entry.category = "iat_plt_thunk";
+        entry.rejection_reason = *thunk_reason;
+        return entry;
+    }
+    if (fn.size_bytes < min_patch) {
+        entry.category = "too_small";
+        entry.rejection_reason = "Function smaller than minimum trampoline patch size (" + std::to_string(min_patch) + " bytes)";
+        return entry;
+    }
+    if (has_mixed_data_or_padding(fn)) {
+        entry.category = "mixed_data_or_padding";
+        entry.rejection_reason = "Function body consists solely of padding/traps or invalid bytes";
+        return entry;
+    }
+    if (overlaps_another_function(analysis, fn)) {
+        entry.category = "overlap";
+        entry.rejection_reason = "Function address range overlaps another discovered function";
+        return entry;
+    }
+    if (fn.confidence == core::analysis::AnalysisConfidence::Low) {
+        entry.category = "low_confidence";
+        entry.rejection_reason = "Partially unknown CFG or invalid instructions in function body";
+        return entry;
+    }
+
+    IrFunction ir_fn = is_arm64
+        ? arch::aarch64::AArch64Lifter().lift_function(fn)
+        : arch::x86_64::X86_64Lifter().lift_function(fn);
+
+    bool has_return = false;
+    for (const auto& bb : ir_fn.blocks) {
+        entry.ir_ops += static_cast<std::uint32_t>(bb.instructions.size());
+        for (const auto& insn : bb.instructions) {
+            if (insn.opcode == IrOpcode::Ret) {
+                has_return = true;
+            }
+            if (insn.opcode == IrOpcode::Unknown || insn.opcode == IrOpcode::Syscall) {
+                entry.unsupported_instructions.push_back(
+                    insn.comment.empty() ? std::string(core::ir::to_string(insn.opcode)) : insn.comment);
+            }
+            // Reject unresolved / RIP-relative memory operands (Kind::Memory without base+disp)
+            auto has_unresolved_mem = [](const std::vector<IrOperand>& ops) noexcept {
+                for (const auto& o : ops) {
+                    if (o.kind == IrOperand::Kind::Memory) return true;
+                }
+                return false;
+            };
+            if (has_unresolved_mem(insn.srcs) || has_unresolved_mem(insn.dsts)) {
+                entry.category = "rip_relative_or_unresolved_mem";
+                entry.rejection_reason = "Contains RIP-relative or unresolved global memory operand";
+                return entry;
+            }
+            // Conservative indirect call/jump check
+            if ((insn.opcode == IrOpcode::Call || insn.opcode == IrOpcode::Jump) &&
+                !insn.srcs.empty() && insn.srcs[0].kind != IrOperand::Kind::Label) {
+                entry.category = "indirect_control_flow";
+                entry.rejection_reason = "Conservative rejection: unverified indirect call/jump (" +
+                    std::string(core::ir::to_string(insn.opcode)) + ")";
+                return entry;
+            }
+        }
+    }
+
+    if (!entry.unsupported_instructions.empty()) {
+        entry.category = "unsupported_insn";
+        entry.rejection_reason = "Contains unsupported instruction(s): " + entry.unsupported_instructions.front();
+        return entry;
+    }
+    if (!has_return) {
+        entry.category = "incomplete_boundaries";
+        entry.rejection_reason = "Function has no return path (tail-call or incomplete boundary)";
+        return entry;
+    }
+
+    TranslateOptions t_opts;
+    t_opts.allow_external_calls = allow_external_calls;
+    t_opts.authorized_call_targets = auth_calls;
+    auto bvm_res = IrToVmTranslator::translate(ir_fn, t_opts);
+    if (!bvm_res) {
+        entry.category = "vm_translation_rejected";
+        entry.rejection_reason = bvm_res.error().message;
+        return entry;
+    }
+
+    entry.eligible = true;
+    entry.category = "eligible";
+    entry.vm_ops = static_cast<std::uint32_t>(bvm_res.value().instructions.size());
+    entry.estimated_runtime_bytes = static_cast<std::uint32_t>(12 + entry.vm_ops * 12);
+    entry.estimated_overhead_pct = (entry.ir_ops > 0)
+        ? static_cast<std::uint32_t>((entry.vm_ops * 100u) / entry.ir_ops)
+        : 100u;
+
+    if (out_orig_ir_ops) *out_orig_ir_ops = entry.ir_ops;
+    if (out_program) *out_program = std::move(bvm_res.value());
+    return entry;
+}
 
 core::diagnostics::Result<MultiFunctionPlan>
 prepare_target_functions(const core::binary::IBinaryFile& bin,
@@ -316,25 +533,20 @@ prepare_target_functions(const core::binary::IBinaryFile& bin,
 
     if (options.protect_all_eligible) {
         for (const auto& fn : analysis.functions) {
-            if (is_crt_stub_name(fn.name, fn.from_entry_point)) {
-                FunctionCompatibilityEntry rej;
-                rej.name = fn.name;
-                rej.entry_va = fn.entry_va;
-                rej.size_bytes = fn.size_bytes;
-                rej.rejection_reason = "Entry point or CRT/startup routine excluded";
-                plan.rejected.push_back(std::move(rej));
+            auto elig = evaluate_function_eligibility(
+                bin, analysis, fn, auth_calls, options.allow_external_calls, is_arm64);
+            if (!elig.eligible) {
+                plan.rejected.push_back(std::move(elig));
                 continue;
             }
             auto pf = process_fn(fn);
             if (!pf) {
-                FunctionCompatibilityEntry rej;
-                rej.name = fn.name;
-                rej.entry_va = fn.entry_va;
-                rej.size_bytes = fn.size_bytes;
-                rej.rejection_reason = pf.error().message;
-                plan.rejected.push_back(std::move(rej));
+                elig.eligible = false;
+                elig.rejection_reason = pf.error().message;
+                plan.rejected.push_back(std::move(elig));
                 continue;
             }
+            ++plan.eligible_count;
             plan.prepared.push_back(std::move(pf.value()));
         }
     } else if (explicit_multi) {

@@ -51,6 +51,9 @@ struct FunctionCompatibilityEntry {
     bool eligible{false};
     std::uint32_t ir_ops{0};
     std::uint32_t vm_ops{0};
+    std::string category;
+    std::uint32_t estimated_overhead_pct{0};
+    std::uint32_t estimated_runtime_bytes{0};
     std::vector<std::string> unsupported_instructions;
     std::string rejection_reason;
 };
