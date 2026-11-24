@@ -1538,7 +1538,7 @@ TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
             if (f.name.find("bm_target_cmov_select") != std::string::npos) found_cmov = true;
             if (f.name.find("bm_target_unsigned_cmp") != std::string::npos) found_ucmp = true;
         }
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
         EXPECT_TRUE(found_global_rw);
 #else
         (void)found_global_rw;
