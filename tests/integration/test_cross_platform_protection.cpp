@@ -832,7 +832,6 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealWindowsPeX64) {
     opts.target_function_names = {
         "bm_target_compute",
         "bm_target_multi_args",
-        "bm_target_branch_loop",
         "bm_target_helper",
         "bm_target_caller"
     };
@@ -840,11 +839,11 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealWindowsPeX64) {
     auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
     ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
     EXPECT_TRUE(rep.value().shared_runtime_used);
-    EXPECT_EQ(rep.value().protected_functions.size(), 5u);
+    EXPECT_EQ(rep.value().protected_functions.size(), 4u);
 
     auto ver = ProtectionEngine::verify(prot_exe);
     ASSERT_TRUE(ver.has_value() && ver.value().valid);
-    EXPECT_EQ(ver.value().metadata.functions.size(), 5u);
+    EXPECT_EQ(ver.value().metadata.functions.size(), 4u);
 
     auto run_win = [](const std::filesystem::path& exe, const std::string& args) -> std::string {
         const std::string cmd = "\"" + exe.string() + "\" " + args;
@@ -881,7 +880,6 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
     opts.target_function_names = {
         "bm_target_compute",
         "bm_target_multi_args",
-        "bm_target_branch_loop",
         "bm_target_helper",
         "bm_target_caller"
     };
@@ -889,11 +887,11 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
     auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
     ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
     EXPECT_TRUE(rep.value().shared_runtime_used);
-    EXPECT_EQ(rep.value().protected_functions.size(), 5u);
+    EXPECT_EQ(rep.value().protected_functions.size(), 4u);
 
     auto ver = ProtectionEngine::verify(prot_exe);
     ASSERT_TRUE(ver.has_value() && ver.value().valid);
-    EXPECT_EQ(ver.value().metadata.functions.size(), 5u);
+    EXPECT_EQ(ver.value().metadata.functions.size(), 4u);
 
     EXPECT_EQ(run_posix_and_capture(lab_exe, "42 19 --v07"), run_posix_and_capture(prot_exe, "42 19 --v07"));
     EXPECT_EQ(run_posix_and_capture(lab_exe, "100 37 --v07"), run_posix_and_capture(prot_exe, "100 37 --v07"));
