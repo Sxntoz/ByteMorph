@@ -1524,8 +1524,16 @@ TEST(ProtectionV09Test, V09OpcodeCodecRoundtripAndValidation) {
     EXPECT_FALSE(VmInterpreter::execute(invalid_cc).has_value());
 }
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#define BYTEMORPH_HAS_SANITIZER 1
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define BYTEMORPH_HAS_SANITIZER 1
+#endif
+
 TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
-#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && defined(NDEBUG)
+#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && !defined(BYTEMORPH_HAS_SANITIZER)
     const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
     if (std::filesystem::exists(target_exe)) {
         auto compat = bytemorph::prot::ProtectionEngine::check_compatibility(target_exe, false);
@@ -1550,7 +1558,7 @@ TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
 }
 
 TEST(ProtectionV09Test, MultiFunctionProtectionWithGlobalsAndAeadVerify) {
-#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && defined(NDEBUG)
+#if defined(BYTEMORPH_LAB_PE_TARGET_PATH) && !defined(BYTEMORPH_HAS_SANITIZER)
     const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
     if (std::filesystem::exists(target_exe)) {
         const std::filesystem::path out_exe =
