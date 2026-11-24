@@ -16,10 +16,23 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 using namespace bytemorph::core::analysis;
 using namespace bytemorph::core::ir;
@@ -1129,4 +1142,433 @@ TEST(ProtectionV08Test, BytecodeFuzzAndMemoryBoundsSafety) {
         (void)VmInterpreter::execute(p, opts);
     }
     SUCCEED();
+}
+
+TEST(ProtectionV09Test, X64RipRelativeGlobalLiftingAndPicTranslation) {
+    using namespace bytemorph::core::ir;
+    using namespace bytemorph::virt;
+
+    bytemorph::core::analysis::FunctionInfo fn;
+    fn.name = "rip_global_fn";
+    fn.entry_va = 0x140001000ULL;
+    bytemorph::core::analysis::BasicBlock bb;
+    bb.start_va = 0x140001000ULL;
+    bb.end_va = 0x140001020ULL;
+    bb.instructions = {
+        {0x140001000ULL, {0x48,0x8D,0x05,0x00,0x20,0x00,0x00}, "lea", "rax, [rip + 0x2000]", "lea rax, [rip + 0x2000]", ControlFlowKind::Sequential, std::nullopt},
+        {0x140001007ULL, {0x8B,0x0D,0x00,0x30,0x00,0x00}, "mov", "ecx, dword ptr [rip + 0x3000]", "mov ecx, dword ptr [rip + 0x3000]", ControlFlowKind::Sequential, std::nullopt},
+        {0x14000100DULL, {0x89,0x05,0x00,0x30,0x00,0x00}, "mov", "dword ptr [rip + 0x3000], eax", "mov dword ptr [rip + 0x3000], eax", ControlFlowKind::Sequential, std::nullopt},
+        {0x140001013ULL, {0xC3}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    };
+    fn.blocks.push_back(bb);
+
+    auto ir_fn = bytemorph::arch::x86_64::X86_64Lifter().lift_function(fn);
+    ASSERT_FALSE(ir_fn.blocks.empty());
+    std::size_t lea_count = 0;
+    for (const auto& insn : ir_fn.blocks[0].instructions) {
+        if (insn.opcode == IrOpcode::LeaGlobal) ++lea_count;
+    }
+    EXPECT_EQ(lea_count, 3u);
+
+    TranslateOptions topts;
+    topts.stub_base_va = 0x140001000ULL;
+    auto bvm_res = IrToVmTranslator::translate(ir_fn, topts);
+    ASSERT_TRUE(bvm_res.has_value()) << bvm_res.error().to_string();
+
+    bool found_leapic = false;
+    for (const auto& vi : bvm_res.value().instructions) {
+        if (vi.opcode == VmOpcode::LeaPic) {
+            found_leapic = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_leapic);
+
+    // Verify ASLR relocation of LeaPic via pic_base_va
+    BvmProgram pic_only;
+    pic_only.instructions = {
+        {VmOpcode::LeaPic, 0, 0, 0, 0x2007},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    VmExecOptions o1;
+    o1.pic_base_va = 0x140001000ULL;
+    auto r1 = VmInterpreter::execute(pic_only, o1);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1.value().return_value, 0x140003007ULL);
+
+    VmExecOptions o2;
+    o2.pic_base_va = 0x7FF600001000ULL;
+    auto r2 = VmInterpreter::execute(pic_only, o2);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2.value().return_value, 0x7FF600003007ULL);
+}
+
+TEST(ProtectionV09Test, Arm64AdrpAddAndAdrpLdrFusion) {
+    using namespace bytemorph::core::ir;
+    using namespace bytemorph::virt;
+
+    bytemorph::core::analysis::FunctionInfo fn;
+    fn.name = "arm64_adrp_fn";
+    fn.entry_va = 0x100004000ULL;
+    bytemorph::core::analysis::BasicBlock bb;
+    bb.start_va = 0x100004000ULL;
+    bb.end_va = 0x100004014ULL;
+    bb.instructions = {
+        {0x100004000ULL, {0,0,0,0}, "adrp", "x0, #0x100008000", "adrp x0, #0x100008000", ControlFlowKind::Sequential, std::nullopt},
+        {0x100004004ULL, {0,0,0,0}, "add", "x0, x0, #0x120", "add x0, x0, #0x120", ControlFlowKind::Sequential, std::nullopt},
+        {0x100004008ULL, {0,0,0,0}, "adrp", "x1, #0x100009000", "adrp x1, #0x100009000", ControlFlowKind::Sequential, std::nullopt},
+        {0x10000400CULL, {0,0,0,0}, "ldr", "x2, [x1, #0x40]", "ldr x2, [x1, #0x40]", ControlFlowKind::Sequential, std::nullopt},
+        {0x100004010ULL, {0,0,0,0}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    };
+    fn.blocks.push_back(bb);
+
+    auto ir_fn = bytemorph::arch::aarch64::AArch64Lifter().lift_function(fn);
+    ASSERT_FALSE(ir_fn.blocks.empty());
+    const auto& insns = ir_fn.blocks[0].instructions;
+    ASSERT_GE(insns.size(), 4u);
+    EXPECT_EQ(insns[0].opcode, IrOpcode::LeaGlobal);
+    EXPECT_EQ(static_cast<std::uint64_t>(insns[0].srcs[0].imm), 0x100008120ULL);
+    EXPECT_EQ(insns[1].opcode, IrOpcode::LeaGlobal);
+    EXPECT_EQ(static_cast<std::uint64_t>(insns[1].srcs[0].imm), 0x100009040ULL);
+    EXPECT_EQ(insns[2].opcode, IrOpcode::Load);
+
+    TranslateOptions topts;
+    topts.stub_base_va = 0x100004000ULL;
+    auto bvm = IrToVmTranslator::translate(ir_fn, topts);
+    ASSERT_TRUE(bvm.has_value()) << bvm.error().to_string();
+    EXPECT_EQ(bvm.value().instructions[0].opcode, VmOpcode::LeaPic);
+    EXPECT_EQ(bvm.value().instructions[0].imm, 0x4120);
+}
+
+TEST(ProtectionV09Test, X64CmovccSetccAdcSbbDifferential) {
+    using namespace bytemorph::core::ir;
+    using namespace bytemorph::virt;
+
+    bytemorph::core::analysis::FunctionInfo fn;
+    fn.name = "cmov_adc_fn";
+    fn.entry_va = 0x1000;
+    bytemorph::core::analysis::BasicBlock bb;
+    bb.start_va = 0x1000;
+    bb.end_va = 0x1020;
+    bb.instructions = {
+        {0x1000, {0,0,0}, "mov", "rax, rcx", "mov rax, rcx", ControlFlowKind::Sequential, std::nullopt},
+        {0x1003, {0,0,0}, "cmp", "rcx, rdx", "cmp rcx, rdx", ControlFlowKind::Sequential, std::nullopt},
+        {0x1006, {0,0,0,0}, "cmovg", "rax, rdx", "cmovg rax, rdx", ControlFlowKind::Sequential, std::nullopt},
+        {0x100A, {0,0,0}, "setb", "r8b", "setb r8b", ControlFlowKind::Sequential, std::nullopt},
+        {0x100D, {0,0,0}, "adc", "rax, r8", "adc rax, r8", ControlFlowKind::Sequential, std::nullopt},
+        {0x1010, {0xC3}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    };
+    fn.blocks.push_back(bb);
+
+    auto ir_fn = bytemorph::arch::x86_64::X86_64Lifter().lift_function(fn);
+    auto bvm = IrToVmTranslator::translate(ir_fn, TranslateOptions{});
+    ASSERT_TRUE(bvm.has_value()) << bvm.error().to_string();
+
+    for (const auto& [a, b] : std::vector<std::pair<std::uint64_t, std::uint64_t>>{
+             {10ULL, 20ULL}, {30ULL, 5ULL}, {static_cast<std::uint64_t>(-5LL), 2ULL}}) {
+        IrExecOptions ir_opts;
+        ir_opts.initial_regs["rcx"] = a;
+        ir_opts.initial_regs["rdx"] = b;
+        ir_opts.initial_regs["r8"] = 0;
+        auto ir_res = IrInterpreter::execute(ir_fn, ir_opts);
+        ASSERT_TRUE(ir_res.has_value()) << ir_res.error().to_string();
+
+        VmExecOptions vm_opts;
+        vm_opts.initial_regs[1] = a; // rcx
+        vm_opts.initial_regs[2] = b; // rdx
+        vm_opts.initial_regs[8] = 0; // r8
+        auto vm_res = VmInterpreter::execute(bvm.value(), vm_opts);
+        ASSERT_TRUE(vm_res.has_value()) << vm_res.error().to_string();
+
+        EXPECT_EQ(vm_res.value().return_value, ir_res.value().return_value);
+    }
+}
+
+TEST(ProtectionV09Test, Arm64CselVariantsAndCsetDifferential) {
+    using namespace bytemorph::core::ir;
+    using namespace bytemorph::virt;
+
+    bytemorph::core::analysis::FunctionInfo fn;
+    fn.name = "arm64_csel_fn";
+    fn.entry_va = 0x2000;
+    bytemorph::core::analysis::BasicBlock bb;
+    bb.start_va = 0x2000;
+    bb.end_va = 0x2020;
+    bb.instructions = {
+        {0x2000, {0,0,0,0}, "cmp", "x0, x1", "cmp x0, x1", ControlFlowKind::Sequential, std::nullopt},
+        {0x2004, {0,0,0,0}, "csel", "x2, x0, x1, lt", "csel x2, x0, x1, lt", ControlFlowKind::Sequential, std::nullopt},
+        {0x2008, {0,0,0,0}, "csinc", "x3, x0, x1, eq", "csinc x3, x0, x1, eq", ControlFlowKind::Sequential, std::nullopt},
+        {0x200C, {0,0,0,0}, "cset", "x4, hi", "cset x4, hi", ControlFlowKind::Sequential, std::nullopt},
+        {0x2010, {0,0,0,0}, "add", "x0, x2, x3", "add x0, x2, x3", ControlFlowKind::Sequential, std::nullopt},
+        {0x2014, {0,0,0,0}, "add", "x0, x0, x4", "add x0, x0, x4", ControlFlowKind::Sequential, std::nullopt},
+        {0x2018, {0,0,0,0}, "ret", "", "ret", ControlFlowKind::Return, std::nullopt}
+    };
+    fn.blocks.push_back(bb);
+
+    auto ir_fn = bytemorph::arch::aarch64::AArch64Lifter().lift_function(fn);
+    auto bvm = IrToVmTranslator::translate(ir_fn, TranslateOptions{});
+    ASSERT_TRUE(bvm.has_value()) << bvm.error().to_string();
+
+    for (const auto& [x0, x1] : std::vector<std::pair<std::uint64_t, std::uint64_t>>{
+             {5ULL, 12ULL}, {12ULL, 12ULL}, {25ULL, 7ULL}}) {
+        IrExecOptions ir_opts;
+        ir_opts.initial_regs["x0"] = x0;
+        ir_opts.initial_regs["x1"] = x1;
+        auto ir_res = IrInterpreter::execute(ir_fn, ir_opts);
+        ASSERT_TRUE(ir_res.has_value()) << ir_res.error().to_string();
+
+        VmExecOptions vm_opts;
+        vm_opts.initial_regs[0] = x0;
+        vm_opts.initial_regs[1] = x1;
+        auto vm_res = VmInterpreter::execute(bvm.value(), vm_opts);
+        ASSERT_TRUE(vm_res.has_value()) << vm_res.error().to_string();
+
+        EXPECT_EQ(vm_res.value().return_value, ir_res.value().return_value);
+    }
+}
+
+TEST(ProtectionV09Test, SignedAndUnsignedFlagsAccuracy) {
+    using namespace bytemorph::virt;
+    BvmProgram prog;
+    prog.instructions = {
+        {VmOpcode::Cmp, 0, 1, 2, 0},
+        {VmOpcode::SetCc, 0, 0, static_cast<std::uint8_t>(VmCondCode::Lt), 0},
+        {VmOpcode::SetCc, 3, 0, static_cast<std::uint8_t>(VmCondCode::Below), 0},
+        {VmOpcode::SetCc, 6, 0, static_cast<std::uint8_t>(VmCondCode::Overflow), 0},
+        {VmOpcode::Shl, 3, 3, 7, 0},
+        {VmOpcode::Or, 0, 0, 3, 0},
+        {VmOpcode::Shl, 6, 6, 8, 0},
+        {VmOpcode::Or, 0, 0, 6, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+
+    VmExecOptions opts;
+    // INT64_MIN (0x8000000000000000) vs 1:
+    // Signed Lt = 1 (bit0), Unsigned Below = 0 (bit1), Overflow = 1 (bit2) => 5
+    opts.initial_regs[1] = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::min());
+    opts.initial_regs[2] = 1ULL;
+    opts.initial_regs[7] = 1ULL;
+    opts.initial_regs[8] = 2ULL;
+    auto res = VmInterpreter::execute(prog, opts);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().return_value, 5ULL);
+}
+
+TEST(ProtectionV09Test, VmMemoryPoolZeroLeakAndConcurrency) {
+    using namespace bytemorph::virt;
+
+    BvmProgram writer_prog;
+    writer_prog.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 0xDEADBEEFCAFEULL},
+        {VmOpcode::Store, 4, 1, 64, 16},
+        {VmOpcode::Load, 0, 4, 64, 16},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    BvmProgram reader_prog;
+    reader_prog.instructions = {
+        {VmOpcode::Load, 0, 4, 64, 16},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+
+    // Warm-up pool
+    ASSERT_TRUE(VmInterpreter::execute(writer_prog).has_value());
+    for (int i = 0; i < 50; ++i) {
+        auto wr = VmInterpreter::execute(writer_prog);
+        ASSERT_TRUE(wr.has_value());
+        EXPECT_EQ(wr.value().return_value, 0xDEADBEEFCAFEULL);
+        EXPECT_EQ(wr.value().allocations_count, 0u);
+
+        auto rd = VmInterpreter::execute(reader_prog);
+        ASSERT_TRUE(rd.has_value());
+        EXPECT_EQ(rd.value().return_value, 0ULL); // Zero state leak!
+    }
+
+    // Concurrent multi-threaded execution
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{0};
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int iter = 0; iter < 150; ++iter) {
+                BvmProgram tp;
+                const std::int64_t val = static_cast<std::int64_t>(t * 1000 + iter + 1);
+                tp.instructions = {
+                    {VmOpcode::MovImm, 1, 0, 0, val},
+                    {VmOpcode::Store, 4, 1, 64, 8},
+                    {VmOpcode::Load, 0, 4, 64, 8},
+                    {VmOpcode::Ret, 0, 0, 0, 0}
+                };
+                auto r = VmInterpreter::execute(tp);
+                if (!r.has_value() || r.value().return_value != static_cast<std::uint64_t>(val)) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(failures.load(), 0);
+}
+
+TEST(ProtectionV09Test, NativeArm64PicRuntimeV09Emission) {
+    using namespace bytemorph::virt;
+    BvmProgram prog;
+    prog.instructions = {
+        {VmOpcode::LeaPic, 2, 0, 0, 0x1200},
+        {VmOpcode::Cmp, 0, 0, 1, 0},
+        {VmOpcode::SetCc, 3, 0, static_cast<std::uint8_t>(VmCondCode::Above), 0},
+        {VmOpcode::SelectCc, 0, 3, static_cast<std::uint8_t>(VmCondCode::Ne), 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    bytemorph::prot::detail::SharedRuntimeLayout layout;
+    auto code = bytemorph::prot::detail::emit_shared_pic_arm64_vm_runtime(
+        std::vector<BvmProgram>{prog}, layout);
+    ASSERT_TRUE(code.has_value()) << code.error().to_string();
+    EXPECT_GT(code.value().size(), 100u);
+    EXPECT_EQ(code.value().size() % 4, 0u);
+}
+
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+TEST(ProtectionV09Test, NativeX64PicRuntimeV09OpcodesAndRealPeExecution) {
+    using namespace bytemorph::virt;
+    // 1. Direct native JIT test of LeaPic, Cmp (CF/OF), SelectCc, SetCc
+    BvmProgram prog;
+    prog.instructions = {
+        {VmOpcode::LeaPic, 6, 0, 0, 0x400},
+        {VmOpcode::Cmp, 0, 1, 2, 0},
+        {VmOpcode::SetCc, 3, 0, static_cast<std::uint8_t>(VmCondCode::Below), 0},
+        {VmOpcode::MovImm, 0, 0, 0, 100},
+        {VmOpcode::SelectCc, 0, 6, static_cast<std::uint8_t>(VmCondCode::Eq), 0},
+        {VmOpcode::Add, 0, 0, 3, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    bytemorph::prot::detail::SharedRuntimeLayout layout;
+    auto code = bytemorph::prot::detail::emit_shared_pic_x64_vm_runtime(
+        std::vector<BvmProgram>{prog}, bytemorph::prot::detail::AbiKind::Win64, layout);
+    ASSERT_TRUE(code.has_value()) << code.error().to_string();
+
+    void* exec_mem = ::VirtualAlloc(nullptr, code.value().size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    ASSERT_NE(exec_mem, nullptr);
+    std::memcpy(exec_mem, code.value().data(), code.value().size());
+    using FnType = std::uint64_t(*)(std::uint64_t, std::uint64_t);
+    auto fn = reinterpret_cast<FnType>(reinterpret_cast<std::uint8_t*>(exec_mem) + layout.entry_offsets[0]);
+    const std::uint64_t entry_addr = reinterpret_cast<std::uint64_t>(exec_mem);
+    // Call with (5, 10): Below=1, Eq=0 -> 100 + 1 = 101
+    EXPECT_EQ(fn(5, 10), 101ULL);
+    // Call with (10, 10): Below=0, Eq=1 -> (entry_addr + 0x400) + 0
+    EXPECT_EQ(fn(10, 10), entry_addr + 0x400ULL);
+    ::VirtualFree(exec_mem, 0, MEM_RELEASE);
+
+    // 2. Real PE protection + execution with globals, cmov, unsigned cmp
+#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+    const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    if (std::filesystem::exists(target_exe)) {
+        const std::filesystem::path out_exe =
+            std::filesystem::temp_directory_path() / "bytemorph_v09_lab_protected.exe";
+        std::filesystem::remove(out_exe);
+
+        bytemorph::prot::ProtectOptions opts;
+        opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+        opts.seed = 0x571D0909ULL;
+        opts.target_function_names = {
+            "bm_target_compute",
+            "bm_target_global_rw",
+            "bm_target_cmov_select",
+            "bm_target_unsigned_cmp"
+        };
+        auto prot_res = bytemorph::prot::ProtectionEngine::protect(target_exe, out_exe, opts);
+        ASSERT_TRUE(prot_res.has_value()) << prot_res.error().to_string();
+
+        auto run_exe = [](const std::string& cmd) -> std::string {
+            FILE* pipe = _popen(cmd.c_str(), "r");
+            if (!pipe) return "";
+            char buf[256];
+            std::string out;
+            while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+            _pclose(pipe);
+            return out;
+        };
+        const std::string orig_out = run_exe("\"" + target_exe.string() + "\" 42 19 --v09");
+        const std::string prot_out = run_exe("\"" + out_exe.string() + "\" 42 19 --v09");
+        EXPECT_FALSE(orig_out.empty());
+        EXPECT_EQ(prot_out, orig_out);
+        std::filesystem::remove(out_exe);
+    }
+#endif
+}
+#endif
+
+TEST(ProtectionV09Test, V09OpcodeCodecRoundtripAndValidation) {
+    using namespace bytemorph::virt;
+    BvmProgram prog;
+    prog.build_seed = 0x9999ULL;
+    prog.instructions = {
+        {VmOpcode::LeaPic, 2, 0, 0, -0x1234},
+        {VmOpcode::SetCc, 3, 0, static_cast<std::uint8_t>(VmCondCode::AboveEq), 0},
+        {VmOpcode::SelectCc, 0, 2, static_cast<std::uint8_t>(VmCondCode::Overflow), 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    auto enc = BvmCodec::encode(prog);
+    ASSERT_TRUE(enc.has_value());
+    auto dec = BvmCodec::decode(enc.value());
+    ASSERT_TRUE(dec.has_value());
+    ASSERT_EQ(dec.value().instructions.size(), 4u);
+    EXPECT_EQ(dec.value().instructions[0].opcode, VmOpcode::LeaPic);
+    EXPECT_EQ(dec.value().instructions[0].imm, -0x1234);
+    EXPECT_EQ(dec.value().instructions[1].opcode, VmOpcode::SetCc);
+    EXPECT_EQ(dec.value().instructions[2].opcode, VmOpcode::SelectCc);
+
+    BvmProgram invalid_cc;
+    invalid_cc.instructions = {
+        {VmOpcode::SetCc, 0, 0, 99, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+    EXPECT_FALSE(VmInterpreter::execute(invalid_cc).has_value());
+}
+
+TEST(ProtectionV09Test, SmartEligibility3AcceptsGlobalsInLabPe) {
+#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+    const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    if (std::filesystem::exists(target_exe)) {
+        auto compat = bytemorph::prot::ProtectionEngine::check_compatibility(target_exe, false);
+        ASSERT_TRUE(compat.has_value()) << compat.error().to_string();
+        bool found_global_rw = false;
+        bool found_cmov = false;
+        bool found_ucmp = false;
+        for (const auto& f : compat.value().eligible_functions) {
+            if (f.name == "bm_target_global_rw") found_global_rw = true;
+            if (f.name == "bm_target_cmov_select") found_cmov = true;
+            if (f.name == "bm_target_unsigned_cmp") found_ucmp = true;
+        }
+        EXPECT_TRUE(found_global_rw);
+        EXPECT_TRUE(found_cmov);
+        EXPECT_TRUE(found_ucmp);
+    }
+#endif
+}
+
+TEST(ProtectionV09Test, MultiFunctionProtectionWithGlobalsAndAeadVerify) {
+#ifdef BYTEMORPH_LAB_PE_TARGET_PATH
+    const std::filesystem::path target_exe(BYTEMORPH_LAB_PE_TARGET_PATH);
+    if (std::filesystem::exists(target_exe)) {
+        const std::filesystem::path out_exe =
+            std::filesystem::temp_directory_path() / "bytemorph_v09_verify_protected.exe";
+        std::filesystem::remove(out_exe);
+
+        bytemorph::prot::ProtectOptions opts;
+        opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+        opts.seed = 0x90909090ULL;
+        opts.target_function_names = {
+            "bm_target_global_rw",
+            "bm_target_cmov_select",
+            "bm_target_unsigned_cmp"
+        };
+        auto prot = bytemorph::prot::ProtectionEngine::protect(target_exe, out_exe, opts);
+        ASSERT_TRUE(prot.has_value()) << prot.error().to_string();
+        EXPECT_EQ(prot.value().protected_functions.size(), 3u);
+
+        auto ver = bytemorph::prot::ProtectionEngine::verify(out_exe);
+        ASSERT_TRUE(ver.has_value() && ver.value().valid);
+        EXPECT_EQ(ver.value().metadata.functions.size(), 3u);
+        std::filesystem::remove(out_exe);
+    }
+#endif
 }

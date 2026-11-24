@@ -385,6 +385,16 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
         ? arch::aarch64::AArch64Lifter().lift_function(fn)
         : arch::x86_64::X86_64Lifter().lift_function(fn);
 
+    auto is_valid_global_va = [&](std::uint64_t va) noexcept -> bool {
+        for (const auto& sec : bin.sections()) {
+            const std::uint64_t span = std::max<std::uint64_t>(sec.virtual_size, sec.raw_size);
+            if (span > 0 && va >= sec.virtual_address && va < sec.virtual_address + span) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     bool has_return = false;
     for (const auto& bb : ir_fn.blocks) {
         entry.ir_ops += static_cast<std::uint32_t>(bb.instructions.size());
@@ -396,10 +406,18 @@ evaluate_function_eligibility(const core::binary::IBinaryFile& bin,
                 entry.unsupported_instructions.push_back(
                     insn.comment.empty() ? std::string(core::ir::to_string(insn.opcode)) : insn.comment);
             }
-            // Reject unresolved / RIP-relative memory operands (Kind::Memory without base+disp)
+            if (insn.opcode == IrOpcode::LeaGlobal) {
+                if (insn.srcs.empty() || insn.srcs[0].kind != IrOperand::Kind::Label ||
+                    !is_valid_global_va(static_cast<std::uint64_t>(insn.srcs[0].imm))) {
+                    entry.category = "rip_relative_or_unresolved_mem";
+                    entry.rejection_reason = "RIP/PC-relative global reference points outside mapped binary sections";
+                    return entry;
+                }
+            }
+            // Reject unresolved memory operands (resolved __bm_rip_tmp from LeaGlobal is permitted)
             auto has_unresolved_mem = [](const std::vector<IrOperand>& ops) noexcept {
                 for (const auto& o : ops) {
-                    if (o.kind == IrOperand::Kind::Memory) return true;
+                    if (o.kind == IrOperand::Kind::Memory && o.name != "__bm_rip_tmp") return true;
                 }
                 return false;
             };
@@ -776,6 +794,9 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     Label l_op_shl = a.new_label();
     Label l_op_shr = a.new_label();
     Label l_op_cmp = a.new_label();
+    Label l_op_leapic = a.new_label();
+    Label l_op_selectcc = a.new_label();
+    Label l_op_setcc = a.new_label();
     Label l_op_jmp = a.new_label();
     Label l_op_jeq = a.new_label();
     Label l_op_jne = a.new_label();
@@ -878,8 +899,11 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Xor));     a.je(l_op_xor);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Shl));     a.je(l_op_shl);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Shr));     a.je(l_op_shr);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Cmp));     a.je(l_op_cmp);
-    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jmp));     a.je(l_op_jmp);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Cmp));      a.je(l_op_cmp);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::LeaPic));   a.je(l_op_leapic);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::SelectCc)); a.je(l_op_selectcc);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::SetCc));    a.je(l_op_setcc);
+    a.cmp(x86::eax, static_cast<int>(VmOpcode::Jmp));      a.je(l_op_jmp);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jeq));     a.je(l_op_jeq);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jne));     a.je(l_op_jne);
     a.cmp(x86::eax, static_cast<int>(VmOpcode::Jlt));     a.je(l_op_jlt);
@@ -1030,9 +1054,90 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.cmp(x86::rax, x86::qword_ptr(x86::rsp, x86::r9, 3));
     a.setz(x86::r15b);
     a.sets(x86::dl);
+    a.setb(x86::al);
+    a.seto(x86::r10b);
+    a.and_(x86::r15d, 1);
     a.shl(x86::dl, 1);
     a.or_(x86::r15b, x86::dl);
+    a.shl(x86::al, 2);
+    a.or_(x86::r15b, x86::al);
+    a.shl(x86::r10b, 3);
+    a.or_(x86::r15b, x86::r10b);
     a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+    a.bind(l_op_leapic);
+    a.lea(x86::rax, x86::ptr(l_entry));
+    a.add(x86::rax, x86::r11);
+    a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+    a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+    {
+        Label l_eval_cc = a.new_label();
+        Label l_cc_apply = a.new_label();
+        Label l_cc_next = a.new_label();
+        Label l_cc_0 = a.new_label(); Label l_cc_1 = a.new_label();
+        Label l_cc_2 = a.new_label(); Label l_cc_3 = a.new_label();
+        Label l_cc_4 = a.new_label(); Label l_cc_5 = a.new_label();
+        Label l_cc_6 = a.new_label(); Label l_cc_7 = a.new_label();
+        Label l_cc_8 = a.new_label(); Label l_cc_9 = a.new_label();
+        Label l_cc_10 = a.new_label(); Label l_cc_11 = a.new_label();
+        Label l_cc_12 = a.new_label(); Label l_cc_13 = a.new_label();
+
+        a.bind(l_op_setcc);
+        a.xor_(x86::r10d, x86::r10d);
+        a.jmp(l_eval_cc);
+
+        a.bind(l_op_selectcc);
+        a.mov(x86::r10d, 1);
+
+        a.bind(l_eval_cc);
+        a.xor_(x86::eax, x86::eax);
+        a.cmp(x86::r9d, 0);  a.je(l_cc_0);
+        a.cmp(x86::r9d, 1);  a.je(l_cc_1);
+        a.cmp(x86::r9d, 2);  a.je(l_cc_2);
+        a.cmp(x86::r9d, 3);  a.je(l_cc_3);
+        a.cmp(x86::r9d, 4);  a.je(l_cc_4);
+        a.cmp(x86::r9d, 5);  a.je(l_cc_5);
+        a.cmp(x86::r9d, 6);  a.je(l_cc_6);
+        a.cmp(x86::r9d, 7);  a.je(l_cc_7);
+        a.cmp(x86::r9d, 8);  a.je(l_cc_8);
+        a.cmp(x86::r9d, 9);  a.je(l_cc_9);
+        a.cmp(x86::r9d, 10); a.je(l_cc_10);
+        a.cmp(x86::r9d, 11); a.je(l_cc_11);
+        a.cmp(x86::r9d, 12); a.je(l_cc_12);
+        a.cmp(x86::r9d, 13); a.je(l_cc_13);
+        a.jmp(l_cc_apply);
+
+        a.bind(l_cc_0);  a.test(x86::r15d, 1); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_1);  a.test(x86::r15d, 1); a.setz(x86::al);  a.jmp(l_cc_apply);
+        a.bind(l_cc_2);  a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_3);  a.test(x86::r15d, 1); a.setnz(x86::al); a.jnz(l_cc_apply); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_4);  a.test(x86::r15d, 1); a.jnz(l_cc_apply); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.setz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_5);  a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.setz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_6);  a.test(x86::r15d, 4); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_7);  a.test(x86::r15d, 5); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_8);  a.test(x86::r15d, 5); a.setz(x86::al);  a.jmp(l_cc_apply);
+        a.bind(l_cc_9);  a.test(x86::r15d, 4); a.setz(x86::al);  a.jmp(l_cc_apply);
+        a.bind(l_cc_10); a.test(x86::r15d, 2); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_11); a.test(x86::r15d, 2); a.setz(x86::al);  a.jmp(l_cc_apply);
+        a.bind(l_cc_12); a.test(x86::r15d, 8); a.setnz(x86::al); a.jmp(l_cc_apply);
+        a.bind(l_cc_13); a.test(x86::r15d, 8); a.setz(x86::al);
+
+        a.bind(l_cc_apply);
+        a.test(x86::r10d, x86::r10d);
+        a.jnz(l_cc_next);
+        a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+
+        a.bind(l_cc_next);
+        Label l_sel_skip = a.new_label();
+        a.test(x86::al, x86::al);
+        a.jz(l_sel_skip);
+        a.mov(x86::rax, x86::qword_ptr(x86::rsp, x86::r8, 3));
+        a.mov(x86::qword_ptr(x86::rsp, x86::rcx, 3), x86::rax);
+        a.bind(l_sel_skip);
+        a.inc(x86::r14d); a.jmp(l_vm_loop);
+    }
 
     a.bind(l_op_jmp);
     a.bind(l_take_branch);
@@ -1041,10 +1146,13 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
 
     a.bind(l_op_jeq); a.test(x86::r15d, 1); a.jnz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
     a.bind(l_op_jne); a.test(x86::r15d, 1); a.jz(l_take_branch);  a.inc(x86::r14d); a.jmp(l_vm_loop);
-    a.bind(l_op_jlt); a.test(x86::r15d, 2); a.jnz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
-    a.bind(l_op_jle); a.test(x86::r15d, 3); a.jnz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
-    a.bind(l_op_jgt); a.test(x86::r15d, 3); a.jz(l_take_branch);  a.inc(x86::r14d); a.jmp(l_vm_loop);
-    a.bind(l_op_jge); a.test(x86::r15d, 2); a.jz(l_take_branch);  a.inc(x86::r14d); a.jmp(l_vm_loop);
+    a.bind(l_op_jlt); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.jnz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
+    a.bind(l_op_jle); a.test(x86::r15d, 1); a.jnz(l_take_branch); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.jnz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
+    {
+        Label l_jgt_skip = a.new_label();
+        a.bind(l_op_jgt); a.test(x86::r15d, 1); a.jnz(l_jgt_skip); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.jz(l_take_branch); a.bind(l_jgt_skip); a.inc(x86::r14d); a.jmp(l_vm_loop);
+    }
+    a.bind(l_op_jge); a.mov(x86::edx, x86::r15d); a.shr(x86::edx, 2); a.xor_(x86::edx, x86::r15d); a.test(x86::edx, 2); a.jz(l_take_branch); a.inc(x86::r14d); a.jmp(l_vm_loop);
 
     // CallExt bridge: target_va = l_entry + r11 (PIC!)
     a.bind(l_op_callext);
@@ -1170,6 +1278,9 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     Label l_op_shl = a.new_label();
     Label l_op_shr = a.new_label();
     Label l_op_cmp = a.new_label();
+    Label l_op_leapic = a.new_label();
+    Label l_op_selectcc = a.new_label();
+    Label l_op_setcc = a.new_label();
     Label l_op_jmp = a.new_label();
     Label l_op_jeq = a.new_label();
     Label l_op_jne = a.new_label();
@@ -1257,8 +1368,11 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Xor));     a.b_eq(l_op_xor);
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Shl));     a.b_eq(l_op_shl);
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Shr));     a.b_eq(l_op_shr);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Cmp));     a.b_eq(l_op_cmp);
-    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jmp));     a.b_eq(l_op_jmp);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Cmp));      a.b_eq(l_op_cmp);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::LeaPic));   a.b_eq(l_op_leapic);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::SelectCc)); a.b_eq(l_op_selectcc);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::SetCc));    a.b_eq(l_op_setcc);
+    a.cmp(a64::w10, static_cast<int>(VmOpcode::Jmp));      a.b_eq(l_op_jmp);
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Jeq));     a.b_eq(l_op_jeq);
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Jne));     a.b_eq(l_op_jne);
     a.cmp(a64::w10, static_cast<int>(VmOpcode::Jlt));     a.b_eq(l_op_jlt);
@@ -1369,9 +1483,86 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     load_srcs();
     a.cmp(a64::x0, a64::x1);
     a.cset(a64::w23, a64::CondCode::kEQ);
-    a.cset(a64::w15, a64::CondCode::kLT);
+    a.cset(a64::w15, a64::CondCode::kMI);
     a.orr(a64::w23, a64::w23, a64::w15, a64::lsl(1));
+    a.cset(a64::w15, a64::CondCode::kLO);
+    a.orr(a64::w23, a64::w23, a64::w15, a64::lsl(2));
+    a.cset(a64::w15, a64::CondCode::kVS);
+    a.orr(a64::w23, a64::w23, a64::w15, a64::lsl(3));
     a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+    a.bind(l_op_leapic);
+    a.adr(a64::x0, l_entry);
+    a.add(a64::x0, a64::x0, a64::x14);
+    store_dst();
+    a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+    {
+        Label l_eval_cc = a.new_label();
+        Label l_cc_apply = a.new_label();
+        Label l_sel_skip = a.new_label();
+        Label l_cc_0 = a.new_label(); Label l_cc_1 = a.new_label();
+        Label l_cc_2 = a.new_label(); Label l_cc_3 = a.new_label();
+        Label l_cc_4 = a.new_label(); Label l_cc_5 = a.new_label();
+        Label l_cc_6 = a.new_label(); Label l_cc_7 = a.new_label();
+        Label l_cc_8 = a.new_label(); Label l_cc_9 = a.new_label();
+        Label l_cc_10 = a.new_label(); Label l_cc_11 = a.new_label();
+        Label l_cc_12 = a.new_label(); Label l_cc_13 = a.new_label();
+
+        a.bind(l_op_setcc);
+        a.mov(a64::w9, 0);
+        a.b(l_eval_cc);
+
+        a.bind(l_op_selectcc);
+        a.mov(a64::w9, 1);
+
+        a.bind(l_eval_cc);
+        a.mov(a64::x0, 0);
+        a.cmp(a64::w13, 0);  a.b_eq(l_cc_0);
+        a.cmp(a64::w13, 1);  a.b_eq(l_cc_1);
+        a.cmp(a64::w13, 2);  a.b_eq(l_cc_2);
+        a.cmp(a64::w13, 3);  a.b_eq(l_cc_3);
+        a.cmp(a64::w13, 4);  a.b_eq(l_cc_4);
+        a.cmp(a64::w13, 5);  a.b_eq(l_cc_5);
+        a.cmp(a64::w13, 6);  a.b_eq(l_cc_6);
+        a.cmp(a64::w13, 7);  a.b_eq(l_cc_7);
+        a.cmp(a64::w13, 8);  a.b_eq(l_cc_8);
+        a.cmp(a64::w13, 9);  a.b_eq(l_cc_9);
+        a.cmp(a64::w13, 10); a.b_eq(l_cc_10);
+        a.cmp(a64::w13, 11); a.b_eq(l_cc_11);
+        a.cmp(a64::w13, 12); a.b_eq(l_cc_12);
+        a.cmp(a64::w13, 13); a.b_eq(l_cc_13);
+        a.b(l_cc_apply);
+
+        a.bind(l_cc_0);  a.tst(a64::w23, 1); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_1);  a.tst(a64::w23, 1); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_2);  a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_3);  a.tst(a64::w23, 1); a.cset(a64::x0, a64::CondCode::kNE); a.b_ne(l_cc_apply); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_4);  a.tst(a64::w23, 1); a.b_ne(l_cc_apply); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_5);  a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_6);  a.tst(a64::w23, 4); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_7);  a.tst(a64::w23, 5); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_8);  a.tst(a64::w23, 5); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_9);  a.tst(a64::w23, 4); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_10); a.tst(a64::w23, 2); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_11); a.tst(a64::w23, 2); a.cset(a64::x0, a64::CondCode::kEQ); a.b(l_cc_apply);
+        a.bind(l_cc_12); a.tst(a64::w23, 8); a.cset(a64::x0, a64::CondCode::kNE); a.b(l_cc_apply);
+        a.bind(l_cc_13); a.tst(a64::w23, 8); a.cset(a64::x0, a64::CondCode::kEQ);
+
+        a.bind(l_cc_apply);
+        a.cbnz(a64::w9, l_sel_skip);
+        store_dst();
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+
+        a.bind(l_sel_skip);
+        Label l_sel_done = a.new_label();
+        a.cbz(a64::x0, l_sel_done);
+        a.mov(a64::x15, a64::sp);
+        a.ldr(a64::x0, a64::ptr(a64::x15, a64::x12, a64::lsl(3)));
+        store_dst();
+        a.bind(l_sel_done);
+        a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    }
 
     a.bind(l_op_jmp);
     a.bind(l_take_branch);
@@ -1380,10 +1571,13 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
 
     a.bind(l_op_jeq); a.tst(a64::w23, 1); a.b_ne(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
     a.bind(l_op_jne); a.tst(a64::w23, 1); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
-    a.bind(l_op_jlt); a.tst(a64::w23, 2); a.b_ne(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
-    a.bind(l_op_jle); a.tst(a64::w23, 3); a.b_ne(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
-    a.bind(l_op_jgt); a.tst(a64::w23, 3); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
-    a.bind(l_op_jge); a.tst(a64::w23, 2); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    a.bind(l_op_jlt); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.b_ne(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    a.bind(l_op_jle); a.tst(a64::w23, 1); a.b_ne(l_take_branch); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.b_ne(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    {
+        Label l_jgt_skip = a.new_label();
+        a.bind(l_op_jgt); a.tst(a64::w23, 1); a.b_ne(l_jgt_skip); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.b_eq(l_take_branch); a.bind(l_jgt_skip); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
+    }
+    a.bind(l_op_jge); a.lsr(a64::w15, a64::w23, 2); a.eor(a64::w15, a64::w15, a64::w23); a.tst(a64::w15, 2); a.b_eq(l_take_branch); a.add(a64::w22, a64::w22, 1); a.b(l_vm_loop);
 
     // CallExt bridge on ARM64: target_va = l_entry + x14 (PIC!)
     a.bind(l_op_callext);

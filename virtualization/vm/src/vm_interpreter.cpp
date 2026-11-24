@@ -6,6 +6,26 @@ namespace bytemorph::virt {
 
 namespace {
 
+bool eval_vm_cc(std::uint8_t cc, bool zf, bool sf, bool cf, bool of) noexcept {
+    switch (static_cast<VmCondCode>(cc)) {
+        case VmCondCode::Eq:          return zf;
+        case VmCondCode::Ne:          return !zf;
+        case VmCondCode::Lt:          return sf != of;
+        case VmCondCode::Le:          return (sf != of) || zf;
+        case VmCondCode::Gt:          return (sf == of) && !zf;
+        case VmCondCode::Ge:          return sf == of;
+        case VmCondCode::Below:       return cf;
+        case VmCondCode::BelowEq:     return cf || zf;
+        case VmCondCode::Above:       return !cf && !zf;
+        case VmCondCode::AboveEq:     return !cf;
+        case VmCondCode::Sign:        return sf;
+        case VmCondCode::NotSign:     return !sf;
+        case VmCondCode::Overflow:    return of;
+        case VmCondCode::NotOverflow: return !of;
+        default:                      return false;
+    }
+}
+
 core::diagnostics::Result<bool> validate_program(const BvmProgram& program) {
     using core::diagnostics::ErrorCode;
     const std::size_t code_len = program.instructions.size();
@@ -15,14 +35,19 @@ core::diagnostics::Result<bool> validate_program(const BvmProgram& program) {
             continue; // Runtime trap sentinel
         }
         const bool src2_is_width = (insn.opcode == VmOpcode::Load || insn.opcode == VmOpcode::Store);
+        const bool src2_is_cc = (insn.opcode == VmOpcode::SelectCc || insn.opcode == VmOpcode::SetCc);
         if (src2_is_width) {
             has_mem_ops = true;
         }
         if (insn.dst >= BvmProgram::kNumRegisters ||
             insn.src1 >= BvmProgram::kNumRegisters ||
-            (!src2_is_width && insn.src2 >= BvmProgram::kNumRegisters)) {
+            (!src2_is_width && !src2_is_cc && insn.src2 >= BvmProgram::kNumRegisters)) {
             return core::diagnostics::Result<bool>::err(
                 ErrorCode::OutOfBounds, "Register index out of bounds", "VmInterpreter::execute");
+        }
+        if (src2_is_cc && insn.src2 > static_cast<std::uint8_t>(VmCondCode::NotOverflow)) {
+            return core::diagnostics::Result<bool>::err(
+                ErrorCode::ParseError, "Invalid VM condition code", "VmInterpreter::execute");
         }
         switch (insn.opcode) {
             case VmOpcode::Jmp:
@@ -68,8 +93,27 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
 
     VmExecState state;
     state.regs = options.initial_regs;
+
+    thread_local std::vector<std::uint64_t> tls_memory_pool;
+    std::size_t mem_slots = 0;
+    std::uint64_t* mem_data = nullptr;
+
     if (has_mem_ops && options.memory_slots > 0) {
-        state.memory.assign(options.memory_slots, 0ULL);
+        mem_slots = options.memory_slots;
+        if (options.use_memory_pool) {
+            if (tls_memory_pool.size() < options.memory_slots) {
+                tls_memory_pool.resize(options.memory_slots, 0ULL);
+                state.allocations_count = 1;
+            } else {
+                state.allocations_count = 0;
+            }
+            mem_data = tls_memory_pool.data();
+            std::memset(mem_data, 0, mem_slots * sizeof(std::uint64_t));
+        } else {
+            state.memory.assign(options.memory_slots, 0ULL);
+            state.allocations_count = 1;
+            mem_data = state.memory.data();
+        }
         if (state.regs[4] == 0 && state.regs[5] == 0) {
             const std::uint64_t mid_stack = ((options.memory_slots * sizeof(std::uint64_t)) / 2) & ~15ULL;
             state.regs[4] = mid_stack;
@@ -80,9 +124,7 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     const std::size_t code_len = program.instructions.size();
     const VmInstruction* insns = program.instructions.data();
     std::uint64_t* regs = state.regs.data();
-    const std::size_t mem_slots = state.memory.size();
     const std::size_t total_mem_bytes = mem_slots * sizeof(std::uint64_t);
-    std::uint64_t* mem_data = state.memory.data();
     auto* mem_bytes = reinterpret_cast<std::uint8_t*>(mem_data);
 
     std::size_t pc = state.pc;
@@ -90,6 +132,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     const std::uint64_t max_steps = options.max_steps;
     bool zf = state.zf;
     bool sf = state.sf;
+    bool cf = state.cf;
+    bool of = state.of;
 
     while (pc < code_len) {
         if (steps >= max_steps) {
@@ -166,18 +210,26 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 break;
             }
             case VmOpcode::Add: {
-                const auto res = regs[insn.src1] + regs[insn.src2];
+                const std::uint64_t u1 = regs[insn.src1];
+                const std::uint64_t u2 = regs[insn.src2];
+                const std::uint64_t res = u1 + u2;
                 regs[insn.dst] = res;
                 zf = (res == 0);
                 sf = (static_cast<std::int64_t>(res) < 0);
+                cf = (res < u1);
+                of = (((~(u1 ^ u2) & (u1 ^ res)) >> 63) != 0);
                 ++pc;
                 break;
             }
             case VmOpcode::Sub: {
-                const auto res = regs[insn.src1] - regs[insn.src2];
+                const std::uint64_t u1 = regs[insn.src1];
+                const std::uint64_t u2 = regs[insn.src2];
+                const std::uint64_t res = u1 - u2;
                 regs[insn.dst] = res;
                 zf = (res == 0);
                 sf = (static_cast<std::int64_t>(res) < 0);
+                cf = (u1 < u2);
+                of = ((((u1 ^ u2) & (u1 ^ res)) >> 63) != 0);
                 ++pc;
                 break;
             }
@@ -248,13 +300,30 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 break;
             }
             case VmOpcode::Cmp: {
-                const auto lhs = static_cast<std::int64_t>(regs[insn.src1]);
-                const auto rhs = static_cast<std::int64_t>(regs[insn.src2]);
-                zf = (lhs == rhs);
-                sf = (lhs < rhs);
+                const std::uint64_t u1 = regs[insn.src1];
+                const std::uint64_t u2 = regs[insn.src2];
+                const std::uint64_t diff = u1 - u2;
+                zf = (diff == 0);
+                sf = (static_cast<std::int64_t>(diff) < 0);
+                cf = (u1 < u2);
+                of = ((((u1 ^ u2) & (u1 ^ diff)) >> 63) != 0);
                 ++pc;
                 break;
             }
+            case VmOpcode::LeaPic:
+                regs[insn.dst] = static_cast<std::uint64_t>(static_cast<std::int64_t>(options.pic_base_va) + insn.imm);
+                ++pc;
+                break;
+            case VmOpcode::SelectCc:
+                if (eval_vm_cc(insn.src2, zf, sf, cf, of)) {
+                    regs[insn.dst] = regs[insn.src1];
+                }
+                ++pc;
+                break;
+            case VmOpcode::SetCc:
+                regs[insn.dst] = eval_vm_cc(insn.src2, zf, sf, cf, of) ? 1ULL : 0ULL;
+                ++pc;
+                break;
             case VmOpcode::Jmp:
                 pc = static_cast<std::size_t>(insn.imm);
                 break;
@@ -265,16 +334,16 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
                 pc = !zf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jlt:
-                pc = sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = (sf != of) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jle:
-                pc = (sf || zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = ((sf != of) || zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jgt:
-                pc = (!sf && !zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = ((sf == of) && !zf) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Jge:
-                pc = !sf ? static_cast<std::size_t>(insn.imm) : (pc + 1);
+                pc = (sf == of) ? static_cast<std::size_t>(insn.imm) : (pc + 1);
                 break;
             case VmOpcode::Call:
                 if (state.call_stack.size() >= options.max_call_depth) {
@@ -345,6 +414,8 @@ VmInterpreter::execute(const BvmProgram& program, const VmExecOptions& options) 
     state.steps_executed = steps;
     state.zf = zf;
     state.sf = sf;
+    state.cf = cf;
+    state.of = of;
     state.return_value = regs[0];
     return state;
 }

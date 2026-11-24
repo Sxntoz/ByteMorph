@@ -73,6 +73,26 @@ VmOpcode map_cond_opcode(const std::string& cond) noexcept {
     return VmOpcode::Jne;
 }
 
+VmCondCode map_vm_cond_code(const std::string& cond) noexcept {
+    if (cond == "eq" || cond == "je" || cond == "jz" || cond == "b.eq") return VmCondCode::Eq;
+    if (cond == "ne" || cond == "jne" || cond == "jnz" || cond == "b.ne") return VmCondCode::Ne;
+    if (cond == "lt" || cond == "jl" || cond == "jnge" || cond == "b.lt") return VmCondCode::Lt;
+    if (cond == "le" || cond == "jle" || cond == "jng" || cond == "b.le") return VmCondCode::Le;
+    if (cond == "gt" || cond == "jg" || cond == "jnle" || cond == "b.gt") return VmCondCode::Gt;
+    if (cond == "ge" || cond == "jge" || cond == "jnl" || cond == "b.ge") return VmCondCode::Ge;
+    if (cond == "b" || cond == "jb" || cond == "jnae" || cond == "jc" || cond == "c" ||
+        cond == "b.lo" || cond == "b.cc" || cond == "lo" || cond == "cc") return VmCondCode::Below;
+    if (cond == "be" || cond == "jbe" || cond == "jna" || cond == "b.ls" || cond == "ls") return VmCondCode::BelowEq;
+    if (cond == "a" || cond == "ja" || cond == "jnbe" || cond == "b.hi" || cond == "hi") return VmCondCode::Above;
+    if (cond == "ae" || cond == "jae" || cond == "jnb" || cond == "jnc" || cond == "nc" ||
+        cond == "b.hs" || cond == "b.cs" || cond == "hs" || cond == "cs") return VmCondCode::AboveEq;
+    if (cond == "s" || cond == "js" || cond == "b.mi" || cond == "mi") return VmCondCode::Sign;
+    if (cond == "ns" || cond == "jns" || cond == "b.pl" || cond == "pl") return VmCondCode::NotSign;
+    if (cond == "o" || cond == "jo" || cond == "b.vs" || cond == "vs") return VmCondCode::Overflow;
+    if (cond == "no" || cond == "jno" || cond == "b.vc" || cond == "vc") return VmCondCode::NotOverflow;
+    return VmCondCode::Ne;
+}
+
 std::uint8_t normalize_mem_width(std::uint8_t w) noexcept {
     if (w == 8 || w == 16 || w == 32 || w == 64) return w;
     return 64;
@@ -231,6 +251,60 @@ IrToVmTranslator::translate(const IrFunction& fn, const TranslateOptions& option
                         return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
                     }
                     prog.instructions.push_back(VmInstruction{VmOpcode::Cmp, 0, s1.value(), s2.value(), 0});
+                    break;
+                }
+                case IrOpcode::LeaGlobal: {
+                    if (insn.dsts.size() != 1 || insn.srcs.empty()) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid LeaGlobal arity", "IrToVmTranslator::translate");
+                    }
+                    auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                    if (!dst_r) return diagnostics::Result<BvmProgram>::err(dst_r.error().code, dst_r.error().message, dst_r.error().context);
+                    const std::int64_t rel_off = static_cast<std::int64_t>(insn.srcs[0].imm) -
+                                                 static_cast<std::int64_t>(options.stub_base_va);
+                    prog.instructions.push_back(VmInstruction{VmOpcode::LeaPic, dst_r.value(), 0, 0, rel_off});
+                    break;
+                }
+                case IrOpcode::SelectCc: {
+                    if (insn.dsts.size() != 1 || insn.srcs.empty()) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid SelectCc arity", "IrToVmTranslator::translate");
+                    }
+                    auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                    auto src_r = materialize_src(insn.srcs[0], 29);
+                    if (!dst_r || !src_r) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
+                    }
+                    const std::string& c = insn.cond.empty() ? insn.comment : insn.cond;
+                    const std::uint8_t cc = static_cast<std::uint8_t>(map_vm_cond_code(c));
+                    prog.instructions.push_back(VmInstruction{VmOpcode::SelectCc, dst_r.value(), src_r.value(), cc, 0});
+                    break;
+                }
+                case IrOpcode::SetCc: {
+                    if (insn.dsts.size() != 1) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid SetCc arity", "IrToVmTranslator::translate");
+                    }
+                    auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                    if (!dst_r) return diagnostics::Result<BvmProgram>::err(dst_r.error().code, dst_r.error().message, dst_r.error().context);
+                    const std::string& c = insn.cond.empty() ? insn.comment : insn.cond;
+                    const std::uint8_t cc = static_cast<std::uint8_t>(map_vm_cond_code(c));
+                    prog.instructions.push_back(VmInstruction{VmOpcode::SetCc, dst_r.value(), 0, cc, 0});
+                    break;
+                }
+                case IrOpcode::Adc:
+                case IrOpcode::Sbb: {
+                    if (insn.dsts.size() != 1 || insn.srcs.size() < 2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::ParseError, "Invalid Adc/Sbb arity", "IrToVmTranslator::translate");
+                    }
+                    auto dst_r = reg_alloc.get_or_alloc(insn.dsts[0].name);
+                    auto s1 = materialize_src(insn.srcs[0], 29);
+                    auto s2 = materialize_src(insn.srcs[1], 30);
+                    if (!dst_r || !s1 || !s2) {
+                        return diagnostics::Result<BvmProgram>::err(ErrorCode::OutOfBounds, "Register allocation failed", "IrToVmTranslator::translate");
+                    }
+                    const std::uint8_t cf_cc = static_cast<std::uint8_t>(VmCondCode::Below);
+                    const VmOpcode bin_op = (insn.opcode == IrOpcode::Adc) ? VmOpcode::Add : VmOpcode::Sub;
+                    prog.instructions.push_back(VmInstruction{VmOpcode::SetCc, 31, 0, cf_cc, 0});
+                    prog.instructions.push_back(VmInstruction{bin_op, 28, s1.value(), s2.value(), 0});
+                    prog.instructions.push_back(VmInstruction{bin_op, dst_r.value(), 28, 31, 0});
                     break;
                 }
                 case IrOpcode::Jump: {

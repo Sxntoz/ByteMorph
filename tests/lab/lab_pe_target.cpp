@@ -41,6 +41,22 @@ extern "C" BM_EXPORT std::int64_t bm_target_caller(std::int64_t a, std::int64_t 
     return c + h;
 }
 
+alignas(8) static const std::int64_t g_bm_ro_bias = 0x1337LL;
+alignas(8) static std::int64_t g_bm_rw_counter = 100LL;
+
+extern "C" BM_EXPORT std::int64_t bm_target_global_rw(std::int64_t a) {
+    g_bm_rw_counter += a;
+    return g_bm_rw_counter + g_bm_ro_bias;
+}
+
+extern "C" BM_EXPORT std::int64_t bm_target_cmov_select(std::int64_t a, std::int64_t b) {
+    return (a > b) ? (a * 3 + 7) : (b * 2 - 5);
+}
+
+extern "C" BM_EXPORT std::int64_t bm_target_unsigned_cmp(std::uint64_t a, std::uint64_t b) {
+    return (a < b) ? 11LL : 29LL;
+}
+
 int main(int argc, char* argv[]) {
     std::int64_t a = 42;
     std::int64_t b = 19;
@@ -61,6 +77,15 @@ int main(int argc, char* argv[]) {
         const std::int64_t caller = bm_target_caller(a, b);
         std::cout << "RESULT=" << res << " MULTI=" << multi
                   << " LOOP=" << loop << " CALLER=" << caller << '\n';
+        return 0;
+    }
+    if (argc >= 4 && std::strcmp(argv[3], "--v09") == 0) {
+        const std::int64_t g1 = bm_target_global_rw(a);
+        const std::int64_t g2 = bm_target_global_rw(b);
+        const std::int64_t cm = bm_target_cmov_select(a, b);
+        const std::int64_t uc = bm_target_unsigned_cmp(static_cast<std::uint64_t>(a), static_cast<std::uint64_t>(b));
+        std::cout << "RESULT=" << res << " GLOBAL1=" << g1 << " GLOBAL2=" << g2
+                  << " CMOV=" << cm << " UCMP=" << uc << '\n';
         return 0;
     }
     std::cout << "RESULT=" << res << '\n';

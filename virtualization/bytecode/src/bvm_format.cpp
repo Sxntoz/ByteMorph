@@ -76,6 +76,9 @@ std::string_view to_string(VmOpcode op) noexcept {
         case VmOpcode::Ret: return "vm.ret";
         case VmOpcode::Halt: return "vm.halt";
         case VmOpcode::CallExt: return "vm.callext";
+        case VmOpcode::LeaPic: return "vm.leapic";
+        case VmOpcode::SelectCc: return "vm.selectcc";
+        case VmOpcode::SetCc: return "vm.setcc";
         case VmOpcode::MaxOpcode: return "vm.invalid";
     }
     return "vm.invalid";

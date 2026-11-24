@@ -38,7 +38,27 @@ enum class VmOpcode : std::uint8_t {
     Ret = 0x17,
     Halt = 0x18,
     CallExt = 0x19,
-    MaxOpcode = 0x1A
+    LeaPic = 0x1A,
+    SelectCc = 0x1B,
+    SetCc = 0x1C,
+    MaxOpcode = 0x1D
+};
+
+enum class VmCondCode : std::uint8_t {
+    Eq = 0,
+    Ne = 1,
+    Lt = 2,
+    Le = 3,
+    Gt = 4,
+    Ge = 5,
+    Below = 6,      // CF == 1 (unsigned <)
+    BelowEq = 7,    // CF == 1 || ZF == 1 (unsigned <=)
+    Above = 8,      // CF == 0 && ZF == 0 (unsigned >)
+    AboveEq = 9,    // CF == 0 (unsigned >=)
+    Sign = 10,      // SF == 1
+    NotSign = 11,   // SF == 0
+    Overflow = 12,  // OF == 1
+    NotOverflow = 13
 };
 
 [[nodiscard]] std::string_view to_string(VmOpcode op) noexcept;

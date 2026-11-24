@@ -45,6 +45,7 @@ namespace {
 
 struct ParsedX86Address {
     bool valid{false};
+    bool is_rip_relative{false};
     std::uint8_t width{64};
     std::string base_reg;
     std::string index_reg;
@@ -145,10 +146,36 @@ struct ParsedX86Address {
     }
 
     if (res.base_reg == "rip" || res.index_reg == "rip") {
-        return ParsedX86Address{};
+        res.is_rip_relative = true;
+        res.valid = true;
+        return res;
+    }
+    if (res.base_reg.empty() && res.index_reg.empty() && res.disp > 0x10000) {
+        // Zydis formats [rip + disp32] as absolute effective VA [0x1400050B0]
+        res.is_rip_relative = true;
+        res.valid = true;
+        return res;
     }
     res.valid = (!res.base_reg.empty() || !res.index_reg.empty());
     return res;
+}
+
+[[nodiscard]] std::string normalize_x86_cc(std::string_view suffix) noexcept {
+    if (suffix == "e" || suffix == "z") return "eq";
+    if (suffix == "ne" || suffix == "nz") return "ne";
+    if (suffix == "l" || suffix == "nge") return "lt";
+    if (suffix == "le" || suffix == "ng") return "le";
+    if (suffix == "g" || suffix == "nle") return "gt";
+    if (suffix == "ge" || suffix == "nl") return "ge";
+    if (suffix == "b" || suffix == "c" || suffix == "nae") return "b";
+    if (suffix == "be" || suffix == "na") return "be";
+    if (suffix == "a" || suffix == "nbe") return "a";
+    if (suffix == "ae" || suffix == "nc" || suffix == "nb") return "ae";
+    if (suffix == "s") return "s";
+    if (suffix == "ns") return "ns";
+    if (suffix == "o") return "o";
+    if (suffix == "no") return "no";
+    return {};
 }
 
 [[nodiscard]] IrOperand parse_operand_text(const std::string& op) {
@@ -268,11 +295,42 @@ IrInstruction X86_64Lifter::lift_instruction(const DisassembledInstruction& insn
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "adc" && ops.size() == 2) {
+        ir.opcode = IrOpcode::Adc;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
     } else if (insn.mnemonic == "sub" && ops.size() == 2) {
         ir.opcode = IrOpcode::Sub;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic == "sbb" && ops.size() == 2) {
+        ir.opcode = IrOpcode::Sbb;
+        ir.dsts.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[0]));
+        ir.srcs.push_back(parse_operand_text(ops[1]));
+    } else if (insn.mnemonic.rfind("cmov", 0) == 0 && ops.size() == 2) {
+        const std::string cc = normalize_x86_cc(std::string_view(insn.mnemonic).substr(4));
+        if (!cc.empty()) {
+            ir.opcode = IrOpcode::SelectCc;
+            ir.dsts.push_back(parse_operand_text(ops[0]));
+            ir.srcs.push_back(parse_operand_text(ops[1]));
+            ir.cond = cc;
+        } else {
+            ir.opcode = IrOpcode::Unknown;
+            ir.comment = insn.full_text;
+        }
+    } else if (insn.mnemonic.rfind("set", 0) == 0 && ops.size() == 1) {
+        const std::string cc = normalize_x86_cc(std::string_view(insn.mnemonic).substr(3));
+        if (!cc.empty()) {
+            ir.opcode = IrOpcode::SetCc;
+            ir.dsts.push_back(parse_operand_text(ops[0]));
+            ir.cond = cc;
+        } else {
+            ir.opcode = IrOpcode::Unknown;
+            ir.comment = insn.full_text;
+        }
     } else if (insn.mnemonic == "inc" && ops.size() == 1) {
         ir.opcode = IrOpcode::Add;
         ir.dsts.push_back(parse_operand_text(ops[0]));
@@ -403,13 +461,31 @@ IrFunction X86_64Lifter::lift_function(const FunctionInfo& fn) const {
     const auto idx_tmp = IrOperand::reg("__bm_idx_tmp", 64);
     const auto addr_tmp = IrOperand::reg("__bm_addr_tmp", 64);
     const auto rmw_tmp = IrOperand::reg("__bm_rmw_tmp", 64);
+    const auto rip_tmp = IrOperand::reg("__bm_rip_tmp", 64);
 
-    auto materialize_complex_mem = [&](std::uint64_t va, IrOperand& op, std::vector<IrInstruction>& out) {
-        if (op.kind != IrOperand::Kind::Memory || op.name.find('[') == std::string::npos) {
+    auto materialize_complex_mem = [&](std::uint64_t va, std::size_t insn_len, IrOperand& op, std::vector<IrInstruction>& out) {
+        if (op.kind != IrOperand::Kind::Memory) {
+            return;
+        }
+        if (op.name == "rip") {
+            const std::uint64_t target_va = static_cast<std::uint64_t>(static_cast<std::int64_t>(va + insn_len) + op.imm);
+            out.push_back(IrInstruction{va, IrOpcode::LeaGlobal, {rip_tmp}, {IrOperand::label(target_va)}, {}, "rip_global"});
+            op = IrOperand::memory_disp("__bm_rip_tmp", 0, op.bit_width);
+            return;
+        }
+        if (op.name.find('[') == std::string::npos) {
             return;
         }
         const auto addr = parse_x86_address(op.name);
         if (!addr.valid) return;
+        if (addr.is_rip_relative) {
+            const std::uint64_t target_va = (addr.base_reg == "rip" || addr.index_reg == "rip")
+                ? static_cast<std::uint64_t>(static_cast<std::int64_t>(va + insn_len) + addr.disp)
+                : static_cast<std::uint64_t>(addr.disp);
+            out.push_back(IrInstruction{va, IrOpcode::LeaGlobal, {rip_tmp}, {IrOperand::label(target_va)}, {}, "rip_global"});
+            op = IrOperand::memory_disp("__bm_rip_tmp", 0, addr.width);
+            return;
+        }
         if (addr.index_reg.empty() && !addr.base_reg.empty()) {
             op = IrOperand::memory_disp(addr.base_reg, addr.disp, addr.width);
             return;
@@ -484,6 +560,14 @@ IrFunction X86_64Lifter::lift_function(const FunctionInfo& fn) const {
             }
             if (insn.mnemonic == "lea" && ops.size() == 2) {
                 const auto addr = parse_x86_address(ops[1]);
+                if (addr.valid && addr.is_rip_relative) {
+                    const std::uint64_t target_va = (addr.base_reg == "rip" || addr.index_reg == "rip")
+                        ? static_cast<std::uint64_t>(static_cast<std::int64_t>(insn.address + insn.bytes.size()) + addr.disp)
+                        : static_cast<std::uint64_t>(addr.disp);
+                    ir_bb.instructions.push_back(IrInstruction{
+                        insn.address, IrOpcode::LeaGlobal, {parse_operand_text(ops[0])}, {IrOperand::label(target_va)}, {}, "lea_rip_global"});
+                    continue;
+                }
                 if (addr.valid && !addr.index_reg.empty() &&
                     !(addr.disp == 0 && !addr.base_reg.empty() &&
                       ((addr.base_reg == addr.index_reg && (addr.scale == 2 || addr.scale == 4 || addr.scale == 8)) ||
@@ -508,10 +592,10 @@ IrFunction X86_64Lifter::lift_function(const FunctionInfo& fn) const {
 
             IrInstruction lifted = lift_instruction(insn);
             for (auto& s : lifted.srcs) {
-                materialize_complex_mem(insn.address, s, ir_bb.instructions);
+                materialize_complex_mem(insn.address, insn.bytes.size(), s, ir_bb.instructions);
             }
             for (auto& d : lifted.dsts) {
-                materialize_complex_mem(insn.address, d, ir_bb.instructions);
+                materialize_complex_mem(insn.address, insn.bytes.size(), d, ir_bb.instructions);
             }
 
             // Expand Read-Modify-Write ALU instruction with Memory destination (e.g. add dword ptr [rbp-4], 1)

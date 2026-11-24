@@ -41,7 +41,7 @@ void print_usage() {
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
         << "  info <file>                         Display binary headers, sections, segments, imports, exports\n"
-        << "  analyze <file> [--functions] [--eligibility-report report.json]\n"
+        << "  analyze <file> [--functions] [--memory-references] [--eligibility-report report.json]\n"
         << "  disasm <file>                       Disassemble executable sections (x86-64 / ARM64)\n"
         << "  functions <file>                    List discovered functions with metadata and confidence\n"
         << "  cfg <file>                          Display Control Flow Graph (basic blocks, edges, loops)\n"
@@ -53,12 +53,12 @@ void print_usage() {
         << "  vm-run <prog.bvm>                   Execute validated .bvm bytecode in ByteMorph VM\n"
         << "  vm-inspect <prog.bvm>               Inspect .bvm header, seed, and decoded instructions\n"
         << "  benchmark-vm                        Run VM interpreter vs native AsmJit benchmark\n\n"
-        << "Protection Commands (v0.4 - v0.8: PE32+ x64/ARM64*, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
+        << "Protection Commands (v0.4 - v0.9: PE32+ x64/ARM64*, ELF64 x64/ARM64, Mach-O 64-bit/Universal):\n"
         << "  protect <in> [--output <out>] [--profile fast|balanced|maximum] [--functions all-eligible|auto|list]\n"
         << "  compatibility <in> [--detailed] [--format json]  Report eligible/rejected functions & cost estimates\n"
         << "  verify <protected>                  Verify AEAD authentication & section integrity\n"
         << "  protection-info <protected> [--functions] [--format json]  Display protection metadata\n"
-        << "  benchmark-protection [--detailed] [--compare-baseline]     Run professional VM & protection benchmark\n\n"
+        << "  benchmark-protection [--detailed] [--memory] [--compare-baseline]  Run VM & protection benchmark\n\n"
         << "Options:\n"
         << "  --output, -o <path>        Output file path (optional for protect; defaults to <in>.protected)\n"
         << "  --profile <p>              Protection profile: fast | balanced | maximum (default: balanced)\n"
@@ -74,7 +74,9 @@ void print_usage() {
         << "  --allow-signed-strip       Allow stripping Authenticode/Mach-O signature if present\n"
         << "  --allow-ext-calls          Allow authorized external calls (vm.callext) in virtualized functions\n"
         << "  --detailed                 Show per-function category/cost or multi-function scaling\n"
-        << "  --compare-baseline         Compare VM benchmark metrics against v0.7 baseline\n"
+        << "  --memory-references        Show resolved RIP/PC-relative global references during analyze\n"
+        << "  --memory                   Include VM memory pool vs heap allocation benchmark\n"
+        << "  --compare-baseline         Compare VM benchmark metrics against v0.7/v0.8 baselines\n"
         << "  --max <N>                  Limit disassembled instructions per section\n"
         << "  --verbose                  Enable informational logging\n"
         << "  --help, -h                 Show this help message\n"
@@ -245,6 +247,44 @@ int cmd_disasm(const IBinaryFile& bin, std::size_t max_insns) {
                       << std::setfill(' ') << std::dec << "  " << insn.full_text << '\n';
         }
     }
+    return 0;
+}
+
+int cmd_analyze_memory_references(const IBinaryFile& bin, std::size_t max_insns) {
+    AnalysisResult analysis;
+    const int rc = run_analysis(bin, max_insns, analysis);
+    if (rc != 0) return rc;
+
+    const bool is_arm64 = (bin.info().architecture == Architecture::ARM64);
+    std::size_t total_refs = 0;
+    std::cout << "=== Memory References (RIP/PC-Relative Globals) ===\n";
+    for (const auto& fn : analysis.functions) {
+        auto ir_fn = is_arm64
+            ? bytemorph::arch::aarch64::AArch64Lifter().lift_function(fn)
+            : bytemorph::arch::x86_64::X86_64Lifter().lift_function(fn);
+        for (const auto& bb : ir_fn.blocks) {
+            for (const auto& insn : bb.instructions) {
+                if (insn.opcode == bytemorph::core::ir::IrOpcode::LeaGlobal && !insn.srcs.empty()) {
+                    const std::uint64_t target_va = static_cast<std::uint64_t>(insn.srcs[0].imm);
+                    std::string sec_name = "<unmapped>";
+                    for (const auto& sec : bin.sections()) {
+                        const std::uint64_t span = (std::max)(sec.virtual_size, sec.raw_size);
+                        if (span > 0 && target_va >= sec.virtual_address && target_va < sec.virtual_address + span) {
+                            sec_name = sec.name;
+                            break;
+                        }
+                    }
+                    ++total_refs;
+                    std::cout << "  " << std::left << std::setw(26) << fn.name
+                              << " @0x" << std::hex << insn.source_va
+                              << " -> target=0x" << target_va << std::dec
+                              << " section=" << sec_name
+                              << " (" << insn.comment << ")\n";
+                }
+            }
+        }
+    }
+    std::cout << "  Total RIP/PC-relative references: " << total_refs << '\n';
     return 0;
 }
 
@@ -719,7 +759,7 @@ int cmd_protection_info(const std::string& path, bool functions_only, const std:
     return 0;
 }
 
-int cmd_benchmark_protection(bool detailed, bool compare_baseline) {
+int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_bench = false) {
     auto cmp_res = bytemorph::virt::AsmJitPrototype::run_arithmetic_comparison(42, 19, 10000);
     if (!cmp_res) {
         std::cerr << "Benchmark error: " << cmp_res.error().to_string() << '\n';
@@ -861,20 +901,34 @@ int cmd_benchmark_protection(bool detailed, bool compare_baseline) {
 
         std::cout << "  --- Professional Multi-Sample VM Suite (15 samples, warm-up=200) ---\n";
         const double arith_10k = run_bench_stats("Arithmetic", arith_prog, {});
-        (void)run_bench_stats("Memory Load/Store", stack_prog, {});
+        const double mem_pooled_10k = run_bench_stats("Memory Load/Store (Pool)", stack_prog, {});
+        double mem_heap_10k = 0.0;
+        if (memory_bench || compare_baseline) {
+            bytemorph::virt::VmExecOptions heap_opts;
+            heap_opts.use_memory_pool = false;
+            mem_heap_10k = run_bench_stats("Memory Load/Store (Heap)", stack_prog, heap_opts);
+            const double pool_gain = (mem_heap_10k > 0.0001)
+                ? (((mem_heap_10k - mem_pooled_10k) / mem_heap_10k) * 100.0)
+                : 0.0;
+            std::cout << "    Memory Pool Speedup vs Heap: " << std::setprecision(1) << pool_gain << "%\n";
+        }
         (void)run_bench_stats("Loop/Branch", loop_prog, {});
         const double ext_10k = run_bench_stats("External Call Bridge", ext_prog, ext_opts);
 
         if (compare_baseline) {
             constexpr double kV07Interpreter10kMs = 2.987;
             constexpr double kV07ExtBridge10kMs = 2.405;
+            constexpr double kV08Memory10kMs = 5.016;
             const double interp_delta_pct = ((arith_10k - kV07Interpreter10kMs) / kV07Interpreter10kMs) * 100.0;
             const double ext_delta_pct = ((ext_10k - kV07ExtBridge10kMs) / kV07ExtBridge10kMs) * 100.0;
-            std::cout << "  --- Baseline Comparison (v0.7 -> v0.8) ---\n"
+            const double mem_delta_pct = ((mem_pooled_10k - kV08Memory10kMs) / kV08Memory10kMs) * 100.0;
+            std::cout << "  --- Baseline Comparison (v0.7/v0.8 -> v0.9) ---\n"
                       << "    VM Interpreter (10k eq.)  : v0.7=" << std::setprecision(3) << kV07Interpreter10kMs
-                      << " ms -> v0.8=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
+                      << " ms -> v0.9=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
+                      << "    Memory Load/Store (10k)   : v0.8=" << std::setprecision(3) << kV08Memory10kMs
+                      << " ms -> v0.9=" << mem_pooled_10k << " ms (" << std::setprecision(1) << mem_delta_pct << "%)\n"
                       << "    External Call Bridge (10k): v0.7=" << std::setprecision(3) << kV07ExtBridge10kMs
-                      << " ms -> v0.8=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
+                      << " ms -> v0.9=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
         }
     }
 
@@ -911,7 +965,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.8.0\n";
+        std::cout << "ByteMorph v0.9.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -920,11 +974,13 @@ int main(int argc, char* argv[]) {
     if (cmd == "benchmark-protection") {
         bool detailed = false;
         bool compare_baseline = false;
+        bool memory_bench = false;
         for (int i = 2; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--detailed") detailed = true;
             else if (std::string_view(argv[i]) == "--compare-baseline") compare_baseline = true;
+            else if (std::string_view(argv[i]) == "--memory") memory_bench = true;
         }
-        return cmd_benchmark_protection(detailed, compare_baseline);
+        return cmd_benchmark_protection(detailed, compare_baseline, memory_bench);
     }
 
     if (argc < 3) {
@@ -941,6 +997,7 @@ int main(int argc, char* argv[]) {
     std::string output_format = "text";
     std::string eligibility_report_path;
     bool analyze_functions_only = false;
+    bool memory_references_only = false;
     bool detailed_flag = false;
     bytemorph::prot::ProtectOptions prot_opts;
 
@@ -1013,6 +1070,8 @@ int main(int argc, char* argv[]) {
             prot_opts.allow_external_calls = true;
         } else if (arg == "--detailed") {
             detailed_flag = true;
+        } else if (arg == "--memory-references") {
+            memory_references_only = true;
         } else if (arg == "--eligibility-report" && i + 1 < argc) {
             eligibility_report_path = argv[++i];
         } else if (arg == "--format" && i + 1 < argc) {
@@ -1046,7 +1105,10 @@ int main(int argc, char* argv[]) {
     const auto& bin = *load_res.value();
     if (cmd == "info") { print_info(bin); return 0; }
     if (cmd == "disasm") return cmd_disasm(bin, max_insns);
-    if (cmd == "analyze") return analyze_functions_only ? cmd_functions(bin, max_insns) : cmd_analyze(bin, max_insns);
+    if (cmd == "analyze") {
+        if (memory_references_only) return cmd_analyze_memory_references(bin, max_insns);
+        return analyze_functions_only ? cmd_functions(bin, max_insns) : cmd_analyze(bin, max_insns);
+    }
     if (cmd == "functions") return cmd_functions(bin, max_insns);
     if (cmd == "cfg") return cmd_cfg(bin, max_insns);
     if (cmd == "inspect") return (output_format == "json") ? cmd_inspect_json(bin, max_insns) : cmd_analyze(bin, max_insns);

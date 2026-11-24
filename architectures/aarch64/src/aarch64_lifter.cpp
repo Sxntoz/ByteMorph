@@ -126,6 +126,20 @@ struct ParsedArm64Address {
     return IrOperand::reg(op, 64);
 }
 
+[[nodiscard]] std::string normalize_arm_cc(std::string cc) noexcept {
+    for (auto& ch : cc) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (cc == "eq" || cc == "ne" || cc == "lt" || cc == "le" || cc == "gt" || cc == "ge") return cc;
+    if (cc == "lo" || cc == "cc") return "b";
+    if (cc == "ls") return "be";
+    if (cc == "hi") return "a";
+    if (cc == "hs" || cc == "cs") return "ae";
+    if (cc == "mi") return "s";
+    if (cc == "pl") return "ns";
+    if (cc == "vs") return "o";
+    if (cc == "vc") return "no";
+    return {};
+}
+
 } // namespace
 
 IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& insn) const {
@@ -136,9 +150,29 @@ IrInstruction AArch64Lifter::lift_instruction(const DisassembledInstruction& ins
     if (insn.mnemonic == "nop" || insn.mnemonic == "bti" || insn.mnemonic == "hint" ||
         insn.mnemonic == "paciasp" || insn.mnemonic == "autiasp") {
         ir.opcode = IrOpcode::Nop;
+    } else if ((insn.mnemonic == "adr" || insn.mnemonic == "adrp") && ops.size() >= 2) {
+        std::int64_t target_va = 0;
+        if (try_parse_arm_imm(ops[1], target_va)) {
+            ir.opcode = IrOpcode::LeaGlobal;
+            ir.dsts.push_back(parse_operand_text(ops[0]));
+            ir.srcs.push_back(IrOperand::label(static_cast<std::uint64_t>(target_va)));
+            ir.comment = insn.mnemonic;
+        } else {
+            ir.opcode = IrOpcode::Unknown;
+            ir.comment = insn.full_text;
+        }
+    } else if (insn.mnemonic == "cset" && ops.size() >= 2) {
+        const std::string cc = normalize_arm_cc(ops[1]);
+        if (!cc.empty()) {
+            ir.opcode = IrOpcode::SetCc;
+            ir.dsts.push_back(parse_operand_text(ops[0]));
+            ir.cond = cc;
+        } else {
+            ir.opcode = IrOpcode::Unknown;
+            ir.comment = insn.full_text;
+        }
     } else if ((insn.mnemonic == "mov" || insn.mnemonic == "movz" || insn.mnemonic == "sxtw" ||
-                insn.mnemonic == "sxtb" || insn.mnemonic == "sxth" ||
-                insn.mnemonic == "adr" || insn.mnemonic == "adrp") && ops.size() >= 2) {
+                insn.mnemonic == "sxtb" || insn.mnemonic == "sxth") && ops.size() >= 2) {
         ir.opcode = IrOpcode::Mov;
         ir.dsts.push_back(parse_operand_text(ops[0]));
         ir.srcs.push_back(parse_operand_text(ops[1]));
@@ -322,8 +356,82 @@ IrFunction AArch64Lifter::lift_function(const FunctionInfo& fn) const {
         ir_bb.start_va = bb.start_va;
         ir_bb.successors = bb.successors;
         ir_bb.instructions.reserve(bb.instructions.size() * 2);
-        for (const auto& insn : bb.instructions) {
+        for (std::size_t i_idx = 0; i_idx < bb.instructions.size(); ++i_idx) {
+            const auto& insn = bb.instructions[i_idx];
             const auto ops = split_operands(insn.operands_text);
+
+            // Fuse ADRP + ADD / ADRP + LDR into exact PC-relative LeaGlobal (+ Load)
+            if (insn.mnemonic == "adrp" && ops.size() >= 2 && i_idx + 1 < bb.instructions.size()) {
+                std::int64_t page_va = 0;
+                if (try_parse_arm_imm(ops[1], page_va)) {
+                    const auto& next = bb.instructions[i_idx + 1];
+                    const auto next_ops = split_operands(next.operands_text);
+                    if (next.mnemonic == "add" && next_ops.size() >= 3 && next_ops[1] == ops[0]) {
+                        std::int64_t off_imm = 0;
+                        if (try_parse_arm_imm(next_ops[2], off_imm)) {
+                            const std::uint64_t target_va = static_cast<std::uint64_t>(page_va + off_imm);
+                            ir_bb.instructions.push_back(IrInstruction{
+                                insn.address, IrOpcode::LeaGlobal, {parse_operand_text(next_ops[0])},
+                                {IrOperand::label(target_va)}, {}, "adrp_add_global"});
+                            ++i_idx;
+                            continue;
+                        }
+                    } else if ((next.mnemonic == "ldr" || next.mnemonic == "ldur" ||
+                                next.mnemonic == "ldrb" || next.mnemonic == "ldrh" ||
+                                next.mnemonic == "ldrsw") && next_ops.size() >= 2) {
+                        const auto addr = parse_arm64_address(next_ops[1]);
+                        if (addr.valid && addr.base_reg == ops[0] && addr.index_reg.empty()) {
+                            const std::uint64_t target_va = static_cast<std::uint64_t>(page_va + addr.disp);
+                            const std::uint8_t w = infer_arm64_mem_width(next.mnemonic, next_ops[0]);
+                            const auto rip_tmp = IrOperand::reg("__bm_rip_tmp", 64);
+                            ir_bb.instructions.push_back(IrInstruction{
+                                insn.address, IrOpcode::LeaGlobal, {rip_tmp},
+                                {IrOperand::label(target_va)}, {}, "adrp_ldr_global"});
+                            ir_bb.instructions.push_back(IrInstruction{
+                                next.address, IrOpcode::Load, {parse_operand_text(next_ops[0])},
+                                {IrOperand::memory_disp("__bm_rip_tmp", 0, w)}, {}, "adrp_ldr_val"});
+                            ++i_idx;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // csel / csinc / csinv / csneg dst, rn, rm, cond
+            if ((insn.mnemonic == "csel" || insn.mnemonic == "csinc" ||
+                 insn.mnemonic == "csinv" || insn.mnemonic == "csneg") && ops.size() >= 4) {
+                const std::string cc = normalize_arm_cc(ops[3]);
+                if (!cc.empty()) {
+                    const auto dst_op = parse_operand_text(ops[0]);
+                    const auto rn_op = parse_operand_text(ops[1]);
+                    const auto rm_op = parse_operand_text(ops[2]);
+                    const auto cond_tmp = IrOperand::reg("__bm_cond_tmp", 64);
+                    if (insn.mnemonic == "csel") {
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {dst_op}, {rm_op}, {}, "csel_false"});
+                    } else if (insn.mnemonic == "csinc") {
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Add, {cond_tmp}, {rm_op, IrOperand::immediate(1, 64)}, {}, "csinc_false"});
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {dst_op}, {cond_tmp}, {}, "csinc_mv"});
+                    } else if (insn.mnemonic == "csinv") {
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Xor, {cond_tmp}, {rm_op, IrOperand::immediate(-1, 64)}, {}, "csinv_false"});
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {dst_op}, {cond_tmp}, {}, "csinv_mv"});
+                    } else { // csneg
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Sub, {cond_tmp}, {IrOperand::immediate(0, 64), rm_op}, {}, "csneg_false"});
+                        ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Mov, {dst_op}, {cond_tmp}, {}, "csneg_mv"});
+                    }
+                    IrInstruction sel{insn.address, IrOpcode::SelectCc, {dst_op}, {rn_op}, cc, insn.mnemonic};
+                    ir_bb.instructions.push_back(std::move(sel));
+                    continue;
+                }
+            }
+            if (insn.mnemonic == "csetm" && ops.size() >= 2) {
+                const std::string cc = normalize_arm_cc(ops[1]);
+                if (!cc.empty()) {
+                    const auto cond_tmp = IrOperand::reg("__bm_cond_tmp", 64);
+                    ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::SetCc, {cond_tmp}, {}, cc, "csetm_cc"});
+                    ir_bb.instructions.push_back(IrInstruction{insn.address, IrOpcode::Sub, {parse_operand_text(ops[0])}, {IrOperand::immediate(0, 64), cond_tmp}, {}, "csetm_neg"});
+                    continue;
+                }
+            }
 
             // cbz / cbnz rn, label
             if ((insn.mnemonic == "cbz" || insn.mnemonic == "cbnz") && !ops.empty()) {

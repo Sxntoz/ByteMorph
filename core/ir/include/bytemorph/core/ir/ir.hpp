@@ -29,6 +29,11 @@ enum class IrOpcode {
     Call,
     Ret,
     Syscall,
+    LeaGlobal,
+    SelectCc,
+    SetCc,
+    Adc,
+    Sbb,
     Unknown
 };
 

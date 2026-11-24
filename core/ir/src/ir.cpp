@@ -25,6 +25,11 @@ std::string_view to_string(IrOpcode op) noexcept {
         case IrOpcode::Call: return "call";
         case IrOpcode::Ret: return "ret";
         case IrOpcode::Syscall: return "syscall";
+        case IrOpcode::LeaGlobal: return "leaglobal";
+        case IrOpcode::SelectCc: return "selectcc";
+        case IrOpcode::SetCc: return "setcc";
+        case IrOpcode::Adc: return "adc";
+        case IrOpcode::Sbb: return "sbb";
         case IrOpcode::Unknown: return "unknown";
     }
     return "unknown";

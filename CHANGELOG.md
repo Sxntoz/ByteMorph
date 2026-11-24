@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.0] - 2026-11-24
+
+### Adicionado
+- **Memória Global RIP/PC-Relative & ASLR (`LeaGlobal` → `VmOpcode::LeaPic`):**
+  - `X86_64Lifter` agora resolve `[rip + disp32]` e endereços absolutos formatados pelo Zydis para `IrOpcode::LeaGlobal`; `AArch64Lifter` funde pares `ADRP+ADD` e `ADRP+LDR` e suporta `ADR`.
+  - `VmOpcode::LeaPic` (`0x1A`) calcula em runtime `l_entry + (target_va - stub_base_va)` nos emissores nativos PIC x86-64 e ARM64 e `pic_base_va + imm` no `VmInterpreter`, preservando ASLR/PIE.
+- **Condicionais Avançadas & Flags `CF`/`OF`:**
+  - `VmOpcode::SelectCc` (`0x1B`), `VmOpcode::SetCc` (`0x1C`), `IrOpcode::Adc` e `IrOpcode::Sbb`, cobrindo `cmovcc`, `setcc`, `adc`, `sbb` (x86-64) e `csel`/`csinc`/`csinv`/`csneg`/`cset`/`csetm` (ARM64).
+  - `IrInterpreter`, `VmInterpreter` e runtimes nativos x86-64/ARM64 agora propagam `ZF`, `SF`, `CF` e `OF` para comparações com e sem sinal.
+- **VM Memory Pool (`thread_local`):**
+  - Buffer reutilizável por thread em `VmInterpreter::execute` (`use_memory_pool = true`) com zeragem antes de cada execução e contagem em `VmExecState::allocations_count`, reduzindo `Memory Load/Store (10k)` de `5.016 ms` (v0.8) para `3.033 ms` (**-39.5%**) e alcançando **43.1%** de ganho sobre alocação heap (`0.607 ms` vs `1.066 ms`).
+- **Smart Eligibility 3.0 & CLI v0.9:**
+  - `evaluate_function_eligibility` valida referências `LeaGlobal` contra seções mapeadas do binário.
+  - Novos flags CLI: `analyze --memory-references` e `benchmark-protection --memory`.
+- **Testes:** 11 novos testes `ProtectionV09Test` (65 testes C++ + 3 testes Rust aprovados).
+
 ## [0.8.0] - 2026-11-23
 
 ### Adicionado
