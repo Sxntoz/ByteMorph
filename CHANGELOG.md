@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.0] - 2026-11-24
+
+### Adicionado
+- **VM Performance 4.0:** `PreparedBvmProgram` (`VmInterpreter::prepare` / `execute_prepared`) com cache `thread_local`, sentinela `Halt` de fim de fluxo, dispatch *threaded* (GCC/Clang) e limpeza seletiva por intervalo sujo no `tls_memory_pool` (**-29.9%** no interpretador `0.760 -> 0.533 ms` e **-69.7%** em `Load`/`Store` `2.393 -> 0.724 ms`).
+- **IR Optimizer 2.0:** `core/ir/ir_optimizer.hpp` com passes modulares (constant folding/propagation, copy propagation, simplificação algébrica, eliminação de redundância local, simplificação de branches/CFG, liveness + DCE, coalescência de `VirtualReg`), integrado ao `prepare_target_functions`.
+- **Native Runtime 3.0:** zeragem `rep stosq` em x86-64, `stp xzr, xzr` em ARM64 e stack probing 4KB em ARM64; `PeRewriter::protect_file` estendido para aplicar trampolins em qualquer seção executável (incluindo `.bmprot`).
+- **SDK C/C++ & CMake:** `sdk/include/bytemorph/protect.h`, `protect.hpp`, `sdk/cmake/ByteMorphSDK.cmake` (`ByteMorph::SDK`, `bytemorph_protect_target`) e descoberta automática de marcadores `.bmprot` / `__bm_sdk_begin_marker`..`__bm_sdk_end_marker`.
+- **CLI v0.12 & Documentação:** `optimize-ir <in.ir> [--level 0..3]`, `protect` com saída padrão, `benchmark-protection --compare-baseline` (`v0.11 -> v0.12`), [docs/SDK.md](docs/SDK.md) e [docs/IR_OPTIMIZER.md](docs/IR_OPTIMIZER.md).
+- **Testes:** 6 novos testes `ProtectionV012Test` + alvos `lab_sdk_app` e `lab_shared_lib` (88 testes C++ + 3 testes Rust aprovados).
+
 ## [0.11.0] - 2026-11-24
 
 ### Adicionado

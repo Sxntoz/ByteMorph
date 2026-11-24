@@ -41,9 +41,33 @@ struct VmExecState {
     std::uint64_t return_value{0};
 };
 
+struct FastVmInstruction {
+    VmOpcode opcode{VmOpcode::Nop};
+    std::uint8_t dst{0};
+    std::uint8_t src1{0};
+    std::uint8_t src2{0};
+    std::uint32_t aux{0};
+    std::int64_t imm{0};
+};
+
+struct PreparedBvmProgram {
+    std::vector<FastVmInstruction> insns;
+    std::size_t code_len{0};
+    std::uint64_t build_seed{0};
+    std::uint64_t fingerprint{0};
+    bool has_mem_ops{false};
+    bool has_simd_ops{false};
+};
+
 /// Register-based 64-bit ByteMorph Virtual Machine interpreter.
 class VmInterpreter {
 public:
+    [[nodiscard]] static core::diagnostics::Result<PreparedBvmProgram>
+    prepare(const BvmProgram& program);
+
+    [[nodiscard]] static core::diagnostics::Result<VmExecState>
+    execute_prepared(const PreparedBvmProgram& prepared, const VmExecOptions& options = {});
+
     [[nodiscard]] static core::diagnostics::Result<VmExecState>
     execute(const BvmProgram& program, const VmExecOptions& options = {});
 };

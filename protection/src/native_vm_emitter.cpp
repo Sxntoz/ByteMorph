@@ -2,6 +2,7 @@
 
 #include "bytemorph/arch/aarch64/aarch64_lifter.hpp"
 #include "bytemorph/arch/x86_64/x86_64_lifter.hpp"
+#include "bytemorph/core/ir/ir_optimizer.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
 #include "bytemorph/virt/ir_to_vm.hpp"
 
@@ -660,6 +661,10 @@ prepare_target_functions(const core::binary::IBinaryFile& bin,
         std::uint32_t orig_ops = 0;
         for (const auto& bb : ir_fn.blocks) orig_ops += static_cast<std::uint32_t>(bb.instructions.size());
 
+        core::ir::IrOptimizeOptions opt_cfg;
+        opt_cfg.level = (options.profile == ProtectionProfile::Fast) ? 3 : 2;
+        (void)core::ir::IrOptimizer::optimize(ir_fn, opt_cfg);
+
         ObfuscationConfig obf_cfg;
         obf_cfg.seed = options.seed ^ fn.entry_va;
         obf_cfg.enable_substitution = true;
@@ -695,6 +700,49 @@ prepare_target_functions(const core::binary::IBinaryFile& bin,
     };
 
     const bool explicit_multi = !options.target_function_rvas.empty() || !options.target_function_names.empty();
+
+    auto find_sdk_marked_functions = [&]() -> std::vector<const FunctionInfo*> {
+        std::vector<const FunctionInfo*> marked;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto& sec : bin.sections()) {
+            if (sec.name == ".bmprot" || sec.name == "__bmprot" || sec.name == "__TEXT,__bmprot") {
+                const std::uint64_t start = sec.virtual_address;
+                const std::uint64_t end = start + sec.virtual_size;
+                if (end > start) ranges.emplace_back(start, end);
+            }
+        }
+        std::vector<std::uint64_t> begins, ends;
+        for (const auto& sym : bin.symbols()) {
+            if (sym.address == 0) continue;
+            if (sym.name.find("__bm_sdk_begin_marker") != std::string::npos) begins.push_back(sym.address);
+            else if (sym.name.find("__bm_sdk_end_marker") != std::string::npos) ends.push_back(sym.address);
+        }
+        std::sort(begins.begin(), begins.end());
+        std::sort(ends.begin(), ends.end());
+        for (std::size_t bi = 0; bi < begins.size() && bi < ends.size(); ++bi) {
+            if (ends[bi] > begins[bi]) ranges.emplace_back(begins[bi], ends[bi]);
+        }
+        if (ranges.empty()) return marked;
+        for (const auto& fn : analysis.functions) {
+            if (fn.name.find("__bm_sdk_begin_marker") != std::string::npos ||
+                fn.name.find("__bm_sdk_end_marker") != std::string::npos) {
+                continue;
+            }
+            for (const auto& [r_start, r_end] : ranges) {
+                if (fn.entry_va >= r_start && fn.entry_va < r_end) {
+                    marked.push_back(&fn);
+                    break;
+                }
+            }
+        }
+        return marked;
+    };
+
+    const auto sdk_marked = find_sdk_marked_functions();
+    const bool use_sdk_auto =
+        !options.protect_all_eligible && !explicit_multi &&
+        !options.target_function_rva.has_value() && options.target_function_name.empty() &&
+        (options.auto_select_functions || !sdk_marked.empty());
 
     if (options.protect_all_eligible) {
         for (const auto& fn : analysis.functions) {
@@ -779,6 +827,44 @@ prepare_target_functions(const core::binary::IBinaryFile& bin,
                     "prepare_target_functions");
             }
             plan.prepared.push_back(std::move(pf.value()));
+        }
+    } else if (use_sdk_auto) {
+        if (!sdk_marked.empty()) {
+            for (const FunctionInfo* fn_ptr : sdk_marked) {
+                auto elig = evaluate_function_eligibility(
+                    bin, analysis, *fn_ptr, auth_calls, options.allow_external_calls, is_arm64);
+                if (!elig.eligible) {
+                    plan.rejected.push_back(std::move(elig));
+                    continue;
+                }
+                auto pf = process_fn(*fn_ptr);
+                if (!pf) {
+                    elig.eligible = false;
+                    elig.rejection_reason = pf.error().message;
+                    plan.rejected.push_back(std::move(elig));
+                    continue;
+                }
+                ++plan.eligible_count;
+                plan.prepared.push_back(std::move(pf.value()));
+            }
+        } else {
+            // Auto-select top eligible functions if no explicit SDK markers were found
+            for (const auto& fn : analysis.functions) {
+                auto elig = evaluate_function_eligibility(
+                    bin, analysis, fn, auth_calls, options.allow_external_calls, is_arm64);
+                if (!elig.eligible) {
+                    plan.rejected.push_back(std::move(elig));
+                    continue;
+                }
+                if (options.max_overhead_budget_pct.has_value() &&
+                    elig.estimated_overhead_pct > *options.max_overhead_budget_pct) {
+                    continue;
+                }
+                auto pf = process_fn(fn);
+                if (!pf) continue;
+                ++plan.eligible_count;
+                plan.prepared.push_back(std::move(pf.value()));
+            }
         }
     } else {
         // Single target mode (backwards-compatible with v0.4-v0.6)
@@ -1414,15 +1500,13 @@ emit_shared_pic_x64_vm_runtime(const std::vector<BvmProgram>& progs,
         a.sub(x86::rsp, static_cast<std::uint32_t>(total_frame_bytes));
     }
 
+    a.mov(x86::r11, x86::rcx);
+    a.cld();
     a.xor_(x86::eax, x86::eax);
     a.mov(x86::rdi, x86::rsp);
-    a.mov(x86::r10d, 161);
-    Label l_zero_loop = a.new_label();
-    a.bind(l_zero_loop);
-    a.mov(x86::qword_ptr(x86::rdi), x86::rax);
-    a.add(x86::rdi, 8);
-    a.dec(x86::r10d);
-    a.jnz(l_zero_loop);
+    a.mov(x86::ecx, 161);
+    a.rep().stosq();
+    a.mov(x86::rcx, x86::r11);
 
     // Initialize virtual stack pointer R4 (rsp) and frame pointer R5 (rbp) to [rsp + 896]
     a.lea(x86::rax, x86::ptr(x86::rsp, 896));
@@ -2575,14 +2659,23 @@ emit_shared_pic_arm64_vm_runtime(const std::vector<BvmProgram>& progs,
     a.stp(a64::x27, a64::x28, a64::ptr(a64::sp, 80));
     const std::size_t total_frame_bytes = 1280 + vreg_buf_bytes + plain_buf_bytes;
     const std::size_t plain_buf_off = 1280 + vreg_buf_bytes;
-    a.sub(a64::sp, a64::sp, static_cast<std::uint32_t>(total_frame_bytes));
+    if (total_frame_bytes >= 4096) {
+        for (std::size_t step = 4096; step <= total_frame_bytes; step += 4096) {
+            a.sub(a64::sp, a64::sp, 4096);
+            a.ldr(a64::x10, a64::ptr(a64::sp));
+        }
+        const std::size_t rem = total_frame_bytes % 4096;
+        if (rem > 0) a.sub(a64::sp, a64::sp, static_cast<std::uint32_t>(rem));
+    } else {
+        a.sub(a64::sp, a64::sp, static_cast<std::uint32_t>(total_frame_bytes));
+    }
 
-    // Zero R0..R31 and virtual stack frame (160 qwords = 1280B)
+    // Zero R0..R31 and virtual stack frame (80 x 16B pairs = 1280B)
     a.mov(a64::x10, a64::sp);
-    a.mov(a64::w11, 160);
+    a.mov(a64::w11, 80);
     Label l_zero = a.new_label();
     a.bind(l_zero);
-    a.str(a64::xzr, a64::ptr_post(a64::x10, 8));
+    a.stp(a64::xzr, a64::xzr, a64::ptr_post(a64::x10, 16));
     a.subs(a64::w11, a64::w11, 1);
     a.b_ne(l_zero);
 

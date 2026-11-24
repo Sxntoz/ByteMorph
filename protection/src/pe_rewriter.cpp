@@ -135,17 +135,37 @@ PeRewriter::protect_file(const std::filesystem::path& input,
         return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "PE missing .text section", "PeRewriter::protect_file");
     }
 
-    // Validate ALL function patch locations BEFORE mutating .text (transactional!)
-    auto text_content = std::vector<std::uint8_t>(text_sec->content().begin(), text_sec->content().end());
+    // Validate ALL function patch locations BEFORE mutating sections (transactional!)
+    struct MutableSec {
+        LIEF::PE::Section* sec{nullptr};
+        std::vector<std::uint8_t> content;
+    };
+    std::vector<MutableSec> mutable_secs;
+    auto get_or_load_sec = [&](std::uint64_t rva, std::size_t len) -> MutableSec* {
+        for (auto& ms : mutable_secs) {
+            const std::uint64_t s_va = ms.sec->virtual_address();
+            if (rva >= s_va && rva + len <= s_va + ms.content.size()) return &ms;
+        }
+        for (auto& sec : pe->sections()) {
+            const std::uint64_t s_va = sec.virtual_address();
+            auto c = sec.content();
+            if (rva >= s_va && rva + len <= s_va + c.size()) {
+                mutable_secs.push_back({&sec, std::vector<std::uint8_t>(c.begin(), c.end())});
+                return &mutable_secs.back();
+            }
+        }
+        return nullptr;
+    };
+
     for (std::size_t i = 0; i < plan.prepared.size(); ++i) {
         const auto& pf = plan.prepared[i];
         const std::uint64_t target_rva = pf.entry_va - bin.info().image_base;
-        if (target_rva < text_sec->virtual_address() ||
-            target_rva + min_patch > text_sec->virtual_address() + text_content.size()) {
+        MutableSec* target_ms = get_or_load_sec(target_rva, min_patch);
+        if (!target_ms) {
             return diagnostics::Result<ProtectionReport>::err(
-                ErrorCode::OutOfBounds, "Target RVA is outside .text raw content: " + pf.name, "PeRewriter::protect_file");
+                ErrorCode::OutOfBounds, "Target RVA is outside executable section raw content: " + pf.name, "PeRewriter::protect_file");
         }
-        const std::size_t patch_off = static_cast<std::size_t>(target_rva - text_sec->virtual_address());
+        const std::size_t patch_off = static_cast<std::size_t>(target_rva - target_ms->sec->virtual_address());
         const std::uint64_t fn_stub_rva = bmrt_rva + rt_layout.entry_offsets[i];
         if (is_arm64) {
             const std::int64_t delta = static_cast<std::int64_t>(fn_stub_rva) - static_cast<std::int64_t>(target_rva);
@@ -154,15 +174,17 @@ PeRewriter::protect_file(const std::filesystem::path& input,
                 return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "ARM64 branch target out of 128MB range", "PeRewriter::protect_file");
             }
             const std::uint32_t insn = 0x14000000u | (static_cast<std::uint32_t>(imm26) & 0x03FFFFFFu);
-            std::memcpy(text_content.data() + patch_off, &insn, 4);
+            std::memcpy(target_ms->content.data() + patch_off, &insn, 4);
         } else {
             const std::int64_t rel32 = static_cast<std::int64_t>(fn_stub_rva) - static_cast<std::int64_t>(target_rva + 5);
-            text_content[patch_off] = 0xE9;
+            target_ms->content[patch_off] = 0xE9;
             const std::uint32_t rel32_u = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel32));
-            std::memcpy(text_content.data() + patch_off + 1, &rel32_u, 4);
+            std::memcpy(target_ms->content.data() + patch_off + 1, &rel32_u, 4);
         }
     }
-    text_sec->content(text_content);
+    for (auto& ms : mutable_secs) {
+        ms.sec->content(ms.content);
+    }
 
     // Add shared .bmrt (R-X, W^X compliant)
     LIEF::PE::Section bmrt_sec(".bmrt");
@@ -198,7 +220,7 @@ PeRewriter::protect_file(const std::filesystem::path& input,
     meta.profile = options.profile;
     meta.seed = options.seed;
     meta.bytecode_encrypted = rt_opts.encrypt_bytecode;
-    meta.text_blake2b = CryptoAead::blake2b_256(text_content);
+    meta.text_blake2b = CryptoAead::blake2b_256(text_sec->content());
     meta.runtime_blake2b = CryptoAead::blake2b_256(runtime_bytes);
     meta.protected_strings_count = str_cnt;
     if (rt_opts.encrypt_bytecode) {

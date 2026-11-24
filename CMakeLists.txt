@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(ByteMorph
-    VERSION 0.11.0
+    VERSION 0.12.0
     DESCRIPTION "Cross-platform modular binary analysis and software protection engine"
     LANGUAGES C CXX
 )
@@ -114,6 +114,11 @@ endif()
 # ------------------------------------------------------------------------------
 # Modules
 # ------------------------------------------------------------------------------
+add_library(bytemorph_sdk INTERFACE)
+add_library(ByteMorph::SDK ALIAS bytemorph_sdk)
+target_include_directories(bytemorph_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/sdk/include)
+include(${CMAKE_CURRENT_SOURCE_DIR}/sdk/cmake/ByteMorphSDK.cmake)
+
 add_subdirectory(core)
 add_subdirectory(formats)
 add_subdirectory(architectures)

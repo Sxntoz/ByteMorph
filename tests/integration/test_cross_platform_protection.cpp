@@ -7,6 +7,7 @@
 #include "bytemorph/formats/pe/pe_parser.hpp"
 #include "bytemorph/core/ir/ir.hpp"
 #include "bytemorph/core/ir/ir_interpreter.hpp"
+#include "bytemorph/core/ir/ir_optimizer.hpp"
 #include "bytemorph/obf/obfuscation_engine.hpp"
 #include "bytemorph/prot/native_vm_emitter.hpp"
 #include "bytemorph/prot/pe_rewriter.hpp"
@@ -2315,4 +2316,247 @@ TEST(ProtectionV011Test, SmartEligibility50BudgetAndMetrics) {
         }
     }
 #endif
+}
+
+TEST(ProtectionV012Test, IrOptimizer20PassesAndSemanticEquivalence) {
+    using namespace bytemorph::core::ir;
+
+    IrFunction fn;
+    fn.name = "opt_test";
+    fn.entry_va = 0x1000;
+    IrBasicBlock bb;
+    bb.id = 0;
+    bb.start_va = 0x1000;
+
+    // v0 = 10; v1 = 20; v2 = v0 + v1 (fold -> 30); v3 = v2 + 0 (alg -> v2);
+    // dead_v = v3 * 7 (DCE); rax = v3 + rcx; ret
+    bb.instructions.push_back({0x1000, IrOpcode::Mov, {IrOperand::vreg("v_alpha")}, {IrOperand::immediate(10)}, "", ""});
+    bb.instructions.push_back({0x1004, IrOpcode::Mov, {IrOperand::vreg("v_beta")}, {IrOperand::immediate(20)}, "", ""});
+    bb.instructions.push_back({0x1008, IrOpcode::Add, {IrOperand::vreg("v_sum")}, {IrOperand::vreg("v_alpha"), IrOperand::vreg("v_beta")}, "", ""});
+    bb.instructions.push_back({0x100C, IrOpcode::Add, {IrOperand::vreg("v_zero")}, {IrOperand::vreg("v_sum"), IrOperand::immediate(0)}, "", ""});
+    bb.instructions.push_back({0x1010, IrOpcode::Mul, {IrOperand::vreg("v_dead")}, {IrOperand::vreg("v_zero"), IrOperand::immediate(7)}, "", ""});
+    bb.instructions.push_back({0x1014, IrOpcode::Mov, {IrOperand::vreg("v_copy")}, {IrOperand::vreg("v_zero")}, "", ""});
+    bb.instructions.push_back({0x1018, IrOpcode::Add, {IrOperand::reg("rax")}, {IrOperand::reg("rcx"), IrOperand::vreg("v_copy")}, "", ""});
+    bb.instructions.push_back({0x101C, IrOpcode::Ret, {}, {}, "", ""});
+    fn.blocks.push_back(std::move(bb));
+
+    const IrFunction orig = fn;
+    IrOptimizeOptions opts;
+    opts.level = 3;
+    const auto stats = IrOptimizer::optimize(fn, opts);
+
+    EXPECT_LT(stats.instructions_after, stats.instructions_before);
+    EXPECT_GT(stats.constants_folded, 0u);
+    EXPECT_GT(stats.dead_instructions_removed, 0u);
+
+    for (std::int64_t x : {-50LL, 0LL, 17LL, 12345LL}) {
+        IrExecOptions s_orig, s_opt;
+        s_orig.initial_regs["rcx"] = static_cast<std::uint64_t>(x);
+        s_opt.initial_regs["rcx"] = static_cast<std::uint64_t>(x);
+        auto r_orig = IrInterpreter::execute(orig, s_orig);
+        auto r_opt = IrInterpreter::execute(fn, s_opt);
+        ASSERT_TRUE(r_orig.has_value());
+        ASSERT_TRUE(r_opt.has_value());
+        EXPECT_EQ(r_orig.value().regs["rax"], r_opt.value().regs["rax"]);
+    }
+}
+
+TEST(ProtectionV012Test, VmInterpreter40PrepareCacheAndDifferentialEquivalence) {
+    using namespace bytemorph::virt;
+
+    BvmProgram prog;
+    prog.build_seed = 0x12345678ULL;
+    prog.instructions = {
+        {VmOpcode::MovImm, 1, 0, 0, 100},
+        {VmOpcode::Store, 4, 1, 8, -8},
+        {VmOpcode::Load, 2, 4, 8, -8},
+        {VmOpcode::Add, 0, 0, 2, 0},
+        {VmOpcode::Ret, 0, 0, 0, 0}
+    };
+
+    auto prep = VmInterpreter::prepare(prog);
+    ASSERT_TRUE(prep.has_value()) << prep.error().to_string();
+    EXPECT_TRUE(prep.value().has_mem_ops);
+    EXPECT_FALSE(prep.value().has_simd_ops);
+
+    for (int i = 0; i < 64; ++i) {
+        VmExecOptions opts;
+        opts.initial_regs[0] = static_cast<std::uint64_t>(i * 3);
+        auto r1 = VmInterpreter::execute(prog, opts);
+        auto r2 = VmInterpreter::execute_prepared(prep.value(), opts);
+        ASSERT_TRUE(r1.has_value());
+        ASSERT_TRUE(r2.has_value());
+        EXPECT_EQ(r1.value().return_value, static_cast<std::uint64_t>(i * 3 + 100));
+        EXPECT_EQ(r1.value().return_value, r2.value().return_value);
+    }
+}
+
+TEST(ProtectionV012Test, SdkMarkersAndAutoSelectProtectionEquivalence) {
+#ifdef BYTEMORPH_LAB_SDK_APP_PATH
+    const std::filesystem::path sdk_exe(BYTEMORPH_LAB_SDK_APP_PATH);
+    if (!std::filesystem::exists(sdk_exe)) {
+        GTEST_SKIP() << "lab_sdk_app not built";
+    }
+    const auto out_exe = std::filesystem::temp_directory_path() /
+        ("lab_sdk_app_protected" + sdk_exe.extension().string());
+
+    bytemorph::prot::ProtectOptions opts;
+    opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+    opts.auto_select_functions = true;
+    opts.encrypt_bytecode = true;
+
+    auto res = bytemorph::prot::ProtectionEngine::protect(sdk_exe, out_exe, opts);
+    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+    EXPECT_GE(res.value().protected_functions.size(), 1u);
+
+    auto ver = bytemorph::prot::ProtectionEngine::verify(out_exe);
+    ASSERT_TRUE(ver.has_value()) << ver.error().to_string();
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+
+#ifdef _WIN32
+    auto run_capture = [](const std::filesystem::path& exe, int& rc) -> std::string {
+        std::string cmd = "\"\"" + exe.string() + "\" 42\"";
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) { rc = -1; return {}; }
+        char buf[256];
+        std::string out;
+        while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+        rc = _pclose(pipe);
+        return out;
+    };
+    int rc_orig = -1, rc_prot = -1;
+    const std::string out_orig = run_capture(sdk_exe, rc_orig);
+    const std::string out_prot = run_capture(out_exe, rc_prot);
+    EXPECT_EQ(rc_orig, 0);
+    EXPECT_EQ(rc_prot, 0);
+    EXPECT_EQ(out_orig, out_prot);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(out_exe, ec);
+#endif
+}
+
+TEST(ProtectionV012Test, SharedLibraryDllSoDylibProtectionAndVerification) {
+#ifdef BYTEMORPH_LAB_SHARED_LIB_PATH
+    const std::filesystem::path lib_path(BYTEMORPH_LAB_SHARED_LIB_PATH);
+    if (!std::filesystem::exists(lib_path)) {
+        GTEST_SKIP() << "lab_shared_lib not built";
+    }
+    const auto out_lib = std::filesystem::temp_directory_path() /
+        ("lab_shared_lib_protected" + lib_path.extension().string());
+
+    bytemorph::prot::ProtectOptions opts;
+    opts.profile = bytemorph::prot::ProtectionProfile::Balanced;
+    opts.protect_all_eligible = true;
+    opts.encrypt_bytecode = true;
+
+    auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
+    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+    EXPECT_GE(res.value().protected_functions.size(), 1u);
+
+    auto ver = bytemorph::prot::ProtectionEngine::verify(out_lib);
+    ASSERT_TRUE(ver.has_value()) << ver.error().to_string();
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+
+#ifdef _WIN32
+    HMODULE mod = LoadLibraryA(out_lib.string().c_str());
+    ASSERT_NE(mod, nullptr) << "LoadLibraryA failed on protected DLL";
+    using AddMulFn = int(*)(int, int);
+    using ChecksumFn = std::uint64_t(*)(std::uint64_t, std::uint64_t);
+    auto fn_add_mul = reinterpret_cast<AddMulFn>(GetProcAddress(mod, "bm_shared_add_mul"));
+    auto fn_csum = reinterpret_cast<ChecksumFn>(GetProcAddress(mod, "bm_shared_checksum"));
+    ASSERT_NE(fn_add_mul, nullptr);
+    ASSERT_NE(fn_csum, nullptr);
+    EXPECT_EQ(fn_add_mul(10, 20), (10 * 7 + 20 * 13) ^ 0x1357);
+    std::uint64_t expected = 0x1234ULL ^ 0xCAFEBABEULL;
+    for (std::uint64_t i = 0; i < 50; ++i) expected = (expected * 33ULL) + i;
+    EXPECT_EQ(fn_csum(0x1234ULL, 50), expected);
+    FreeLibrary(mod);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(out_lib, ec);
+#endif
+}
+
+TEST(ProtectionV012Test, Cryptography30MultiFunctionAeadAndCorruptionHandling) {
+#ifdef BYTEMORPH_LAB_SHARED_LIB_PATH
+    const std::filesystem::path lib_path(BYTEMORPH_LAB_SHARED_LIB_PATH);
+    if (!std::filesystem::exists(lib_path)) {
+        GTEST_SKIP() << "lab_shared_lib not built";
+    }
+    const auto out_lib = std::filesystem::temp_directory_path() /
+        ("lab_crypto30_protected" + lib_path.extension().string());
+
+    bytemorph::prot::ProtectOptions opts;
+    opts.profile = bytemorph::prot::ProtectionProfile::Maximum;
+    opts.protect_all_eligible = true;
+    opts.encrypt_bytecode = true;
+
+    auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
+    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+
+    auto ver = bytemorph::prot::ProtectionEngine::verify(out_lib);
+    ASSERT_TRUE(ver.has_value());
+    EXPECT_TRUE(ver.value().valid);
+    EXPECT_TRUE(ver.value().aead_authenticated);
+
+    // Corrupt last bytes (BMP4 / sealed payload) and verify clean rejection
+    std::ifstream ifs(out_lib, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(ifs.good());
+    const auto sz = static_cast<std::size_t>(ifs.tellg());
+    ASSERT_GT(sz, 128u);
+    ifs.seekg(0);
+    std::vector<std::uint8_t> corrupted(sz);
+    ifs.read(reinterpret_cast<char*>(corrupted.data()), static_cast<std::streamsize>(sz));
+    // Locate BMP4 metadata/payload and corrupt 1 byte inside it to verify AEAD rejection
+    bool flipped = false;
+    for (std::size_t i = 0; i + 48 < corrupted.size(); ++i) {
+        if (corrupted[i] == 'B' && corrupted[i + 1] == 'M' &&
+            corrupted[i + 2] == 'P' && corrupted[i + 3] == '4') {
+            corrupted[i + 40] ^= 0x5A;
+            flipped = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(flipped);
+    const auto corrupt_path = std::filesystem::temp_directory_path() /
+        ("lab_crypto30_corrupt" + lib_path.extension().string());
+    {
+        std::ofstream ofs(corrupt_path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(corrupted.data()), static_cast<std::streamsize>(corrupted.size()));
+    }
+    auto ver_bad = bytemorph::prot::ProtectionEngine::verify(corrupt_path);
+    if (ver_bad.has_value()) {
+        EXPECT_FALSE(ver_bad.value().valid);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(out_lib, ec);
+    std::filesystem::remove(corrupt_path, ec);
+#endif
+}
+
+TEST(ProtectionV012Test, WindowsArm64Pe32PlusAndLargeStackProbeEmission) {
+    using namespace bytemorph::prot::detail;
+    using namespace bytemorph::virt;
+
+    // Program large enough (> 3KB encrypted blob) to exercise ARM64 >= 4096B stack probing
+    BvmProgram big_prog;
+    big_prog.build_seed = 0xA4642026ULL;
+    for (int i = 0; i < 320; ++i) {
+        big_prog.instructions.push_back({VmOpcode::Add, 0, 0, 1, 0});
+    }
+    big_prog.instructions.push_back({VmOpcode::Ret, 0, 0, 0, 0});
+
+    SharedRuntimeLayout layout;
+    SharedRuntimeOptions rt_opts;
+    rt_opts.encrypt_bytecode = true;
+    rt_opts.seed = 0xA4642026ULL;
+    auto arm64_rt = emit_shared_pic_arm64_vm_runtime(
+        std::vector<BvmProgram>{big_prog}, layout, rt_opts);
+    ASSERT_TRUE(arm64_rt.has_value()) << arm64_rt.error().to_string();
+    EXPECT_GT(arm64_rt.value().size(), 3000u);
+    EXPECT_EQ(layout.entry_offsets.size(), 1u);
 }

@@ -2,11 +2,19 @@
 
 **ByteMorph** é um framework open source, modular e multiplataforma de análise binária, ofuscação de IR, virtualização de código e proteção de binários em **C++20** e **Rust**.
 
-> **Status atual (v0.11.0):**  
+> **Status atual (v0.12.0):**  
 > - **Análise estática e IR/VM:** multiplataforma (PE32+, ELF64, Mach-O 64-bit / Fat Universal; x86-64 e ARM64).  
-> - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility` / `test-equivalence` / `report`):**
->   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11 e C++20 com 130+ funções protegidas, multithreading, alocação dinâmica, structs/globais, bytecode criptografado `XChaCha20-Poly1305` e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
+> - **Proteção e reescrita de binários (`protect` / `verify` / `compatibility` / `test-equivalence` / `report` / `optimize-ir`):**
+>   - **Validado com execução nativa e equivalência:** Windows PE32+ x86-64 (aplicações C11/C++20 com 130+ funções, DLLs com `LoadLibraryA`, SDK `.bmprot`, multithreading, alocação dinâmica, structs/globais, `XChaCha20-Poly1305` e SIMD/FP), Linux ELF64 x86-64 e ARM64/AArch64, macOS Mach-O 64-bit ARM64 (e re-assinatura ad-hoc via `/usr/bin/codesign`).
 >   - **Cross-protection / verificação estrutural e AEAD (experimental para execução nativa):** Windows PE32+ ARM64 (`0xAA64`, compilador cruzado `MSVC Hostx64\arm64` disponível localmente, sem runner nativo Windows ARM64) e Mach-O Fat/Universal multi-slice.
+
+## Recursos da v0.12
+
+- **VM Performance 4.0:** pré-decodificação `PreparedBvmProgram` com cache `thread_local`, sentinela de fim de fluxo, dispatch *threaded* (GCC/Clang) / jump-table (MSVC) e limpeza seletiva por intervalo sujo no `tls_memory_pool` (**-29.9%** no interpretador `0.760 ms -> 0.533 ms` e **-69.7%** em `Load`/`Store` `2.393 ms -> 0.724 ms`).
+- **IR Optimizer 2.0:** pipeline modular (`IrOptimizer` em [docs/IR_OPTIMIZER.md](docs/IR_OPTIMIZER.md)) com *constant folding/propagation*, *copy propagation*, simplificação algébrica, eliminação local de redundância, simplificação de branches/CFG, análise de *liveness* / DCE e coalescência de `VirtualReg`.
+- **Native Runtime 3.0:** zeragem rápida `rep stosq` em x86-64 (preservando `rcx`), `stp xzr, xzr` em ARM64 e stack guard probing de 4KB em ARM64.
+- **SDK C/C++ & CMake:** API versionada em [docs/SDK.md](docs/SDK.md) (`<bytemorph/protect.hpp>`, `BYTEMORPH_PROTECT_BEGIN` / `BYTEMORPH_PROTECT_END` / `BYTEMORPH_PROTECT_FUNC` e `bytemorph_protect_target()` no CMake) com descoberta automática pós-compilação e suporte a patching de seções `.bmprot`.
+- **Compatibilidade Avançada & CLI v0.12:** proteção e execução validada de DLL/SO/DYLIB (`lab_shared_lib`), auditoria criptográfica `BMP4` v2, `optimize-ir --level 0..3`, `protect` com saída padrão e `--functions all-eligible`, e `benchmark-protection --compare-baseline` (`v0.11 -> v0.12`).
 
 ## Recursos da v0.11
 

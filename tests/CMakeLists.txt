@@ -36,6 +36,29 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(lab_cpp_app PRIVATE -fno-ipa-ra)
 endif()
 
+add_executable(lab_sdk_app
+    lab/lab_sdk_app.cpp
+)
+target_compile_features(lab_sdk_app PRIVATE cxx_std_20)
+target_link_libraries(lab_sdk_app PRIVATE ByteMorph::SDK)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lab_sdk_app PRIVATE -O2 -fomit-frame-pointer -fno-sanitize=all)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(lab_sdk_app PRIVATE -fno-ipa-ra)
+endif()
+
+add_library(lab_shared_lib SHARED
+    lab/lab_shared_lib.cpp
+)
+target_compile_features(lab_shared_lib PRIVATE cxx_std_20)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lab_shared_lib PRIVATE -O2 -fomit-frame-pointer -fno-sanitize=all)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(lab_shared_lib PRIVATE -fno-ipa-ra)
+endif()
+
 add_executable(bytemorph_tests
     unit/test_diagnostics.cpp
     unit/test_ir.cpp
@@ -62,9 +85,11 @@ target_compile_definitions(bytemorph_tests
         BYTEMORPH_LAB_PE_TARGET_PATH="$<TARGET_FILE:lab_pe_target>"
         BYTEMORPH_LAB_C_APP_PATH="$<TARGET_FILE:lab_c_app>"
         BYTEMORPH_LAB_CPP_APP_PATH="$<TARGET_FILE:lab_cpp_app>"
+        BYTEMORPH_LAB_SDK_APP_PATH="$<TARGET_FILE:lab_sdk_app>"
+        BYTEMORPH_LAB_SHARED_LIB_PATH="$<TARGET_FILE:lab_shared_lib>"
 )
 
-add_dependencies(bytemorph_tests lab_pe_target lab_c_app lab_cpp_app)
+add_dependencies(bytemorph_tests lab_pe_target lab_c_app lab_cpp_app lab_sdk_app lab_shared_lib)
 
 target_link_libraries(bytemorph_tests
     PRIVATE
@@ -74,6 +99,7 @@ target_link_libraries(bytemorph_tests
         ByteMorph::Obf
         ByteMorph::Virt
         ByteMorph::Prot
+        ByteMorph::SDK
         GTest::gtest_main
 )
 

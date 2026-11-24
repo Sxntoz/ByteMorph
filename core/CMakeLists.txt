@@ -5,6 +5,7 @@ add_library(bytemorph_core STATIC
     ir/src/ir.cpp
     ir/src/ir_serializer.cpp
     ir/src/ir_interpreter.cpp
+    ir/src/ir_optimizer.cpp
     analysis/src/analyzer.cpp
 )
 

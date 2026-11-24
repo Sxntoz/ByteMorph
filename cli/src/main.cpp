@@ -5,6 +5,7 @@
 #include "bytemorph/core/analysis/analyzer.hpp"
 #include "bytemorph/core/binary/loader.hpp"
 #include "bytemorph/core/diagnostics/logger.hpp"
+#include "bytemorph/core/ir/ir_optimizer.hpp"
 #include "bytemorph/core/ir/ir_serializer.hpp"
 #include "bytemorph/formats/elf/elf_parser.hpp"
 #include "bytemorph/formats/macho/macho_parser.hpp"
@@ -37,7 +38,7 @@ using namespace bytemorph::core::ir;
 
 void print_usage() {
     std::cout
-        << "ByteMorph v0.11.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
+        << "ByteMorph v0.12.0 - Cross-Platform Binary Obfuscation & Code Virtualization Engine\n\n"
         << "Usage:\n"
         << "  bytemorph <command> [args] [options]\n\n"
         << "Analysis Commands (v0.1 - v0.2):\n"
@@ -1039,19 +1040,19 @@ int cmd_benchmark_protection(bool detailed, bool compare_baseline, bool memory_b
         }
 
         if (compare_baseline) {
-            constexpr double kV07Interpreter10kMs = 2.987;
-            constexpr double kV07ExtBridge10kMs = 2.405;
-            constexpr double kV08Memory10kMs = 5.016;
-            const double interp_delta_pct = ((arith_10k - kV07Interpreter10kMs) / kV07Interpreter10kMs) * 100.0;
-            const double ext_delta_pct = ((ext_10k - kV07ExtBridge10kMs) / kV07ExtBridge10kMs) * 100.0;
-            const double mem_delta_pct = ((mem_pooled_10k - kV08Memory10kMs) / kV08Memory10kMs) * 100.0;
-            std::cout << "  --- Baseline Comparison (v0.7/v0.8 -> v0.9) ---\n"
-                      << "    VM Interpreter (10k eq.)  : v0.7=" << std::setprecision(3) << kV07Interpreter10kMs
-                      << " ms -> v0.9=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
-                      << "    Memory Load/Store (10k)   : v0.8=" << std::setprecision(3) << kV08Memory10kMs
-                      << " ms -> v0.9=" << mem_pooled_10k << " ms (" << std::setprecision(1) << mem_delta_pct << "%)\n"
-                      << "    External Call Bridge (10k): v0.7=" << std::setprecision(3) << kV07ExtBridge10kMs
-                      << " ms -> v0.9=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
+            constexpr double kV011Interpreter10kMs = 0.760;
+            constexpr double kV011ExtBridge10kMs = 0.550;
+            constexpr double kV011Memory10kMs = 2.393;
+            const double interp_delta_pct = ((arith_10k - kV011Interpreter10kMs) / kV011Interpreter10kMs) * 100.0;
+            const double ext_delta_pct = ((ext_10k - kV011ExtBridge10kMs) / kV011ExtBridge10kMs) * 100.0;
+            const double mem_delta_pct = ((mem_pooled_10k - kV011Memory10kMs) / kV011Memory10kMs) * 100.0;
+            std::cout << "  --- Baseline Comparison (v0.11 -> v0.12) ---\n"
+                      << "    VM Interpreter (10k eq.)  : v0.11=" << std::setprecision(3) << kV011Interpreter10kMs
+                      << " ms -> v0.12=" << arith_10k << " ms (" << std::setprecision(1) << interp_delta_pct << "%)\n"
+                      << "    Memory Load/Store (10k)   : v0.11=" << std::setprecision(3) << kV011Memory10kMs
+                      << " ms -> v0.12=" << mem_pooled_10k << " ms (" << std::setprecision(1) << mem_delta_pct << "%)\n"
+                      << "    External Call Bridge (10k): v0.11=" << std::setprecision(3) << kV011ExtBridge10kMs
+                      << " ms -> v0.12=" << ext_10k << " ms (" << std::setprecision(1) << ext_delta_pct << "%)\n";
         }
     }
 
@@ -1213,7 +1214,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "ByteMorph v0.11.0\n";
+        std::cout << "ByteMorph v0.12.0\n";
         return 0;
     }
     if (cmd == "benchmark-vm") {
@@ -1264,9 +1265,15 @@ int main(int argc, char* argv[]) {
 
     std::string file_path = argv[2];
     std::string output_path;
+    int arg_start = 3;
+    if (cmd == "protect" && argc >= 4 && argv[3][0] != '-') {
+        output_path = argv[3];
+        arg_start = 4;
+    }
     std::size_t max_insns = 0;
     std::size_t fn_idx = 0;
     std::uint64_t seed = 0x42595445ULL;
+    int opt_level = 2;
     std::string output_format = "text";
     std::string eligibility_report_path;
     bool analyze_functions_only = false;
@@ -1277,7 +1284,7 @@ int main(int argc, char* argv[]) {
     bool detailed_flag = false;
     bytemorph::prot::ProtectOptions prot_opts;
 
-    for (int i = 3; i < argc; ++i) {
+    for (int i = arg_start; i < argc; ++i) {
         std::string_view arg = argv[i];
         if (arg == "--verbose") {
             diagnostics::Logger::instance().set_level(diagnostics::LogLevel::Info);
@@ -1287,6 +1294,8 @@ int main(int argc, char* argv[]) {
             output_path = argv[++i];
         } else if (arg == "--seed" && i + 1 < argc) {
             try { seed = std::stoull(argv[++i], nullptr, 0); prot_opts.seed = seed; } catch (...) { return 1; }
+        } else if (arg == "--level" && i + 1 < argc) {
+            try { opt_level = std::stoi(argv[++i]); } catch (...) { return 1; }
         } else if (arg == "--fn" && i + 1 < argc) {
             try { fn_idx = std::stoull(argv[++i]); } catch (...) { return 1; }
         } else if (arg == "--profile" && i + 1 < argc) {
@@ -1374,10 +1383,56 @@ int main(int argc, char* argv[]) {
     }
 
     if (cmd == "obfuscate-ir") return cmd_obfuscate_ir(file_path, output_path, seed);
+    if (cmd == "optimize-ir") {
+        std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            std::cerr << "Failed to read IR file: " << file_path << '\n';
+            return 1;
+        }
+        const auto sz = static_cast<std::size_t>(ifs.tellg());
+        ifs.seekg(0);
+        std::vector<std::uint8_t> ir_bytes(sz);
+        ifs.read(reinterpret_cast<char*>(ir_bytes.data()), static_cast<std::streamsize>(sz));
+        auto mod = bytemorph::core::ir::IrSerializer::deserialize(ir_bytes);
+        if (!mod) {
+            std::cerr << "Failed to deserialize IR: " << mod.error().to_string() << '\n';
+            return 1;
+        }
+        bytemorph::core::ir::IrOptimizeOptions opts;
+        opts.level = opt_level;
+        const auto stats = bytemorph::core::ir::IrOptimizer::optimize(mod.value(), opts);
+        std::cout << "IR Optimizer 2.0 (level=" << opt_level << "): "
+                  << stats.instructions_before << " -> " << stats.instructions_after
+                  << " insns (folded=" << stats.constants_folded
+                  << ", copies=" << stats.copies_propagated
+                  << ", dce=" << stats.dead_instructions_removed
+                  << ", branches=" << stats.branches_simplified << ")\n";
+        if (!output_path.empty()) {
+            const auto out_bytes = bytemorph::core::ir::IrSerializer::serialize(mod.value());
+            if (!out_bytes) {
+                std::cerr << "Failed to serialize optimized IR: " << out_bytes.error().to_string() << '\n';
+                return 1;
+            }
+            std::ofstream ofs(output_path, std::ios::binary);
+            if (!ofs) {
+                std::cerr << "Failed to write optimized IR: " << output_path << '\n';
+                return 1;
+            }
+            ofs.write(reinterpret_cast<const char*>(out_bytes.value().data()),
+                      static_cast<std::streamsize>(out_bytes.value().size()));
+        }
+        return 0;
+    }
     if (cmd == "vm-compile") return cmd_vm_compile(file_path, output_path, seed, fn_idx);
     if (cmd == "vm-run") return cmd_vm_run(file_path);
     if (cmd == "vm-inspect") return cmd_vm_inspect(file_path);
-    if (cmd == "protect") return cmd_protect(file_path, output_path, prot_opts);
+    if (cmd == "protect") {
+        if (output_path.empty()) {
+            const std::filesystem::path in_p(file_path);
+            output_path = (in_p.parent_path() / (in_p.stem().string() + "_protected" + in_p.extension().string())).string();
+        }
+        return cmd_protect(file_path, output_path, prot_opts);
+    }
     if (cmd == "compatibility") return cmd_compatibility(file_path, output_format, prot_opts.allow_external_calls, detailed_flag);
     if (cmd == "verify") return cmd_verify(file_path, deep_verify);
     if (cmd == "report") return cmd_report(file_path, output_path);
