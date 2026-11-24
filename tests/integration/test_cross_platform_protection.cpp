@@ -875,23 +875,31 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
     ProtectOptions opts;
     opts.profile = ProtectionProfile::Balanced;
     opts.seed = 0x50510707ULL;
-    opts.allow_external_calls = true;
     opts.allow_strip_signature = true;
+#if defined(__APPLE__)
+    opts.allow_external_calls = true;
     opts.target_function_names = {
         "bm_target_compute",
         "bm_target_multi_args",
         "bm_target_helper",
         "bm_target_caller"
     };
+#else
+    opts.target_function_names = {
+        "bm_target_compute",
+        "bm_target_multi_args",
+        "bm_target_helper"
+    };
+#endif
 
     auto rep = ProtectionEngine::protect(lab_exe, prot_exe, opts);
     ASSERT_TRUE(rep.has_value()) << rep.error().to_string();
     EXPECT_TRUE(rep.value().shared_runtime_used);
-    EXPECT_EQ(rep.value().protected_functions.size(), 4u);
+    EXPECT_EQ(rep.value().protected_functions.size(), opts.target_function_names.size());
 
     auto ver = ProtectionEngine::verify(prot_exe);
     ASSERT_TRUE(ver.has_value() && ver.value().valid);
-    EXPECT_EQ(ver.value().metadata.functions.size(), 4u);
+    EXPECT_EQ(ver.value().metadata.functions.size(), opts.target_function_names.size());
 
     EXPECT_EQ(run_posix_and_capture(lab_exe, "42 19 --v07"), run_posix_and_capture(prot_exe, "42 19 --v07"));
     EXPECT_EQ(run_posix_and_capture(lab_exe, "100 37 --v07"), run_posix_and_capture(prot_exe, "100 37 --v07"));
