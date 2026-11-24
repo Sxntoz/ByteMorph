@@ -160,6 +160,9 @@ BinaryAnalyzer::analyze(const binary::IBinaryFile& binary,
             auto& s = seeds[sym.address];
             s.va = sym.address;
             s.from_sym = true;
+            if (sym.size > 0 && (!s.end_va.has_value() || sym.address + sym.size < *s.end_va)) {
+                s.end_va = sym.address + sym.size;
+            }
             if (s.source.empty()) {
                 s.source = "symbol";
             }
