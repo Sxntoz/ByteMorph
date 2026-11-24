@@ -2454,7 +2454,18 @@ TEST(ProtectionV012Test, SharedLibraryDllSoDylibProtectionAndVerification) {
     opts.allow_strip_signature = true;
 
     auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
-    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+    if (!res.has_value()) {
+        auto comp = bytemorph::prot::ProtectionEngine::check_compatibility(lib_path, true);
+        std::string diag = res.error().to_string();
+        if (comp.has_value()) {
+            diag += " | elig=" + std::to_string(comp.value().eligible_functions.size()) +
+                    " rej=" + std::to_string(comp.value().rejected_functions.size());
+            for (const auto& rf : comp.value().rejected_functions) {
+                diag += " [" + rf.name + ": " + rf.category + " -> " + rf.rejection_reason + "]";
+            }
+        }
+        FAIL() << diag;
+    }
     EXPECT_GE(res.value().protected_functions.size(), 1u);
 
     auto ver = bytemorph::prot::ProtectionEngine::verify(out_lib);
@@ -2498,7 +2509,18 @@ TEST(ProtectionV012Test, Cryptography30MultiFunctionAeadAndCorruptionHandling) {
     opts.allow_strip_signature = true;
 
     auto res = bytemorph::prot::ProtectionEngine::protect(lib_path, out_lib, opts);
-    ASSERT_TRUE(res.has_value()) << res.error().to_string();
+    if (!res.has_value()) {
+        auto comp = bytemorph::prot::ProtectionEngine::check_compatibility(lib_path, true);
+        std::string diag = res.error().to_string();
+        if (comp.has_value()) {
+            diag += " | elig=" + std::to_string(comp.value().eligible_functions.size()) +
+                    " rej=" + std::to_string(comp.value().rejected_functions.size());
+            for (const auto& rf : comp.value().rejected_functions) {
+                diag += " [" + rf.name + ": " + rf.category + " -> " + rf.rejection_reason + "]";
+            }
+        }
+        FAIL() << diag;
+    }
 
     auto ver = bytemorph::prot::ProtectionEngine::verify(out_lib);
     ASSERT_TRUE(ver.has_value());

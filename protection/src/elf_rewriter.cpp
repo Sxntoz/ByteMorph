@@ -108,19 +108,29 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
     const std::size_t raw_rt_size = runtime_bytes.size();
     runtime_bytes.resize(static_cast<std::size_t>(align_up(runtime_bytes.size(), 0x1000)), 0);
 
-    LIEF::ELF::Section* text_sec_pre = elf->get_section(".text");
-    if (!text_sec_pre) {
-        return diagnostics::Result<ProtectionReport>::err(ErrorCode::ParseError, "ELF missing .text section", "ElfRewriter::protect_file");
-    }
-    std::vector<std::size_t> patch_offsets;
-    patch_offsets.reserve(plan.prepared.size());
+    struct ElfPatchLoc {
+        std::string sec_name;
+        std::size_t offset{0};
+        std::uint64_t va{0};
+    };
+    std::vector<ElfPatchLoc> patch_locs;
+    patch_locs.reserve(plan.prepared.size());
     for (const auto& pf : plan.prepared) {
-        if (pf.entry_va < text_sec_pre->virtual_address() ||
-            pf.entry_va + min_patch > text_sec_pre->virtual_address() + text_sec_pre->content().size()) {
-            return diagnostics::Result<ProtectionReport>::err(
-                ErrorCode::OutOfBounds, "Target VA outside .text: " + pf.name, "ElfRewriter::protect_file");
+        bool found_sec = false;
+        for (const auto& sec : elf->sections()) {
+            if (!sec.has(LIEF::ELF::Section::FLAGS::EXECINSTR)) continue;
+            const std::uint64_t s_va = sec.virtual_address();
+            const std::size_t s_sz = sec.content().size();
+            if (pf.entry_va >= s_va && pf.entry_va + min_patch <= s_va + s_sz) {
+                patch_locs.push_back({sec.name(), static_cast<std::size_t>(pf.entry_va - s_va), pf.entry_va});
+                found_sec = true;
+                break;
+            }
         }
-        patch_offsets.push_back(static_cast<std::size_t>(pf.entry_va - text_sec_pre->virtual_address()));
+        if (!found_sec) {
+            return diagnostics::Result<ProtectionReport>::err(
+                ErrorCode::OutOfBounds, "Target VA outside executable ELF sections: " + pf.name, "ElfRewriter::protect_file");
+        }
     }
 
     LIEF::ELF::Section bmrt_sec(".bmrt", LIEF::ELF::Section::TYPE::PROGBITS);
@@ -186,18 +196,30 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
         runtime_bytes.assign(added_bmrt->content().begin(), added_bmrt->content().end());
     }
 
-    LIEF::ELF::Section* text_sec = elf->get_section(".text");
-    if (!text_sec) {
-        return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Missing .text after segment add", "ElfRewriter::protect_file");
-    }
-    auto text_content = std::vector<std::uint8_t>(text_sec->content().begin(), text_sec->content().end());
-    for (std::size_t i = 0; i < plan.prepared.size(); ++i) {
-        const std::size_t patch_off = patch_offsets[i];
-        if (patch_off + min_patch > text_content.size()) {
-            return diagnostics::Result<ProtectionReport>::err(
-                ErrorCode::OutOfBounds, "Target VA outside .text after segment add: " + plan.prepared[i].name, "ElfRewriter::protect_file");
+    struct ElfMutableSec {
+        LIEF::ELF::Section* sec{nullptr};
+        std::vector<std::uint8_t> content;
+    };
+    std::vector<ElfMutableSec> mutable_secs;
+    auto get_mut_sec = [&](const std::string& name) -> ElfMutableSec* {
+        for (auto& ms : mutable_secs) {
+            if (ms.sec->name() == name) return &ms;
         }
-        const std::uint64_t patched_va = text_sec->virtual_address() + patch_off;
+        LIEF::ELF::Section* s = elf->get_section(name);
+        if (!s) return nullptr;
+        auto c = s->content();
+        mutable_secs.push_back({s, std::vector<std::uint8_t>(c.begin(), c.end())});
+        return &mutable_secs.back();
+    };
+
+    for (std::size_t i = 0; i < plan.prepared.size(); ++i) {
+        const auto& loc = patch_locs[i];
+        ElfMutableSec* ms = get_mut_sec(loc.sec_name);
+        if (!ms || loc.offset + min_patch > ms->content.size()) {
+            return diagnostics::Result<ProtectionReport>::err(
+                ErrorCode::OutOfBounds, "Target VA outside section after segment add: " + plan.prepared[i].name, "ElfRewriter::protect_file");
+        }
+        const std::uint64_t patched_va = ms->sec->virtual_address() + loc.offset;
         const std::uint64_t fn_stub_va = added_bmrt->virtual_address() + rt_layout.entry_offsets[i];
         if (is_arm64) {
             const std::int64_t delta = static_cast<std::int64_t>(fn_stub_va) - static_cast<std::int64_t>(patched_va);
@@ -206,15 +228,22 @@ ElfRewriter::protect_file(const std::filesystem::path& input,
                 return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "ARM64 branch target out of 128MB range", "ElfRewriter::protect_file");
             }
             const std::uint32_t insn = 0x14000000u | (static_cast<std::uint32_t>(imm26) & 0x03FFFFFFu);
-            std::memcpy(text_content.data() + patch_off, &insn, 4);
+            std::memcpy(ms->content.data() + loc.offset, &insn, 4);
         } else {
             const std::int64_t rel32 = static_cast<std::int64_t>(fn_stub_va) - static_cast<std::int64_t>(patched_va + 5);
-            text_content[patch_off] = 0xE9;
+            ms->content[loc.offset] = 0xE9;
             const std::uint32_t rel32_u = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel32));
-            std::memcpy(text_content.data() + patch_off + 1, &rel32_u, 4);
+            std::memcpy(ms->content.data() + loc.offset + 1, &rel32_u, 4);
         }
     }
-    text_sec->content(text_content);
+    for (auto& ms : mutable_secs) {
+        ms.sec->content(ms.content);
+    }
+    LIEF::ELF::Section* text_sec = elf->get_section(".text");
+    if (!text_sec) {
+        return diagnostics::Result<ProtectionReport>::err(ErrorCode::OutOfBounds, "Missing .text after segment add", "ElfRewriter::protect_file");
+    }
+    auto text_content = std::vector<std::uint8_t>(text_sec->content().begin(), text_sec->content().end());
 
     std::vector<std::uint8_t> plaintext;
     for (const auto& pf : plan.prepared) {
