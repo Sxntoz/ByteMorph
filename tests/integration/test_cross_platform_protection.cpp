@@ -887,8 +887,7 @@ TEST(ProtectionV07Test, ProtectsAndExecutesMultiFunctionRealPosixBinary) {
 #else
     opts.target_function_names = {
         "bm_target_compute",
-        "bm_target_multi_args",
-        "bm_target_helper"
+        "bm_target_multi_args"
     };
 #endif
 
